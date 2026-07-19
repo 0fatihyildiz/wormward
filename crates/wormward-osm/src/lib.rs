@@ -24,8 +24,6 @@ pub struct CheckResult {
     #[serde(default)]
     pub scan_severity: Option<String>,
     #[serde(default)]
-    pub threat_count: u64,
-    #[serde(default)]
     pub osm_url: String,
     #[serde(default)]
     pub message: Option<String>,
@@ -75,6 +73,9 @@ impl OsmClient {
                 serde_json::from_str::<CheckResult>(&body).map_err(|e| OsmError::Decode(e.to_string()))
             }
             Err(ureq::Error::Status(401, _)) => Err(OsmError::Auth),
+            // At confirm-only volume (a few deduped lookups per scan) rate limiting is
+            // effectively unreachable; the caller surfaces 429 as a per-item warning
+            // rather than retrying.
             Err(ureq::Error::Status(429, _)) => Err(OsmError::RateLimited),
             Err(ureq::Error::Status(code, _)) => Err(OsmError::Http(code)),
             Err(ureq::Error::Transport(t)) => Err(OsmError::Network(t.to_string())),

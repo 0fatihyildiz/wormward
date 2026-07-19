@@ -39,7 +39,13 @@ pub fn render_text(report: &ScanReport) -> String {
             } else {
                 format!(" — {}", v.osm_url)
             };
-            out.push_str(&format!("      └ {status}{link}\n"));
+            let note = v
+                .message
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .map(|m| format!(" ({m})"))
+                .unwrap_or_default();
+            out.push_str(&format!("      └ {status}{link}{note}\n"));
         }
     }
     out

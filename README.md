@@ -34,8 +34,9 @@ wormward scan ~ --online                            # enrich npm/domain findings
 wormward check --type package --ecosystem npm left-pad
 ```
 
-Online mode is opt-in; without `--online` nothing leaves your machine — only the
-npm-package names and domains already flagged locally are sent.
+Online mode is opt-in; without `--online` nothing leaves your machine. What is
+sent is limited to the npm-package names and domains your local packs already
+flagged — nothing else.
 
 ## How detection works
 

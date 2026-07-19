@@ -40,11 +40,11 @@ fn verdict_from(res: CheckResult) -> OnlineVerdict {
 /// warnings; findings without a verdict keep `online: None`. Never fails.
 pub fn enrich(findings: &mut [Finding], client: &OsmClient) -> Vec<String> {
     let mut warnings = Vec::new();
-    let mut cache: HashMap<(String, String), Option<OnlineVerdict>> = HashMap::new();
+    let mut cache: HashMap<(String, String, Option<String>), Option<OnlineVerdict>> = HashMap::new();
 
     for f in findings.iter() {
         if let Some((rt, id, eco)) = enrichable(f) {
-            let key = (rt.clone(), id.clone());
+            let key = (rt.clone(), id.clone(), eco.clone());
             if cache.contains_key(&key) {
                 continue;
             }
@@ -67,8 +67,8 @@ pub fn enrich(findings: &mut [Finding], client: &OsmClient) -> Vec<String> {
     }
 
     for f in findings.iter_mut() {
-        if let Some((rt, id, _)) = enrichable(f) {
-            if let Some(Some(v)) = cache.get(&(rt, id)) {
+        if let Some((rt, id, eco)) = enrichable(f) {
+            if let Some(Some(v)) = cache.get(&(rt, id, eco)) {
                 f.online = Some(v.clone());
             }
         }
@@ -130,5 +130,38 @@ mod tests {
         let warnings = enrich(&mut findings, &client);
         assert_eq!(warnings.len(), 1);
         assert!(findings[0].online.is_none());
+    }
+
+    fn domain_finding(domain: &str) -> Finding {
+        Finding {
+            campaign: "polinrider".into(),
+            severity: Severity::Medium,
+            repo: PathBuf::from("/r"),
+            file: Some(PathBuf::from("postcss.config.mjs")),
+            signature_id: format!("ioc-domain:{domain}"),
+            kind: FindingKind::IocDomain,
+            evidence: "e".into(),
+            remediable: false,
+            online: None,
+        }
+    }
+
+    #[test]
+    fn enriches_domain_finding_as_report_type_domain() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/check-malicious")
+                .query_param("report_type", "domain")
+                .query_param("resource_identifier", "evil.vercel.app");
+            then.status(200)
+                .json_body(serde_json::json!({ "malicious": true, "osm_url": "https://osm/d" }));
+        });
+        let client = OsmClient::new(server.base_url(), "t".into());
+        let mut findings = vec![domain_finding("evil.vercel.app")];
+        let warnings = enrich(&mut findings, &client);
+        m.assert();
+        assert!(warnings.is_empty());
+        assert!(findings[0].online.as_ref().unwrap().malicious);
     }
 }
