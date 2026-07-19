@@ -115,3 +115,10 @@ remediation:
     markers:
       - "global['!']="
       - "global['_V']="
+      # Generalized bracket-notation global assignment (any key). Bracket-global
+      # assignment is effectively never in legit config code, so this is safe from
+      # over-stripping; dot-notation is deliberately NOT matched (collides with
+      # legitimate `global.x`). Under-stripping is caught by verify-after-strip.
+      # Single-quoted YAML: '' -> ' and backslashes are literal, so this loads as
+      # exactly re:global\[('|\x22)[^'\x22]+('|\x22)\]\s*= (see the pack round-trip test).
+      - 're:global\[(''|\x22)[^''\x22]+(''|\x22)\]\s*='

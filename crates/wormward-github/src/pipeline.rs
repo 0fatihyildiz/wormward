@@ -5,9 +5,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use serde::Serialize;
+use wormward_core::remediate::strip_marker_matches;
 use wormward_core::{
-    apply, commit_paths, deep_scan_repo, force_push_with_lease_to, now_secs, plan_remediation,
-    scan_files, scan_repo, Finding, Pack, RemediationAction,
+    action_for, apply, commit_paths, deep_scan_repo, force_push_with_lease_to, now_secs,
+    plan_remediation, scan_files, scan_repo, Finding, Pack, RemediationAction, RepoFiles,
 };
 
 use crate::api_tree::{ApiTree, BlobCache};
@@ -32,6 +33,11 @@ pub struct RepoOutcome {
     /// Branches force-pushed back to origin.
     pub pushed: Vec<String>,
     pub error: Option<String>,
+    /// The repo is infected but was NOT auto-remediated: either no strip marker is present
+    /// (nothing to strip), or a strip left detectable payload and was reverted. Reported
+    /// honestly as "manual review needed" instead of a silent "no changes". A cleanly fixed
+    /// or a clean repo leaves this false.
+    pub manual_review: bool,
 }
 
 fn describe_action(a: &RemediationAction) -> String {
@@ -113,6 +119,12 @@ pub struct ScannedRepo {
     /// Scan failure, if any. An errored repo carries no findings and must never be
     /// treated as clean.
     pub error: Option<String>,
+    /// True when the default working tree has at least one remediation action `apply`
+    /// would actually perform — computed WITH the tip's file content, so a `StripPayload`
+    /// only counts when a strip marker is genuinely present in the flagged file. Detection
+    /// alone (`is_infected`) does NOT imply this: a repo flagged by a non-marker signature
+    /// (a bare C2 address, a dot-notation variant) is infected but not auto-strippable.
+    pub auto_fixable: bool,
 }
 
 impl ScannedRepo {
@@ -120,6 +132,24 @@ impl ScannedRepo {
     pub fn is_infected(&self) -> bool {
         self.error.is_none() && !self.findings.is_empty()
     }
+}
+
+/// Whether the default working-tree findings include at least one action `apply` would
+/// actually perform, given the file content available via `read`. A `StripPayload` only
+/// counts when a strip marker is genuinely present in the flagged file; `DeleteFile` and
+/// `RemoveGitignoreLine` always count — their target's presence was already detected. This
+/// mirrors what `fix_scanned` does at apply time, so `fixable` never over-promises a no-op.
+fn is_auto_fixable(findings: &[Finding], packs: &[Pack], read: impl Fn(&Path) -> Option<String>) -> bool {
+    findings
+        .iter()
+        .filter(|f| f.git_ref.is_none())
+        .any(|f| match action_for(f, packs) {
+            Some(RemediationAction::StripPayload { file, markers }) => {
+                read(&file).is_some_and(|c| strip_marker_matches(&c, &markers))
+            }
+            Some(_) => true,
+            None => false,
+        })
 }
 
 /// Result of phase one: every repo scanned via the API. No clones exist on disk.
@@ -151,11 +181,10 @@ impl ScanPass {
     /// A repo infected solely on a non-default branch has findings but no working-tree
     /// action (`plan_remediation` routes branch-tip findings, which carry a `git_ref`, to
     /// `manual`), so it is excluded here even though it remains in the scan results/output.
-    pub fn fixable_full_names(&self, packs: &[Pack]) -> Vec<String> {
+    pub fn fixable_full_names(&self, _packs: &[Pack]) -> Vec<String> {
         self.repos
             .iter()
-            .filter(|r| r.is_infected())
-            .filter(|r| !plan_remediation(&r.findings, packs).actions.is_empty())
+            .filter(|r| r.is_infected() && r.auto_fixable)
             .map(|r| r.repo.full_name.clone())
             .collect()
     }
@@ -198,7 +227,8 @@ fn clone_repo(repo: &RepoRef, dest: &Path, token: &str) -> Result<(), String> {
 /// (`truncated`, ~100k+ entries) — coverage must never silently degrade. The temp
 /// clone is deleted on return; a later fix re-clones like any other repo.
 fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRepo {
-    let mut out = ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None };
+    let mut out =
+        ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None, auto_fixable: false };
     let tmp = match tempfile::TempDir::new() {
         Ok(t) => t,
         Err(e) => {
@@ -213,6 +243,10 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
     }
     let mut findings = scan_repo(&dest, packs);
     findings.extend(deep_scan_repo(&dest, packs));
+    // Fixability from the cloned working tree, while `dest` still exists (tmp is dropped
+    // on return). Reads the flagged file's on-disk content, same as `fix_scanned` will.
+    out.auto_fixable =
+        is_auto_fixable(&findings, packs, |rel| std::fs::read_to_string(dest.join(rel)).ok());
     // Re-label onto the virtual repo path: the temp clone path would dangle.
     let label = PathBuf::from(&repo.full_name);
     for f in &mut findings {
@@ -235,7 +269,8 @@ fn api_scan_repo(
     cache: &BlobCache,
     token: &str,
 ) -> Result<ScannedRepo, GithubError> {
-    let mut out = ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None };
+    let mut out =
+        ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None, auto_fixable: false };
 
     let branches = match host.list_branches(&repo.full_name) {
         Ok(b) => b,
@@ -287,6 +322,11 @@ fn api_scan_repo(
             for f in &mut findings {
                 f.git_ref = Some(name.clone());
             }
+        } else {
+            // Default tip = the working tree we could remediate. Compute fixability with
+            // its actual file content (blobs are already cached from the scan above), so a
+            // StripPayload only counts when a marker is genuinely present.
+            out.auto_fixable = is_auto_fixable(&findings, packs, |rel| files.read(rel));
         }
         let mut errors = files.take_errors();
         if let Some(pos) = errors.iter().position(|e| matches!(e, GithubError::RateLimited(_))) {
@@ -363,15 +403,18 @@ fn fix_scanned(
         actions: Vec::new(),
         pushed: Vec::new(),
         error: sr.error.clone(),
+        manual_review: false,
     };
 
     if !do_fix || sr.error.is_some() || sr.findings.is_empty() {
         return outcome;
     }
 
-    // Branch-only infections have no working-tree action; nothing to do here.
+    // Branch-only infections have no working-tree action; nothing to do here. An infected
+    // repo with no applicable action is reported as manual review, not a silent no-op.
     let preview = plan_remediation(&sr.findings, packs);
     if preview.actions.is_empty() {
+        outcome.manual_review = true;
         return outcome;
     }
 
@@ -394,13 +437,38 @@ fn fix_scanned(
     let local = scan_repo(&dest, packs);
     let plan = plan_remediation(&local, packs);
     if plan.actions.is_empty() {
-        return outcome; // repo changed since the scan; nothing fixable remains
+        // Repo changed since the scan, or its findings have no auto-action: infected but
+        // not auto-strippable -> manual review, never a silent "no changes".
+        outcome.manual_review = !local.is_empty();
+        return outcome;
     }
 
     // Apply to the working tree (backups land in <repo>/.wormward-backup/<ts>/).
     let res = apply(&dest, &plan.actions, true);
     outcome.actions = res.applied.iter().map(describe_action).collect();
     if res.applied.is_empty() {
+        // A planned action that stripped nothing (no marker) is not a fix.
+        outcome.manual_review = true;
+        return outcome;
+    }
+
+    // SECURITY: verify the strip actually removed the payload before committing anything.
+    // `strip_after_marker` cuts from the marker onward, but a signature (e.g. a C2 address)
+    // sitting BEFORE the marker survives — committing/pushing that would flag a still-infected
+    // file as "fixed". Re-scan the working tree; if any auto-strip finding remains on the
+    // default tree, revert everything (restoring the committed file) and report manual review.
+    // `.wormward-backup` holds the pristine original but the walker skips it, so it cannot
+    // cause a false residual. This is the critical safety property of the whole pipeline.
+    let residual_strip = scan_repo(&dest, packs).into_iter().any(|f| {
+        f.git_ref.is_none()
+            && matches!(action_for(&f, packs), Some(RemediationAction::StripPayload { .. }))
+    });
+    if residual_strip {
+        // Restore the working tree to the committed (infected) file; do NOT commit or push.
+        let _ = git(&dest, &["checkout", "--", "."]);
+        outcome.actions.clear();
+        outcome.error = None;
+        outcome.manual_review = true;
         return outcome;
     }
 
@@ -608,6 +676,33 @@ mod tests {
         git_ok(&src, &["add", "."]);
         git_ok(&src, &["commit", "-q", "--no-verify", "-m", "infected"]);
 
+        let bare = tmp.path().join(format!("{name}.git"));
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+        bare
+    }
+
+    /// Build an infected bare origin whose default-branch config is flagged by a
+    /// NON-marker signature (a bare C2 address, no `global[...]=`). It is detected as
+    /// infected, but `apply` would strip nothing — so it must NOT be offered as fixable.
+    fn make_nonstrippable_infected_origin(tmp: &TempDir, name: &str) -> PathBuf {
+        let src = tmp.path().join(format!("{name}-src"));
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        // Flagged by the c2-tron-primary literal, but NO strip marker present.
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nfetch('TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP')\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "c2-only"]);
         let bare = tmp.path().join(format!("{name}.git"));
         Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
@@ -844,6 +939,93 @@ mod tests {
             fixable,
             vec!["me/wt".to_string()],
             "branch-only infection must not be offered as a fixable candidate"
+        );
+    }
+
+    #[test]
+    fn nonstrippable_infection_is_not_offered_as_fixable() {
+        let tmp = TempDir::new().unwrap();
+        let bare = make_nonstrippable_infected_origin(&tmp, "c2only");
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/c2only".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let scan = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "").unwrap();
+        assert!(
+            scan.infected_full_names().contains(&"me/c2only".to_string()),
+            "still detected as infected"
+        );
+        assert!(
+            !scan.fixable_full_names(&builtin_packs()).contains(&"me/c2only".to_string()),
+            "must NOT be offered as auto-fixable: no strip marker in the file"
+        );
+    }
+
+    #[test]
+    fn incomplete_strip_reverts_and_reports_manual_not_pushed() {
+        // A file with a strip marker BUT residual worm content BEFORE the marker, so
+        // stripping at the marker leaves a signature match. The fix must NOT push;
+        // it must revert and report the repo as not-fixed (manual).
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("m-src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        // c2 address (signature) appears BEFORE the strip marker; cutting at the marker
+        // leaves the c2 line -> still infected after strip.
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nvar c='TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP';\nglobal['!']='x';TAIL\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "mixed"]);
+        let bare = tmp.path().join("m.git");
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/m".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: Some(tmp.path().join("work")),
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: true,
+        };
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
+        let o = &outcomes[0];
+        assert!(o.pushed.is_empty(), "must not push a still-infected file");
+        assert!(
+            !(o.error.is_none() && !o.actions.is_empty()),
+            "must not report as cleanly fixed"
+        );
+        assert!(o.manual_review, "must flag the repo for manual review");
+        // The bare origin's main tip still has the original (reverted, not half-stripped).
+        let show = Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["show", "main:postcss.config.mjs"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&show.stdout).contains("TMfKQEd7"),
+            "origin must be untouched when strip is incomplete"
         );
     }
 

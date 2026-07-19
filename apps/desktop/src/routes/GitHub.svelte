@@ -128,10 +128,12 @@
   <section class="card">
     <h3>Fix results</h3>
     {#each results as r}
-      <div class="small {r.error ? 'crit' : r.fixed ? 'ok-text' : 'muted'}">
+      <div class="small {r.error ? 'crit' : r.manual_review ? 'crit' : r.fixed ? 'ok-text' : 'muted'}">
         {r.full_name}:
         {#if r.error}
           error — {r.error}
+        {:else if r.manual_review}
+          detected — manual review needed (payload not auto-strippable)
         {:else if r.fixed}
           fixed{r.pushed.length ? ` — pushed ${r.pushed.join(", ")}` : ""}
         {:else}

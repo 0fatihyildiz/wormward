@@ -98,6 +98,7 @@ export interface GithubFixView {
   pushed: string[];
   actions: string[];
   error?: string | null;
+  manual_review: boolean;
 }
 
 export type ScanProgress = { done: number; total: number; repo: string };

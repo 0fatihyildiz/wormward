@@ -334,6 +334,9 @@ pub struct GithubFixView {
     pushed: Vec<String>,
     actions: Vec<String>,
     error: Option<String>,
+    /// Infected but not auto-remediated (no strip marker, or an incomplete strip was
+    /// reverted). Surfaced so the UI reports "manual review needed", never a silent no-op.
+    manual_review: bool,
 }
 
 /// Enumerate + API-scan (no clones) the token owner's GitHub repos (read-only), stash the
@@ -419,6 +422,7 @@ async fn github_fix(
             pushed: o.pushed,
             actions: o.actions,
             error: o.error,
+            manual_review: o.manual_review,
         })
         .collect();
 
