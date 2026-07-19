@@ -1,3 +1,4 @@
+mod online;
 mod report;
 
 use std::path::PathBuf;
@@ -5,6 +6,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use wormward_core::scan;
+use wormward_osm::OsmClient;
 use wormward_packs::builtin_packs;
 
 #[derive(Parser)]
@@ -23,6 +25,12 @@ enum Command {
         dirs: Vec<PathBuf>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
+        /// Cross-check npm-package and domain findings against the live OSM API.
+        #[arg(long)]
+        online: bool,
+        /// OSM API token (else OSM_API_KEY env).
+        #[arg(long)]
+        osm_token: Option<String>,
     },
     /// List the campaign packs compiled into this build.
     ListPacks,
@@ -34,17 +42,38 @@ enum OutputFormat {
     Json,
 }
 
+fn osm_base_url() -> String {
+    std::env::var("OSM_BASE_URL")
+        .unwrap_or_else(|_| "https://api.opensourcemalware.com/functions/v1".to_string())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan { dirs, format } => {
+        Command::Scan { dirs, format, online, osm_token } => {
             for dir in &dirs {
                 if !dir.exists() {
                     eprintln!("error: path does not exist: {}", dir.display());
                     return ExitCode::from(2);
                 }
             }
-            let report = scan(&dirs, &builtin_packs());
+            let mut report = scan(&dirs, &builtin_packs());
+            if online {
+                let token = osm_token
+                    .or_else(|| std::env::var("OSM_API_KEY").ok())
+                    .filter(|t| !t.is_empty());
+                let token = match token {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("error: --online requires an OSM token (--osm-token or OSM_API_KEY)");
+                        return ExitCode::from(2);
+                    }
+                };
+                let client = OsmClient::new(osm_base_url(), token);
+                for w in online::enrich(&mut report.findings, &client) {
+                    eprintln!("warning: {w}");
+                }
+            }
             match format {
                 OutputFormat::Text => print!("{}", report::render_text(&report)),
                 OutputFormat::Json => println!("{}", report::render_json(&report)),

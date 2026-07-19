@@ -32,6 +32,15 @@ pub fn render_text(report: &ScanReport) -> String {
             file,
             f.evidence,
         ));
+        if let Some(v) = &f.online {
+            let status = if v.malicious { "OSM: MALICIOUS" } else { "OSM: not flagged" };
+            let link = if v.osm_url.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", v.osm_url)
+            };
+            out.push_str(&format!("      └ {status}{link}\n"));
+        }
     }
     out
 }
@@ -87,5 +96,20 @@ mod tests {
         assert_eq!(value["findings"][0]["campaign"], "polinrider");
         assert_eq!(value["findings"][0]["severity"], "critical");
         assert_eq!(value["findings"][0]["kind"], "content_signature");
+    }
+
+    #[test]
+    fn renders_online_verdict_line() {
+        let mut r = report_with_finding();
+        r.findings[0].online = Some(wormward_core::OnlineVerdict {
+            malicious: true,
+            severity: Some("high".into()),
+            osm_url: "https://osm/x".into(),
+            threat_id: Some("t".into()),
+            message: None,
+        });
+        let text = render_text(&r);
+        assert!(text.contains("OSM: MALICIOUS"));
+        assert!(text.contains("https://osm/x"));
     }
 }

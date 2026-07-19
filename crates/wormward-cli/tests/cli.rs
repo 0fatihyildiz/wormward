@@ -65,3 +65,59 @@ fn scan_nonexistent_path_exits_2() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn scan_online_enriches_from_mock_and_keeps_exit_1() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/check-malicious");
+        then.status(200).json_body(serde_json::json!({
+            "malicious": true, "osm_url": "https://osm/x", "threat_count": 1,
+            "details": { "threat_id": "t", "severity_level": "high", "description": "d" }
+        }));
+    });
+
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("victim");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    // A malicious-npm finding (polinrider bad_npm_packages) to enrich.
+    fs::write(
+        repo.join("package.json"),
+        r#"{"dependencies":{"tailwindcss-style-animate":"^1.1.6"}}"#,
+    )
+    .unwrap();
+
+    let out = bin()
+        .env("OSM_BASE_URL", server.base_url())
+        .env("OSM_API_KEY", "osm_test")
+        .arg("scan")
+        .arg("--online")
+        .arg("--format")
+        .arg("json")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1)); // local finding still drives exit 1
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let has_online = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["online"]["malicious"] == true);
+    assert!(has_online);
+}
+
+#[test]
+fn scan_online_without_token_exits_2() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("r/.git")).unwrap();
+    let out = bin()
+        .env_remove("OSM_API_KEY")
+        .arg("scan")
+        .arg("--online")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}

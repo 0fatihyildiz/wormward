@@ -12,8 +12,10 @@ path = "src/main.rs"
 [dependencies]
 wormward-core = { path = "../wormward-core" }
 wormward-packs = { path = "../wormward-packs" }
+wormward-osm = { path = "../wormward-osm" }
 clap = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+httpmock = { workspace = true }
