@@ -10,6 +10,6 @@ pub use finding::{Finding, FindingKind, OnlineVerdict, Severity};
 pub use git::reflog_has_amend;
 pub use matchers::{sha256_hex, signature_matches, ContentSignature, SignatureKind};
 pub use pack::{CampaignAnalyzer, Pack, PackError, PackManifest, ScannedFile};
-pub use repo_files::{RepoFiles, WorkingTree};
-pub use scanner::{scan, scan_files, scan_repo, ScanReport};
+pub use repo_files::{GitTree, RepoFiles, WorkingTree};
+pub use scanner::{deep_scan_repo, scan, scan_deep, scan_files, scan_repo, ScanReport};
 pub use walk::{discover_repos, walk_repo_files};

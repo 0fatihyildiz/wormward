@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
@@ -7,7 +8,7 @@ use crate::finding::{Finding, FindingKind, Severity};
 use crate::git::reflog_has_amend;
 use crate::matchers::signature_matches;
 use crate::pack::{Pack, ScannedFile};
-use crate::repo_files::{RepoFiles, WorkingTree};
+use crate::repo_files::{GitTree, RepoFiles, WorkingTree};
 use crate::walk::discover_repos;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -217,6 +218,91 @@ pub fn scan(roots: &[PathBuf], packs: &[Pack]) -> ScanReport {
         findings,
         repos_scanned: repos.len(),
     }
+}
+
+fn branch_commits(repo: &Path) -> Vec<(String, String)> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "for-each-ref",
+            "--format=%(objectname) %(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ])
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, ' ');
+            let oid = parts.next()?.to_string();
+            let name = parts.next()?.to_string();
+            Some((oid, name))
+        })
+        .collect()
+}
+
+fn head_commit(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Scan the tip tree of every local/remote branch (deduped by commit, excluding HEAD's
+/// commit which the working-tree pass already covers). Findings carry the branch ref.
+pub fn deep_scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
+    let head = head_commit(repo);
+    let mut seen = std::collections::HashSet::new();
+    let mut findings = Vec::new();
+    for (oid, name) in branch_commits(repo) {
+        if head.as_deref() == Some(oid.as_str()) {
+            continue;
+        }
+        if !seen.insert(oid.clone()) {
+            continue;
+        }
+        let tree = match GitTree::new(repo, &oid) {
+            Some(t) => t,
+            None => continue,
+        };
+        let mut tree_findings = scan_files(repo, &tree, packs);
+        for f in &mut tree_findings {
+            f.git_ref = Some(name.clone());
+        }
+        findings.extend(tree_findings);
+    }
+    findings
+}
+
+pub fn scan_deep(roots: &[PathBuf], packs: &[Pack]) -> ScanReport {
+    let mut repos: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        repos.extend(discover_repos(root));
+    }
+    repos.sort();
+    repos.dedup();
+
+    let findings: Vec<Finding> = repos
+        .par_iter()
+        .flat_map(|repo| {
+            let mut f = scan_repo(repo, packs);
+            f.extend(deep_scan_repo(repo, packs));
+            f
+        })
+        .collect();
+
+    ScanReport { findings, repos_scanned: repos.len() }
 }
 
 #[cfg(test)]
@@ -446,5 +532,54 @@ mod tests {
         let findings = scan_repo(&repo, &[pack]);
         assert!(findings.iter().any(|f| f.kind == FindingKind::IocDomain));
         assert!(!findings.iter().any(|f| f.kind == FindingKind::ContentSignature));
+    }
+
+    #[test]
+    fn deep_scan_finds_payload_on_non_checked_out_branch() {
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status().unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "export default {};").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "clean"]);
+        git(&repo, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        git(&repo, &["commit", "-q", "-am", "payload"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        // Working tree (main) is clean.
+        assert!(scan_repo(&repo, &[literal_pack()]).is_empty());
+        // Deep scan finds the payload on the 'evil' branch tip.
+        let deep = deep_scan_repo(&repo, &[literal_pack()]);
+        assert!(deep.iter().any(|f| f.kind == FindingKind::ContentSignature
+            && f.git_ref.as_deref() == Some("evil")));
+    }
+
+    #[test]
+    fn deep_scan_clean_repo_with_branches_is_clean() {
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status().unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "export default {};").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "clean"]);
+        git(&repo, &["branch", "feature"]);
+        assert!(deep_scan_repo(&repo, &[literal_pack()]).is_empty());
     }
 }
