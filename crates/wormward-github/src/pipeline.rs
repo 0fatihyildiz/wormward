@@ -115,7 +115,7 @@ pub struct ScannedRepo {
 
 impl ScannedRepo {
     /// A repo is "infected" (a fix candidate) when the read-only scan found anything.
-    fn is_infected(&self) -> bool {
+    pub fn is_infected(&self) -> bool {
         self.error.is_none() && !self.findings.is_empty()
     }
 }
@@ -130,6 +130,12 @@ pub struct ScanPass {
 }
 
 impl ScanPass {
+    /// The repos cloned + scanned in phase one, for callers (e.g. a GUI) that need to
+    /// build their own per-repo view from the raw scan results.
+    pub fn repos(&self) -> &[ScannedRepo] {
+        &self.repos
+    }
+
     /// `full_name`s of every infected repo (working-tree OR branch-only), for reporting.
     pub fn infected_full_names(&self) -> Vec<String> {
         self.repos
