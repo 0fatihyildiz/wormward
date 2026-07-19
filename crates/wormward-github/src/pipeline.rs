@@ -6,9 +6,10 @@ use rayon::prelude::*;
 use serde::Serialize;
 use wormward_core::{
     apply, commit_paths, deep_scan_repo, force_push_with_lease_to, now_secs, plan_remediation,
-    scan_repo, Finding, Pack, RemediationAction,
+    scan_files, scan_repo, Finding, Pack, RemediationAction,
 };
 
+use crate::api_tree::{ApiTree, BlobCache};
 use crate::{GithubError, RepoHost, RepoRef};
 
 #[derive(Debug, Clone)]
@@ -102,14 +103,13 @@ fn sanitize_full_name(full_name: &str) -> String {
     full_name.replace(['/', '\\'], "__").replace("..", "__")
 }
 
-/// A repo cloned and scanned in phase one. The clone on disk at `dest` is reused by the
-/// fix phase — we never re-clone.
+/// A repo scanned via the API in phase one. No clone exists; the fix phase clones
+/// on demand for the repos actually selected.
 pub struct ScannedRepo {
     pub repo: RepoRef,
-    /// Working-tree path of the clone (empty/unused when `error` is set).
-    pub dest: PathBuf,
     pub findings: Vec<Finding>,
-    /// Clone failure, if any. A scanned-but-errored repo carries no findings.
+    /// Scan failure, if any. An errored repo carries no findings and must never be
+    /// treated as clean.
     pub error: Option<String>,
 }
 
@@ -120,18 +120,14 @@ impl ScannedRepo {
     }
 }
 
-/// Result of phase one: every repo cloned + scanned, with the clones kept alive on disk
-/// (via `_tmp` when a temp dir was used) so the fix phase can reuse them.
+/// Result of phase one: every repo scanned via the API. No clones exist on disk.
 pub struct ScanPass {
     repos: Vec<ScannedRepo>,
-    // Held to keep the temp clone directory alive until the fix phase has run. `None`
-    // when the caller supplied an explicit `clone_dir`.
-    _tmp: Option<tempfile::TempDir>,
 }
 
 impl ScanPass {
-    /// The repos cloned + scanned in phase one, for callers (e.g. a GUI) that need to
-    /// build their own per-repo view from the raw scan results.
+    /// The repos scanned in phase one, for callers (e.g. a GUI) that need to build
+    /// their own per-repo view from the raw scan results.
     pub fn repos(&self) -> &[ScannedRepo] {
         &self.repos
     }
@@ -162,51 +158,128 @@ impl ScanPass {
     }
 }
 
-/// Clone (all branches, authenticated) and read-only scan a single repo. No fixes.
-fn clone_and_scan(repo: &RepoRef, base: &Path, packs: &[Pack], token: &str) -> ScannedRepo {
-    let dest = base.join(sanitize_full_name(&repo.full_name));
-
-    // Clone all branches so the deep scan can inspect every branch tip. Authenticate via
-    // the token so private repos clone (and the resulting origin can be pushed to), and
-    // disable the terminal prompt so an auth failure fails fast rather than hanging a
-    // rayon worker on an interactive prompt.
-    let clone = Command::new("git")
+/// Clone all branches of `repo` into `dest`, authenticated via the token so private
+/// repos work (and the resulting origin can be pushed to). GIT_TERMINAL_PROMPT=0 so
+/// an auth failure fails fast instead of hanging a rayon worker. Errors are redacted.
+fn clone_repo(repo: &RepoRef, dest: &Path, token: &str) -> Result<(), String> {
+    let out = Command::new("git")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(["clone", "--no-single-branch", "-q"])
         .arg(authed_url(&repo.clone_url, token))
-        .arg(&dest)
+        .arg(dest)
         .output();
-    match clone {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            return ScannedRepo {
-                repo: repo.clone(),
-                dest,
-                findings: Vec::new(),
-                error: Some(redact(
-                    format!("clone: {}", String::from_utf8_lossy(&out.stderr).trim()),
-                    token,
-                )),
-            };
-        }
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(redact(
+            format!("clone: {}", String::from_utf8_lossy(&o.stderr).trim()),
+            token,
+        )),
+        Err(e) => Err(redact(format!("clone: {e}"), token)),
+    }
+}
+
+/// Full local clone + scan for repos whose tree the API refuses to enumerate
+/// (`truncated`, ~100k+ entries) — coverage must never silently degrade. The temp
+/// clone is deleted on return; a later fix re-clones like any other repo.
+fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRepo {
+    let mut out = ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None };
+    let tmp = match tempfile::TempDir::new() {
+        Ok(t) => t,
         Err(e) => {
-            return ScannedRepo {
-                repo: repo.clone(),
-                dest,
-                findings: Vec::new(),
-                error: Some(redact(format!("clone: {e}"), token)),
-            };
+            out.error = Some(format!("tempdir: {e}"));
+            return out;
+        }
+    };
+    let dest = tmp.path().join(sanitize_full_name(&repo.full_name));
+    if let Err(e) = clone_repo(repo, &dest, token) {
+        out.error = Some(e);
+        return out;
+    }
+    let mut findings = scan_repo(&dest, packs);
+    findings.extend(deep_scan_repo(&dest, packs));
+    // Re-label onto the virtual repo path: the temp clone path would dangle.
+    let label = PathBuf::from(&repo.full_name);
+    for f in &mut findings {
+        f.repo = label.clone();
+    }
+    out.findings = findings;
+    out
+}
+
+/// Scan one repo entirely through the API: default-branch tip first (findings stay
+/// remediable, like a working tree), then every other branch tip deduped by commit
+/// sha with `git_ref` stamped (routed to manual by plan_remediation, like deep scan).
+/// Mirrors scan_repo + deep_scan_repo minus the reflog check (local-only, and
+/// meaningless on a fresh clone anyway). Err ONLY on rate limiting, which aborts the
+/// whole run; anything else is a per-repo error.
+fn api_scan_repo(
+    repo: &RepoRef,
+    host: &dyn RepoHost,
+    packs: &[Pack],
+    cache: &BlobCache,
+    token: &str,
+) -> Result<ScannedRepo, GithubError> {
+    let mut out = ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None };
+
+    let branches = match host.list_branches(&repo.full_name) {
+        Ok(b) => b,
+        Err(e @ GithubError::RateLimited(_)) => return Err(e),
+        Err(e) => {
+            out.error = Some(e.to_string());
+            return Ok(out);
+        }
+    };
+    let Some(default) = branches.iter().find(|b| b.name == repo.default_branch) else {
+        return Ok(out); // empty repo / unborn default branch: nothing to scan
+    };
+
+    let mut tips: Vec<(String, Option<String>)> = vec![(default.commit_sha.clone(), None)];
+    let mut seen: HashSet<String> = [default.commit_sha.clone()].into_iter().collect();
+    for b in &branches {
+        if seen.insert(b.commit_sha.clone()) {
+            tips.push((b.commit_sha.clone(), Some(b.name.clone())));
         }
     }
 
-    // Scan the working tree + every branch tip (read-only).
-    let mut findings = scan_repo(&dest, packs);
-    findings.extend(deep_scan_repo(&dest, packs));
-    ScannedRepo { repo: repo.clone(), dest, findings, error: None }
+    let label = PathBuf::from(&repo.full_name);
+    for (sha, git_ref) in tips {
+        let tree = match host.get_tree(&repo.full_name, &sha) {
+            Ok(t) => t,
+            Err(e @ GithubError::RateLimited(_)) => return Err(e),
+            Err(e) => {
+                out.error = Some(e.to_string());
+                return Ok(out);
+            }
+        };
+        if tree.truncated {
+            return Ok(fallback_clone_scan(repo, packs, token));
+        }
+        let files = ApiTree::new(host, &repo.full_name, &tree, cache);
+        let mut findings = scan_files(&label, &files, packs);
+        if let Some(name) = &git_ref {
+            for f in &mut findings {
+                f.git_ref = Some(name.clone());
+            }
+        }
+        let mut errors = files.take_errors();
+        if let Some(pos) = errors.iter().position(|e| matches!(e, GithubError::RateLimited(_))) {
+            return Err(errors.swap_remove(pos));
+        }
+        if let Some(e) = errors.first() {
+            // A failed blob fetch must not read as "clean".
+            out.error = Some(format!("scan incomplete: {e}"));
+            out.findings.clear();
+            return Ok(out);
+        }
+        out.findings.extend(findings);
+    }
+    Ok(out)
 }
 
-/// Phase one: enumerate the account's repos, then clone + scan each (bounded-parallel via
-/// rayon). No repo is fixed here. Per-repo clone failures are captured, never fatal.
+/// Phase one: enumerate the account's repos, then scan each entirely via the API
+/// (bounded-parallel via rayon) — nothing is cloned. Per-repo failures are captured,
+/// never fatal; only rate limiting aborts the run (finishing the sweep would just
+/// burn the remaining quota on guaranteed failures).
 pub fn scan_pass(
     opts: &GithubRunOpts,
     host: &dyn RepoHost,
@@ -214,33 +287,31 @@ pub fn scan_pass(
     token: &str,
 ) -> Result<ScanPass, GithubError> {
     let repos = host.list_repos(opts.include_forks)?;
-
-    // Resolve a base clone directory (temp dir kept alive inside the returned ScanPass).
-    let mut tmp = None;
-    let base: PathBuf = match &opts.clone_dir {
-        Some(d) => {
-            std::fs::create_dir_all(d).map_err(|e| GithubError::Http(e.to_string()))?;
-            d.clone()
-        }
-        None => {
-            let dir = tempfile::TempDir::new().map_err(|e| GithubError::Http(e.to_string()))?;
-            let p = dir.path().to_path_buf();
-            tmp = Some(dir);
-            p
-        }
-    };
-
-    let scanned: Vec<ScannedRepo> = repos
+    let cache = BlobCache::new();
+    let results: Vec<Result<ScannedRepo, GithubError>> = repos
         .par_iter()
-        .map(|repo| clone_and_scan(repo, &base, packs, token))
+        .map(|repo| api_scan_repo(repo, host, packs, &cache, token))
         .collect();
-    Ok(ScanPass { repos: scanned, _tmp: tmp })
+    let mut scanned = Vec::with_capacity(results.len());
+    for r in results {
+        scanned.push(r?);
+    }
+    Ok(ScanPass { repos: scanned })
 }
 
-/// Remediate one already-cloned repo, reusing its working tree. When `do_fix` is false
-/// the repo is only reported (findings preserved, no writes) — this is how deselected
-/// repos and clean/errored repos are passed through.
-fn fix_scanned(sr: &ScannedRepo, opts: &GithubRunOpts, packs: &[Pack], token: &str, do_fix: bool) -> RepoOutcome {
+/// Remediate one scanned repo. Dry runs (`!opts.yes`) plan from the API-scan
+/// findings and touch nothing — not even a clone. A real fix clones the repo fresh,
+/// re-scans it locally (the repo may have changed since the API scan, and local
+/// findings make remediation paths line up with the working tree), then plans,
+/// applies, commits and optionally pushes exactly as before.
+fn fix_scanned(
+    sr: &ScannedRepo,
+    opts: &GithubRunOpts,
+    packs: &[Pack],
+    token: &str,
+    do_fix: bool,
+    base: Option<&Path>,
+) -> RepoOutcome {
     let mut outcome = RepoOutcome {
         repo: sr.repo.clone(),
         findings: sr.findings.clone(),
@@ -253,20 +324,36 @@ fn fix_scanned(sr: &ScannedRepo, opts: &GithubRunOpts, packs: &[Pack], token: &s
         return outcome;
     }
 
-    let dest = &sr.dest;
-    let plan = plan_remediation(&sr.findings, packs);
-    if plan.actions.is_empty() {
+    // Branch-only infections have no working-tree action; nothing to do here.
+    let preview = plan_remediation(&sr.findings, packs);
+    if preview.actions.is_empty() {
         return outcome;
     }
 
-    // Dry run: report the actions that WOULD be applied without touching the tree.
+    // Dry run: report the actions that WOULD be applied. No clone, no writes.
     if !opts.yes {
-        outcome.actions = plan.actions.iter().map(describe_action).collect();
+        outcome.actions = preview.actions.iter().map(describe_action).collect();
         return outcome;
+    }
+
+    let Some(base) = base else {
+        outcome.error = Some("no clone directory available".into());
+        return outcome;
+    };
+    let dest = base.join(sanitize_full_name(&sr.repo.full_name));
+    if let Err(e) = clone_repo(&sr.repo, &dest, token) {
+        outcome.error = Some(e);
+        return outcome;
+    }
+
+    let local = scan_repo(&dest, packs);
+    let plan = plan_remediation(&local, packs);
+    if plan.actions.is_empty() {
+        return outcome; // repo changed since the scan; nothing fixable remains
     }
 
     // Apply to the working tree (backups land in <repo>/.wormward-backup/<ts>/).
-    let res = apply(dest, &plan.actions, true);
+    let res = apply(&dest, &plan.actions, true);
     outcome.actions = res.applied.iter().map(describe_action).collect();
     if res.applied.is_empty() {
         return outcome;
@@ -274,7 +361,7 @@ fn fix_scanned(sr: &ScannedRepo, opts: &GithubRunOpts, packs: &[Pack], token: &s
 
     let paths: Vec<PathBuf> = res.applied.iter().map(|a| a.target().to_path_buf()).collect();
     let campaigns = {
-        let mut c: Vec<&str> = sr.findings.iter().map(|f| f.campaign.as_str()).collect();
+        let mut c: Vec<&str> = local.iter().map(|f| f.campaign.as_str()).collect();
         c.sort();
         c.dedup();
         c.join(", ")
@@ -284,10 +371,10 @@ fn fix_scanned(sr: &ScannedRepo, opts: &GithubRunOpts, packs: &[Pack], token: &s
     // would fail with "nothing to commit" — treat that as a no-op success, not an error.
     for p in &paths {
         let s = p.to_string_lossy();
-        let _ = git(dest, &["add", "-A", "--", s.as_ref()]);
+        let _ = git(&dest, &["add", "-A", "--", s.as_ref()]);
     }
-    if has_staged_changes(dest) {
-        if let Err(e) = commit_paths(dest, &format!("wormward: remediate {campaigns}"), &paths) {
+    if has_staged_changes(&dest) {
+        if let Err(e) = commit_paths(&dest, &format!("wormward: remediate {campaigns}"), &paths) {
             outcome.error = Some(redact(format!("commit: {e}"), token));
             return outcome;
         }
@@ -303,14 +390,14 @@ fn fix_scanned(sr: &ScannedRepo, opts: &GithubRunOpts, packs: &[Pack], token: &s
             "refs/remotes/origin/{b}:refs/heads/wormward-backup/{b}-{ts}",
             b = sr.repo.default_branch
         );
-        if let Err(e) = git(dest, &["push", "origin", "--", &backup]) {
+        if let Err(e) = git(&dest, &["push", "origin", "--", &backup]) {
             outcome.error = Some(redact(format!("backup push: {e}"), token));
             return outcome;
         }
         // Push EXACTLY the cleaned default branch via an explicit refspec, never a bare
         // `--force-with-lease` (which under push.default=matching would push every branch).
         let refspec = format!("HEAD:refs/heads/{}", sr.repo.default_branch);
-        match force_push_with_lease_to(dest, "origin", &refspec) {
+        match force_push_with_lease_to(&dest, "origin", &refspec) {
             Ok(()) => outcome.pushed.push(sr.repo.default_branch.clone()),
             Err(e) => outcome.error = Some(redact(format!("force-push: {e}"), token)),
         }
@@ -319,11 +406,11 @@ fn fix_scanned(sr: &ScannedRepo, opts: &GithubRunOpts, packs: &[Pack], token: &s
     outcome
 }
 
-/// Phase two: remediate the scanned repos, reusing their clones (no re-clone). When
-/// `selected` is `Some`, only repos whose `full_name` is in the set are fixed; every
-/// other repo is reported unchanged. `None` fixes all infected repos (subject to
-/// `opts.fix`). Per-repo failures are captured in `RepoOutcome.error`; the run never
-/// aborts.
+/// Phase two: remediate the scanned repos, cloning ON DEMAND only the repos being
+/// fixed. When `selected` is `Some`, only repos whose `full_name` is in the set are
+/// fixed; every other repo is reported unchanged. The temp clone dir (when no
+/// explicit `clone_dir` is given) is dropped at the end of this function, deleting
+/// the credentialed clones. Per-repo failures are captured; the run never aborts.
 pub fn fix_pass(
     scan: &ScanPass,
     opts: &GithubRunOpts,
@@ -331,11 +418,26 @@ pub fn fix_pass(
     token: &str,
     selected: Option<&HashSet<String>>,
 ) -> Vec<RepoOutcome> {
+    // A clone base is only needed when something will actually be written.
+    let mut _tmp = None;
+    let base: Option<PathBuf> = if opts.fix && opts.yes {
+        match &opts.clone_dir {
+            Some(d) => std::fs::create_dir_all(d).ok().map(|_| d.clone()),
+            None => tempfile::TempDir::new().ok().map(|t| {
+                let p = t.path().to_path_buf();
+                _tmp = Some(t);
+                p
+            }),
+        }
+    } else {
+        None
+    };
+
     scan.repos
         .par_iter()
         .map(|sr| {
             let chosen = selected.is_none_or(|s| s.contains(&sr.repo.full_name));
-            fix_scanned(sr, opts, packs, token, opts.fix && chosen)
+            fix_scanned(sr, opts, packs, token, opts.fix && chosen, base.as_deref())
         })
         .collect()
 }
@@ -558,6 +660,8 @@ mod tests {
         assert!(outcomes[0].error.is_none(), "unexpected error: {:?}", outcomes[0].error);
         assert!(!outcomes[0].findings.is_empty());
         assert!(!outcomes[0].actions.is_empty());
+        // The fix cloned on demand into clone_dir.
+        assert!(tmp.path().join("work").join("me__proj").exists());
     }
 
     #[test]
@@ -584,9 +688,15 @@ mod tests {
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
         assert!(!outcomes[0].actions.is_empty());
         assert!(outcomes[0].pushed.is_empty());
-        // The infected file in the working tree must be untouched by a dry run.
-        let cloned = clone_dir.join("me__proj").join("postcss.config.mjs");
-        assert!(std::fs::read_to_string(&cloned).unwrap().contains("rmcej%otb%"));
+        // A dry run touches nothing: no clone is created and the origin keeps the payload.
+        assert!(!clone_dir.exists(), "dry run must not clone anything");
+        let show = Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["show", "main:postcss.config.mjs"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&show.stdout).contains("rmcej%otb%"));
     }
 
     #[test]
@@ -735,8 +845,58 @@ mod tests {
         assert!(by("me/a").error.is_none());
         assert!(by("me/b").error.is_none());
 
-        // The deselected clone's working tree is still infected on disk (never remediated).
-        let b_file = clone_dir.join("me__b").join("postcss.config.mjs");
-        assert!(std::fs::read_to_string(&b_file).unwrap().contains("rmcej%otb%"));
+        // The deselected repo was never cloned, and its origin is still infected.
+        assert!(!clone_dir.join("me__b").exists(), "deselected repo must not be cloned");
+        let show = Command::new("git")
+            .arg("-C")
+            .arg(&bare_b)
+            .args(["show", "main:postcss.config.mjs"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&show.stdout).contains("rmcej%otb%"));
+    }
+
+    #[test]
+    fn clean_repos_never_touch_disk() {
+        // A clean account scans and "fixes" without a single clone directory appearing.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("clean-src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("postcss.config.mjs"), "export default {};\n").unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "clean"]);
+        let bare = tmp.path().join("clean.git");
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+
+        let clone_dir = tmp.path().join("work");
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/clean".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: Some(clone_dir.clone()),
+            include_forks: false,
+            fix: true,
+            push: false,
+            yes: true,
+        };
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
+        assert!(outcomes[0].findings.is_empty());
+        assert!(outcomes[0].error.is_none());
+        assert!(
+            !clone_dir.join("me__clean").exists(),
+            "clean repo must never be cloned"
+        );
     }
 }
