@@ -128,11 +128,27 @@ pub struct ScanPass {
 }
 
 impl ScanPass {
-    /// `full_name`s of infected repos, i.e. the candidates for interactive selection.
+    /// `full_name`s of every infected repo (working-tree OR branch-only), for reporting.
     pub fn infected_full_names(&self) -> Vec<String> {
         self.repos
             .iter()
             .filter(|r| r.is_infected())
+            .map(|r| r.repo.full_name.clone())
+            .collect()
+    }
+
+    /// `full_name`s of infected repos whose *default working tree* has at least one
+    /// applicable remediation action — the only repos `fix_scanned` can actually fix, and
+    /// therefore the only sensible candidates for interactive selection.
+    ///
+    /// A repo infected solely on a non-default branch has findings but no working-tree
+    /// action (`plan_remediation` routes branch-tip findings, which carry a `git_ref`, to
+    /// `manual`), so it is excluded here even though it remains in the scan results/output.
+    pub fn fixable_full_names(&self, packs: &[Pack]) -> Vec<String> {
+        self.repos
+            .iter()
+            .filter(|r| r.is_infected())
+            .filter(|r| !plan_remediation(&r.findings, packs).actions.is_empty())
             .map(|r| r.repo.full_name.clone())
             .collect()
     }
@@ -391,6 +407,38 @@ mod tests {
         bare
     }
 
+    /// Build a bare origin whose default branch (`main`) is CLEAN but a non-default
+    /// branch (`evil`) carries the payload. A deep scan flags it (branch-only), yet its
+    /// default working tree has no remediation action.
+    fn make_branch_only_infected_origin(tmp: &TempDir, name: &str) -> PathBuf {
+        let src = tmp.path().join(format!("{name}-src"));
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("postcss.config.mjs"), "export default {};\n").unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "clean"]);
+        // Infect only a non-default branch.
+        git_ok(&src, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='8-270-2';\n(\"rmcej%otb%\",2857687)\n",
+        )
+        .unwrap();
+        git_ok(&src, &["commit", "-q", "--no-verify", "-am", "payload"]);
+        git_ok(&src, &["checkout", "-q", "main"]);
+
+        let bare = tmp.path().join(format!("{name}.git"));
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+        git_ok(&src, &["push", "-q", "origin", "evil"]);
+        bare
+    }
+
     fn make_infected_origin(tmp: &TempDir) -> PathBuf {
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -519,6 +567,56 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&branches.stdout).contains("wormward-backup/main-"));
+    }
+
+    #[test]
+    fn branch_only_infection_is_reported_but_not_a_fix_candidate() {
+        // Two infected repos: one infected only on a non-default branch, one infected in
+        // its default working tree. Both must appear in the scan results (infected list),
+        // but only the working-tree one is a fixable-selection candidate — offering the
+        // branch-only repo would be a no-op since fix_scanned only touches the default tree.
+        let tmp = TempDir::new().unwrap();
+        let bare_branch_only = make_branch_only_infected_origin(&tmp, "branchonly");
+        let bare_working_tree = make_infected_origin_named(&tmp, "wt");
+        let clone_dir = tmp.path().join("work");
+        let host = FakeMultiHost {
+            repos: vec![
+                RepoRef {
+                    full_name: "me/branchonly".into(),
+                    clone_url: bare_branch_only.to_string_lossy().to_string(),
+                    default_branch: "main".into(),
+                    fork: false,
+                },
+                RepoRef {
+                    full_name: "me/wt".into(),
+                    clone_url: bare_working_tree.to_string_lossy().to_string(),
+                    default_branch: "main".into(),
+                    fork: false,
+                },
+            ],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: Some(clone_dir),
+            include_forks: false,
+            fix: true,
+            push: false,
+            yes: true,
+        };
+
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+
+        // Both repos are detected as infected (branch-only via deep scan, wt via working tree).
+        let mut infected = scan.infected_full_names();
+        infected.sort();
+        assert_eq!(infected, vec!["me/branchonly".to_string(), "me/wt".to_string()]);
+
+        // ...but only the working-tree-infected repo is a fixable-selection candidate.
+        let fixable = scan.fixable_full_names(&builtin_packs());
+        assert_eq!(
+            fixable,
+            vec!["me/wt".to_string()],
+            "branch-only infection must not be offered as a fixable candidate"
+        );
     }
 
     #[test]
