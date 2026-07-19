@@ -6,8 +6,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use wormward_core::{
-    amend_head, apply, commit_paths, discover_repos, force_push_with_lease, plan_remediation, push,
-    restore, scan, scan_deep, scan_repo,
+    amend_head, apply, apply_branch_cleans, commit_paths, deep_scan_repo, discover_repos,
+    force_push_with_lease, now_secs, plan_branch_cleans, plan_remediation, push, restore, scan,
+    scan_deep, scan_repo, BranchCleanStatus,
 };
 use wormward_osm::OsmClient;
 use wormward_packs::builtin_packs;
@@ -70,6 +71,10 @@ enum Command {
         /// With --push, amend HEAD instead of adding a commit, then push --force-with-lease.
         #[arg(long)]
         rewrite: bool,
+        /// Also clean infected tips of branches other than the one checked out (via isolated
+        /// worktrees). With --apply --push --yes, force-pushes each cleaned branch.
+        #[arg(long = "all-branches")]
+        all_branches: bool,
         /// Required confirmation for the destructive --push / --rewrite git operations.
         #[arg(long)]
         yes: bool,
@@ -225,7 +230,15 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Clean { dirs, apply: do_apply, no_backup, push: do_push, rewrite, yes } => {
+        Command::Clean {
+            dirs,
+            apply: do_apply,
+            no_backup,
+            push: do_push,
+            rewrite,
+            all_branches,
+            yes,
+        } => {
             for dir in &dirs {
                 if !dir.exists() {
                     eprintln!("error: path does not exist: {}", dir.display());
@@ -256,7 +269,13 @@ fn main() -> ExitCode {
                 for repo in discover_repos(dir) {
                     let findings = scan_repo(&repo, &packs);
                     let plan = plan_remediation(&findings, &packs);
-                    if plan.actions.is_empty() && plan.manual.is_empty() {
+                    // Cross-branch: plan cleans for infected tips of other branches.
+                    let branch_plans = if all_branches {
+                        plan_branch_cleans(&deep_scan_repo(&repo, &packs), &packs, now_secs())
+                    } else {
+                        Vec::new()
+                    };
+                    if plan.actions.is_empty() && plan.manual.is_empty() && branch_plans.is_empty() {
                         continue;
                     }
                     println!("{}", repo.display());
@@ -318,6 +337,38 @@ fn main() -> ExitCode {
                                     eprintln!("  note: local changes were applied; run 'wormward restore' to revert, or fix git and retry");
                                     total_failed += 1;
                                 }
+                            }
+                        }
+                    }
+
+                    // Cross-branch cleaning of other infected branch tips.
+                    for bp in &branch_plans {
+                        println!("  branch {}:", bp.branch);
+                        for a in &bp.actions {
+                            println!("    would {}", describe_action(a));
+                        }
+                        total_actions += bp.actions.len();
+                    }
+                    if do_apply && !branch_plans.is_empty() {
+                        // Force-push gating matches the working-tree path: the earlier
+                        // `(do_push || rewrite) && !yes` guard already enforced --yes.
+                        let outcomes = apply_branch_cleans(&branch_plans, false, do_push);
+                        for o in &outcomes {
+                            match &o.status {
+                                BranchCleanStatus::Cleaned { backup_ref } => println!(
+                                    "  branch {}: cleaned{} (backup {})",
+                                    o.plan.branch,
+                                    if do_push { ", pushed" } else { "" },
+                                    backup_ref
+                                ),
+                                BranchCleanStatus::Skipped(why) => {
+                                    println!("  branch {}: skipped — {why}", o.plan.branch)
+                                }
+                                BranchCleanStatus::Failed(why) => {
+                                    eprintln!("  branch {}: failed — {why}", o.plan.branch);
+                                    total_failed += 1;
+                                }
+                                BranchCleanStatus::Planned => {}
                             }
                         }
                     }
