@@ -58,6 +58,7 @@ mod tests {
                 kind: FindingKind::ContentSignature,
                 evidence: "content signature 'primary' matched".into(),
                 remediable: true,
+                online: None,
             }],
         }
     }

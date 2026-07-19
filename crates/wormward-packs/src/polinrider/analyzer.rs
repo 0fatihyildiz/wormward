@@ -27,6 +27,7 @@ impl CampaignAnalyzer for PolinriderAnalyzer {
                     "confirmed obfuscation: injection marker + decoder '{decoder}'"
                 ),
                 remediable: true,
+                online: None,
             }],
             _ => vec![],
         }

@@ -24,6 +24,15 @@ pub enum FindingKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OnlineVerdict {
+    pub malicious: bool,
+    pub severity: Option<String>,
+    pub osm_url: String,
+    pub threat_id: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Finding {
     pub campaign: String,
     pub severity: Severity,
@@ -33,6 +42,8 @@ pub struct Finding {
     pub kind: FindingKind,
     pub evidence: String,
     pub remediable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<OnlineVerdict>,
 }
 
 #[cfg(test)]
@@ -49,5 +60,38 @@ mod tests {
     fn finding_kind_serializes_snake_case() {
         let json = serde_json::to_string(&FindingKind::ContentSignature).unwrap();
         assert_eq!(json, "\"content_signature\"");
+    }
+
+    fn sample_finding(online: Option<OnlineVerdict>) -> Finding {
+        Finding {
+            campaign: "c".into(),
+            severity: Severity::High,
+            repo: PathBuf::from("/r"),
+            file: None,
+            signature_id: "s".into(),
+            kind: FindingKind::NpmPackage,
+            evidence: "e".into(),
+            remediable: false,
+            online,
+        }
+    }
+
+    #[test]
+    fn online_field_omitted_when_none() {
+        let json = serde_json::to_string(&sample_finding(None)).unwrap();
+        assert!(!json.contains("online"));
+    }
+
+    #[test]
+    fn online_field_present_when_set() {
+        let f = sample_finding(Some(OnlineVerdict {
+            malicious: true,
+            severity: Some("high".into()),
+            osm_url: "https://osm/x".into(),
+            threat_id: Some("t".into()),
+            message: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["online"]["malicious"], true);
     }
 }

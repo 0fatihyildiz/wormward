@@ -45,6 +45,7 @@ fn check_artifacts(repo: &Path, pack: &Pack) -> Vec<Finding> {
                 kind: FindingKind::Artifact,
                 evidence: format!("{} present ({})", artifact.path, artifact.label),
                 remediable: true,
+                online: None,
             });
         }
     }
@@ -72,6 +73,7 @@ fn check_gitignore(repo: &Path, pack: &Pack) -> Vec<Finding> {
                 kind: FindingKind::GitignoreInjection,
                 evidence: format!("'{injected}' injected into .gitignore"),
                 remediable: true,
+                online: None,
             });
         }
     }
@@ -100,6 +102,7 @@ fn check_npm(repo: &Path, pack: &Pack) -> Vec<Finding> {
                 kind: FindingKind::NpmPackage,
                 evidence: format!("malicious dependency '{bad}' in package.json"),
                 remediable: false,
+                online: None,
             });
         }
     }
@@ -132,6 +135,7 @@ pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
                         kind: FindingKind::ContentSignature,
                         evidence: format!("content signature '{}' matched", sig.id),
                         remediable: true,
+                        online: None,
                     });
                 }
             }
@@ -148,6 +152,7 @@ pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
                         kind: FindingKind::IocDomain,
                         evidence: format!("C2 indicator domain '{domain}' referenced"),
                         remediable: false,
+                        online: None,
                     });
                 }
             }
@@ -177,6 +182,7 @@ pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
             kind: FindingKind::GitReflog,
             evidence: "amended commits found in reflog (consistent with worm propagation)".into(),
             remediable: false,
+            online: None,
         });
     }
     findings
@@ -298,6 +304,7 @@ mod tests {
                         kind: FindingKind::Analyzer,
                         evidence: "stub".into(),
                         remediable: true,
+                        online: None,
                     }]
                 } else {
                     vec![]
