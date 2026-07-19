@@ -10,7 +10,7 @@ node_modules/
 
 # Tauri generated
 apps/desktop/src-tauri/gen/
-apps/desktop/dist/assets/
+apps/desktop/dist/
 
 # OS / editor
 .DS_Store
