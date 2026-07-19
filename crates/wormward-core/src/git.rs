@@ -72,6 +72,70 @@ pub fn force_push_with_lease(repo: &Path) -> Result<(), String> {
     run_git(repo, &["push", "--force-with-lease"])
 }
 
+/// `git push --force-with-lease <remote> <branch>` — a force-push scoped to exactly one
+/// branch. Used when cleaning a remote-tracking tip (e.g. `origin/evil`), where the temp
+/// worktree's local branch has no upstream configured for a bare `push`.
+pub fn force_push_with_lease_to(repo: &Path, remote: &str, branch: &str) -> Result<(), String> {
+    run_git(repo, &["push", "--force-with-lease", remote, branch])
+}
+
+/// Run git and capture trimmed stdout on success.
+fn run_git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Resolve a revision to its full commit oid (`git rev-parse <rev>`).
+pub fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
+    run_git_stdout(repo, &["rev-parse", rev])
+}
+
+/// Whether a ref resolves (`git rev-parse --verify --quiet <refname>`).
+pub fn verify_ref(repo: &Path, refname: &str) -> bool {
+    run_git(repo, &["rev-parse", "--verify", "--quiet", refname]).is_ok()
+}
+
+/// Point a ref at a value (`git update-ref <name> <value>`). Used to snapshot a branch tip
+/// into `refs/wormward-backup/...` before rewriting it.
+pub fn update_ref(repo: &Path, name: &str, value: &str) -> Result<(), String> {
+    run_git(repo, &["update-ref", name, value])
+}
+
+/// `git worktree add <path> <branch>` — check out an existing local branch into an isolated
+/// worktree so its tip can be cleaned without disturbing the user's checkout.
+pub fn worktree_add(repo: &Path, path: &Path, branch: &str) -> Result<(), String> {
+    let p = path.to_string_lossy();
+    run_git(repo, &["worktree", "add", p.as_ref(), branch])
+}
+
+/// `git worktree add <path> -b <new_branch> <start>` — create a fresh local branch from a
+/// start-point (e.g. a remote-tracking ref) in an isolated worktree.
+pub fn worktree_add_new_branch(
+    repo: &Path,
+    path: &Path,
+    new_branch: &str,
+    start: &str,
+) -> Result<(), String> {
+    let p = path.to_string_lossy();
+    run_git(repo, &["worktree", "add", p.as_ref(), "-b", new_branch, start])
+}
+
+/// `git worktree remove --force <path>` — always run after a branch clean, success or not.
+pub fn worktree_remove(repo: &Path, path: &Path) -> Result<(), String> {
+    let p = path.to_string_lossy();
+    run_git(repo, &["worktree", "remove", "--force", p.as_ref()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
