@@ -245,21 +245,24 @@ fn push_if_gated(
 }
 
 /// Promote local `node ./X.js` targets of an auto-run command to `DerivedScript`
-/// units and score them (one hop, deduped per tree).
+/// units and score them (one hop). `scored` dedups against files already scored
+/// under another surface, so a reachable file is never double-reported.
 fn expand_derived(
     findings: &mut Vec<Finding>,
     repo: &Path,
     files: &dyn RepoFiles,
-    seen: &mut HashSet<PathBuf>,
+    scored: &mut HashSet<PathBuf>,
     command: &str,
 ) {
     for tgt in derived_targets(command) {
         let tp = PathBuf::from(&tgt);
-        if is_excluded_path(&tp) || !seen.insert(tp.clone()) {
+        if is_excluded_path(&tp) || !scored.insert(tp.clone()) {
             continue;
         }
         if let Some(dc) = files.read(&tp) {
-            push_if_gated(findings, repo, tp, Surface::DerivedScript, &dc);
+            if dc.len() <= MAX_CONTENT_BYTES && !looks_binary(&dc) {
+                push_if_gated(findings, repo, tp, Surface::DerivedScript, &dc);
+            }
         }
     }
 }
@@ -269,57 +272,61 @@ fn expand_derived(
 /// is separate (`scan_git_hooks`) because it applies only to the working tree.
 pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let mut derived_seen: HashSet<PathBuf> = HashSet::new();
+    // Real file paths already scored under some surface — prevents a reachable
+    // DerivedScript that is also a classified ConfigFile from double-reporting.
+    let mut scored: HashSet<PathBuf> = HashSet::new();
 
     for rel in files.paths() {
         if is_excluded_path(rel) {
             continue;
         }
+        // Read each file once; skip oversized/binary blobs (mirrors scan_files).
+        let content = match files.read(rel) {
+            Some(c) if c.len() <= MAX_CONTENT_BYTES && !looks_binary(&c) => c,
+            _ => continue,
+        };
+
         if let Some(surface) = classify(rel) {
-            if let Some(content) = files.read(rel) {
-                if surface == Surface::TasksJson {
-                    let low = content.to_lowercase();
-                    if !(low.contains("folderopen") || low.contains("allowautomatictasks")) {
-                        continue;
-                    }
+            // A folderOpen precondition gates TasksJson (auto-runs on folder open only).
+            let auto_run_ok = surface != Surface::TasksJson || {
+                let low = content.to_lowercase();
+                low.contains("folderopen") || low.contains("allowautomatictasks")
+            };
+            if auto_run_ok {
+                if scored.insert(rel.clone()) {
+                    push_if_gated(&mut findings, repo, rel.clone(), surface, &content);
                 }
-                push_if_gated(&mut findings, repo, rel.clone(), surface, &content);
                 if matches!(surface, Surface::WorkflowFile | Surface::TasksJson) {
-                    expand_derived(&mut findings, repo, files, &mut derived_seen, &content);
+                    expand_derived(&mut findings, repo, files, &mut scored, &content);
                 }
             }
         }
 
         if rel.file_name().map(|n| n == "package.json").unwrap_or(false) {
-            if let Some(pj) = files.read(rel) {
-                for (key, script) in lifecycle_scripts(&pj) {
-                    let vfile = PathBuf::from(format!("{}#{}", rel.display(), key));
-                    push_if_gated(&mut findings, repo, vfile, Surface::LifecycleScript, &script);
-                    expand_derived(&mut findings, repo, files, &mut derived_seen, &script);
-                }
+            for (key, script) in lifecycle_scripts(&content) {
+                let vfile = PathBuf::from(format!("{}#{}", rel.display(), key));
+                push_if_gated(&mut findings, repo, vfile, Surface::LifecycleScript, &script);
+                expand_derived(&mut findings, repo, files, &mut scored, &script);
             }
         }
 
         // ExfilStaging: root-level *.json holding a base64 credential blob.
         if rel.parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true)
             && rel.extension().map(|e| e == "json").unwrap_or(false)
+            && is_exfil_staging(&content)
         {
-            if let Some(c) = files.read(rel) {
-                if is_exfil_staging(&c) {
-                    findings.push(Finding {
-                        campaign: "generic".into(),
-                        severity: Severity::Critical,
-                        repo: repo.to_path_buf(),
-                        file: Some(rel.clone()),
-                        signature_id: "capability:exfil-staging".into(),
-                        kind: FindingKind::Capability,
-                        evidence: format!("exfil-staging: base64 credential blob ({})", rel.display()),
-                        remediable: false,
-                        online: None,
-                        git_ref: None,
-                    });
-                }
-            }
+            findings.push(Finding {
+                campaign: "generic".into(),
+                severity: Severity::Critical,
+                repo: repo.to_path_buf(),
+                file: Some(rel.clone()),
+                signature_id: "capability:exfil-staging".into(),
+                kind: FindingKind::Capability,
+                evidence: format!("exfil-staging: base64 credential blob ({})", rel.display()),
+                remediable: false,
+                online: None,
+                git_ref: None,
+            });
         }
     }
 
@@ -346,14 +353,37 @@ fn scan_git_hooks(repo: &Path) -> Vec<Finding> {
     findings
 }
 
+/// When a campaign (pack) finding already covers a file, drop the additive generic
+/// capability finding on that same file so the report shows the more actionable,
+/// remediable, campaign-attributed finding rather than a duplicate.
+fn dedup_capability_against_packs(findings: &mut Vec<Finding>) {
+    let pack_files: HashSet<PathBuf> = findings
+        .iter()
+        .filter(|f| f.kind != FindingKind::Capability)
+        .filter_map(|f| f.file.clone())
+        .collect();
+    findings.retain(|f| {
+        f.kind != FindingKind::Capability
+            || f.file.as_ref().map(|p| !pack_files.contains(p)).unwrap_or(true)
+    });
+}
+
 pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
     let working = WorkingTree::new(repo);
     let mut findings = scan_files(repo, &working, packs);
     findings.extend(scan_capabilities(repo, &working));
     findings.extend(scan_git_hooks(repo));
+    dedup_capability_against_packs(&mut findings);
 
     if !findings.is_empty() && reflog_has_amend(repo) {
-        let campaign = findings[0].campaign.clone();
+        // Attribute the reflog corroboration to a campaign (pack) finding when one
+        // exists; fall back to "generic" only if every finding is capability-only.
+        let campaign = findings
+            .iter()
+            .map(|f| f.campaign.as_str())
+            .find(|c| *c != "generic")
+            .unwrap_or("generic")
+            .to_string();
         findings.push(Finding {
             campaign,
             severity: Severity::Medium,
@@ -449,6 +479,7 @@ pub fn deep_scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
         };
         let mut tree_findings = scan_files(repo, &tree, packs);
         tree_findings.extend(scan_capabilities(repo, &tree));
+        dedup_capability_against_packs(&mut tree_findings);
         for f in &mut tree_findings {
             f.git_ref = Some(name.clone());
         }

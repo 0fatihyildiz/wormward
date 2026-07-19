@@ -18,7 +18,7 @@ pub use git::{
     force_push_with_lease_to, push, reflog_has_amend, rev_parse, update_ref, verify_ref,
     worktree_add, worktree_add_new_branch, worktree_prune, worktree_remove,
 };
-pub use matchers::{shannon_entropy, sha256_hex, signature_matches, ContentSignature, SignatureKind};
+pub use matchers::{shannon_entropy, sha256_hex, ContentSignature, SignatureKind};
 pub use pack::{CampaignAnalyzer, Pack, PackError, PackManifest, ScannedFile};
 pub use remediate::{
     action_for, apply, plan_remediation, restore, RemediationAction, RemediationPlan,

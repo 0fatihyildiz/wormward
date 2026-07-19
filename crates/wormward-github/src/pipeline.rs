@@ -474,7 +474,10 @@ fn fix_scanned(
 
     let paths: Vec<PathBuf> = res.applied.iter().map(|a| a.target().to_path_buf()).collect();
     let campaigns = {
-        let mut c: Vec<&str> = local.iter().map(|f| f.campaign.as_str()).collect();
+        // Only campaigns whose findings are actually remediable can have produced the
+        // applied actions; non-remediable ones (e.g. capability "generic") were not
+        // remediated and must not be claimed in the commit message.
+        let mut c: Vec<&str> = local.iter().filter(|f| f.remediable).map(|f| f.campaign.as_str()).collect();
         c.sort();
         c.dedup();
         c.join(", ")
