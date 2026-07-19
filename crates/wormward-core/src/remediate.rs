@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::finding::{Finding, FindingKind};
 use crate::pack::Pack;
@@ -87,12 +88,98 @@ pub fn plan_remediation(findings: &[Finding], packs: &[Pack]) -> RemediationPlan
     RemediationPlan { actions, manual }
 }
 
+pub struct RemediationResult {
+    pub applied: Vec<RemediationAction>,
+    pub skipped: Vec<(RemediationAction, String)>,
+    pub backup_dir: Option<PathBuf>,
+}
+
+fn backup_file(repo: &Path, rel: &Path, backup_dir: &Path) {
+    let src = repo.join(rel);
+    if !src.is_file() {
+        return;
+    }
+    let dst = backup_dir.join(rel);
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(&src, &dst);
+}
+
+fn earliest_marker(content: &str, markers: &[String]) -> Option<usize> {
+    markers.iter().filter_map(|m| content.find(m)).min()
+}
+
+/// Apply actions in the working tree, backing up each target first (unless disabled).
+pub fn apply(repo: &Path, actions: &[RemediationAction], backup: bool) -> RemediationResult {
+    let backup_dir = if backup && !actions.is_empty() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = repo.join(".wormward-backup").join(ts.to_string());
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir)
+    } else {
+        None
+    };
+
+    let mut applied = Vec::new();
+    let mut skipped = Vec::new();
+
+    for action in actions {
+        if let Some(bd) = &backup_dir {
+            backup_file(repo, action.target(), bd);
+        }
+        let result: Result<(), String> = match action {
+            RemediationAction::DeleteFile { file } => {
+                std::fs::remove_file(repo.join(file)).map_err(|e| e.to_string())
+            }
+            RemediationAction::StripPayload { file, markers } => {
+                let path = repo.join(file);
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => match earliest_marker(&content, markers) {
+                        Some(idx) => {
+                            let cleaned = format!("{}\n", content[..idx].trim_end());
+                            std::fs::write(&path, cleaned).map_err(|e| e.to_string())
+                        }
+                        None => Err("no strip marker found in file".to_string()),
+                    },
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            RemediationAction::RemoveGitignoreLine { file, line } => {
+                let path = repo.join(file);
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        let kept: Vec<&str> =
+                            content.lines().filter(|l| l.trim() != line).collect();
+                        let mut out = kept.join("\n");
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        std::fs::write(&path, out).map_err(|e| e.to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        };
+        match result {
+            Ok(()) => applied.push(action.clone()),
+            Err(e) => skipped.push((action.clone(), e)),
+        }
+    }
+    RemediationResult { applied, skipped, backup_dir }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::finding::Severity;
     use crate::matchers::{ContentSignature, SignatureKind};
     use crate::pack::{Pack, PackManifest, PayloadStrip, Remediation};
+    use std::fs;
+    use tempfile::TempDir;
 
     fn polinrider_pack() -> Pack {
         let manifest = PackManifest {
@@ -199,5 +286,60 @@ mod tests {
             &[polinrider_pack()],
         );
         assert_eq!(plan.actions.len(), 1);
+    }
+
+    #[test]
+    fn strip_removes_payload_keeps_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        fs::write(repo.join("postcss.config.mjs"), "export default {};\nglobal['!']='8';var x='rmcej%otb%';").unwrap();
+        let a = RemediationAction::StripPayload {
+            file: PathBuf::from("postcss.config.mjs"),
+            markers: vec!["global['!']=".into()],
+        };
+        let r = apply(repo, &[a], false);
+        assert_eq!(r.applied.len(), 1);
+        assert_eq!(fs::read_to_string(repo.join("postcss.config.mjs")).unwrap(), "export default {};\n");
+    }
+
+    #[test]
+    fn strip_without_marker_is_skipped_and_file_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        fs::write(repo.join("f.mjs"), "var q='rmcej%otb%';").unwrap();
+        let a = RemediationAction::StripPayload {
+            file: PathBuf::from("f.mjs"),
+            markers: vec!["global['!']=".into()],
+        };
+        let r = apply(repo, &[a], false);
+        assert_eq!(r.skipped.len(), 1);
+        assert_eq!(fs::read_to_string(repo.join("f.mjs")).unwrap(), "var q='rmcej%otb%';");
+    }
+
+    #[test]
+    fn delete_removes_file_and_backs_it_up() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        fs::write(repo.join("temp_auto_push.bat"), "@echo off").unwrap();
+        let a = RemediationAction::DeleteFile { file: PathBuf::from("temp_auto_push.bat") };
+        let r = apply(repo, &[a], true);
+        assert!(!repo.join("temp_auto_push.bat").exists());
+        let bd = r.backup_dir.unwrap();
+        assert!(bd.join("temp_auto_push.bat").is_file());
+    }
+
+    #[test]
+    fn remove_gitignore_line_drops_only_that_line() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        fs::write(repo.join(".gitignore"), "node_modules\nconfig.bat\ndist\n").unwrap();
+        let a = RemediationAction::RemoveGitignoreLine {
+            file: PathBuf::from(".gitignore"),
+            line: "config.bat".into(),
+        };
+        apply(repo, &[a], false);
+        let out = fs::read_to_string(repo.join(".gitignore")).unwrap();
+        assert!(!out.contains("config.bat"));
+        assert!(out.contains("node_modules") && out.contains("dist"));
     }
 }
