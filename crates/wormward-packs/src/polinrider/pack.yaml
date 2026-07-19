@@ -1,0 +1,63 @@
+id: polinrider
+name: PolinRider
+description: >
+  DPRK supply-chain campaign. Obfuscated JavaScript is appended to the end of
+  JS build-config files; a temp_auto_push.bat propagates via amended commits.
+references:
+  - https://github.com/OpenSourceMalware/PolinRider
+severity: critical
+
+target_files:
+  - "postcss.config.mjs"
+  - "postcss.config.js"
+  - "tailwind.config.js"
+  - "eslint.config.mjs"
+  - "next.config.mjs"
+  - "next.config.ts"
+  - "babel.config.js"
+  - "jest.config.js"
+
+content_signatures:
+  - id: primary
+    kind: literal
+    value: '("rmcej%otb%",2857687)'
+  - id: secondary
+    kind: literal
+    value: "global['!']='8-270-2';var _$_1e42="
+  - id: variant-april
+    kind: literal
+    value: '"Cot%3t=shtP"'
+
+artifacts:
+  - path: "temp_auto_push.bat"
+    label: "Propagation script"
+  - path: "config.bat"
+    label: "Hidden orchestrator"
+
+gitignore_injections:
+  - "config.bat"
+
+bad_npm_packages:
+  - tailwindcss-style-animate
+  - tailwind-mainanimation
+  - tailwind-autoanimation
+  - tailwind-animationbased
+  - tailwindcss-typography-style
+  - tailwindcss-style-modify
+  - tailwindcss-animate-style
+
+ioc_domains:
+  - default-configuration.vercel.app
+  - vscode-settings-bootstrap.vercel.app
+  - vscode-settings-config.vercel.app
+  - vscode-bootstrapper.vercel.app
+  - vscode-load-config.vercel.app
+
+analyzer: polinrider
+
+remediation:
+  config_payload:
+    strategy: strip_after_marker
+    markers:
+      - "global['!']="
+      - "global['_V']="

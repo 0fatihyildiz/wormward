@@ -1,0 +1,12 @@
+[package]
+name = "wormward-packs"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wormward-core = { path = "../wormward-core" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
