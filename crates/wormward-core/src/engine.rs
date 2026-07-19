@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use aho_corasick::AhoCorasick;
-use regex::RegexSet;
+use regex::{RegexSet, RegexSetBuilder};
 
 use crate::finding::Severity;
 use crate::matchers::{sha256_hex, SignatureKind};
@@ -25,7 +25,9 @@ pub struct SignatureEngine {
     literal_meta: Vec<SigMeta>,
     regex_set: Option<RegexSet>,
     regex_meta: Vec<SigMeta>,
-    sha256: HashMap<String, SigMeta>, // lowercase digest -> meta
+    // lowercase digest -> every signature carrying that digest. Multiple packs can
+    // share a digest, so we keep a Vec instead of collapsing to a single meta.
+    sha256: HashMap<String, Vec<SigMeta>>,
 }
 
 impl SignatureEngine {
@@ -34,7 +36,7 @@ impl SignatureEngine {
         let mut literal_meta: Vec<SigMeta> = Vec::new();
         let mut regex_patterns: Vec<String> = Vec::new();
         let mut regex_meta: Vec<SigMeta> = Vec::new();
-        let mut sha256: HashMap<String, SigMeta> = HashMap::new();
+        let mut sha256: HashMap<String, Vec<SigMeta>> = HashMap::new();
 
         for pack in packs {
             let m = &pack.manifest;
@@ -57,7 +59,7 @@ impl SignatureEngine {
                         }
                     }
                     SignatureKind::Sha256 => {
-                        sha256.insert(sig.value.to_ascii_lowercase(), meta);
+                        sha256.entry(sig.value.to_ascii_lowercase()).or_default().push(meta);
                     }
                 }
             }
@@ -66,12 +68,19 @@ impl SignatureEngine {
         let literal = if literal_patterns.is_empty() {
             None
         } else {
+            // A build failure here (`.ok()` -> None) disables literal matching for the
+            // whole run; documented rather than left silent. In practice this only fails
+            // on pathological input, not on well-formed pack literals.
             AhoCorasick::new(&literal_patterns).ok()
         };
         let regex_set = if regex_patterns.is_empty() {
             None
         } else {
-            RegexSet::new(&regex_patterns).ok()
+            // Raise the compiled-program size limit so large combined pattern sets still
+            // compile (the default is easy to exceed once many packs are loaded). A build
+            // failure here (`.ok()` -> None) disables regex matching for the whole run;
+            // documented rather than left silent.
+            RegexSetBuilder::new(&regex_patterns).size_limit(1 << 24).build().ok()
         };
 
         SignatureEngine { literal, literal_meta, regex_set, regex_meta, sha256 }
@@ -109,12 +118,15 @@ impl SignatureEngine {
 
         if !self.sha256.is_empty() {
             let digest = sha256_hex(content.as_bytes());
-            if let Some(meta) = self.sha256.get(&digest) {
-                hits.push(SigHit {
-                    pack_id: meta.pack_id.clone(),
-                    signature_id: meta.signature_id.clone(),
-                    severity: meta.severity.clone(),
-                });
+            if let Some(metas) = self.sha256.get(&digest) {
+                // Multiple signatures can share a digest; emit a hit for every one.
+                for meta in metas {
+                    hits.push(SigHit {
+                        pack_id: meta.pack_id.clone(),
+                        signature_id: meta.signature_id.clone(),
+                        severity: meta.severity.clone(),
+                    });
+                }
             }
         }
 
@@ -130,8 +142,12 @@ mod tests {
     use crate::pack::{Pack, PackManifest};
 
     fn pack_with(sigs: Vec<ContentSignature>) -> Pack {
+        pack_with_id("polinrider", sigs)
+    }
+
+    fn pack_with_id(id: &str, sigs: Vec<ContentSignature>) -> Pack {
         let manifest = PackManifest {
-            id: "polinrider".into(),
+            id: id.into(),
             name: "PolinRider".into(),
             description: String::new(),
             references: vec![],
@@ -198,5 +214,20 @@ mod tests {
         let engine = SignatureEngine::build(&[pack]);
         assert_eq!(engine.scan_content("payload").len(), 1);
         assert!(engine.scan_content("other").is_empty());
+    }
+
+    #[test]
+    fn shared_sha256_digest_emits_hit_per_pack() {
+        // Two packs declare the same digest; a matching file must yield one hit each,
+        // not a single collapsed hit.
+        let digest = crate::matchers::sha256_hex(b"payload");
+        let pack_a = pack_with_id("alpha", vec![sig(SignatureKind::Sha256, "h", &digest)]);
+        let pack_b = pack_with_id("beta", vec![sig(SignatureKind::Sha256, "h", &digest)]);
+        let engine = SignatureEngine::build(&[pack_a, pack_b]);
+        let hits = engine.scan_content("payload");
+        assert_eq!(hits.len(), 2);
+        let mut ids: Vec<&str> = hits.iter().map(|h| h.pack_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["alpha", "beta"]);
     }
 }

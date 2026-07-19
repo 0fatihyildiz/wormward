@@ -154,6 +154,9 @@ pub fn scan_files(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Fin
 
         // Content signatures via the shared engine, gated by target membership.
         for hit in engine.scan_content(&content) {
+            // Relies on pack ids being unique: a hit's pack_id must map to exactly one
+            // pack, so this membership check correctly scopes hits to packs targeting
+            // this file. Duplicate pack ids would misattribute or drop hits here.
             if !targeting_ids.contains(hit.pack_id.as_str()) {
                 continue;
             }

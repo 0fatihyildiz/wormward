@@ -23,9 +23,10 @@ fn base_builder(root: &Path) -> WalkBuilder {
 
 pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
     let found = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
-    let mut b = base_builder(root);
-    // Prune node_modules (never a repo root we care about); detect .git in-callback.
-    b.filter_entry(|e| e.file_name() != "node_modules");
+    let b = base_builder(root);
+    // Descend everywhere (including node_modules): the worm can vendor an infected
+    // repo at node_modules/<pkg>/.git, so we must still discover it. We only avoid
+    // descending into .git internals, via WalkState::Skip in the callback below.
     b.build_parallel().run(|| {
         let found = Arc::clone(&found);
         Box::new(move |res| {
@@ -65,7 +66,11 @@ pub fn walk_repo_files(repo: &Path) -> Vec<PathBuf> {
             WalkState::Continue
         })
     });
-    Arc::try_unwrap(files).unwrap().into_inner().unwrap()
+    let mut files = Arc::try_unwrap(files).unwrap().into_inner().unwrap();
+    // The parallel walker yields files in nondeterministic order; sort so findings
+    // (and reflog attribution via findings[0]) are deterministic across runs.
+    files.sort();
+    files
 }
 
 #[cfg(test)]
@@ -92,6 +97,20 @@ mod tests {
         let mut repos = discover_repos(root);
         repos.sort();
         assert_eq!(repos, vec![root.join("a"), root.join("b/c")]);
+    }
+
+    #[test]
+    fn discovers_repo_vendored_under_node_modules() {
+        // The worm can vendor an infected repo at node_modules/<pkg>/.git; discover_repos
+        // must descend into node_modules and still find it.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("app/.git")).unwrap();
+        fs::create_dir_all(root.join("app/node_modules/evil-pkg/.git")).unwrap();
+
+        let repos = discover_repos(root);
+        assert!(repos.contains(&root.join("app")));
+        assert!(repos.contains(&root.join("app/node_modules/evil-pkg")));
     }
 
     #[test]
