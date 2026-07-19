@@ -350,15 +350,23 @@ fn main() -> ExitCode {
                         total_actions += bp.actions.len();
                     }
                     if do_apply && !branch_plans.is_empty() {
-                        // Force-push gating matches the working-tree path: the earlier
-                        // `(do_push || rewrite) && !yes` guard already enforced --yes.
-                        let outcomes = apply_branch_cleans(&branch_plans, false, do_push);
+                        // Cleaning a branch inherently COMMITS (it rewrites a ref), so it is
+                        // destructive and gated behind --yes exactly like the working-tree
+                        // commit/push path. Without --yes it runs as a dry-run (plan only,
+                        // no commits/refs). Force-push only with BOTH --push and --yes.
+                        let outcomes = apply_branch_cleans(&branch_plans, !yes, do_push && yes);
                         for o in &outcomes {
                             match &o.status {
-                                BranchCleanStatus::Cleaned { backup_ref } => println!(
+                                BranchCleanStatus::Cleaned { backup_ref, pushed } => println!(
                                     "  branch {}: cleaned{} (backup {})",
                                     o.plan.branch,
-                                    if do_push { ", pushed" } else { "" },
+                                    if *pushed {
+                                        ", pushed"
+                                    } else if do_push {
+                                        ", not pushed (no upstream)"
+                                    } else {
+                                        ""
+                                    },
                                     backup_ref
                                 ),
                                 BranchCleanStatus::Skipped(why) => {
@@ -368,7 +376,10 @@ fn main() -> ExitCode {
                                     eprintln!("  branch {}: failed — {why}", o.plan.branch);
                                     total_failed += 1;
                                 }
-                                BranchCleanStatus::Planned => {}
+                                BranchCleanStatus::Planned => println!(
+                                    "  branch {}: planned (re-run with --yes to clean and commit)",
+                                    o.plan.branch
+                                ),
                             }
                         }
                     }
