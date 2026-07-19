@@ -249,4 +249,38 @@ fn clean_apply_push_yes_updates_bare_remote() {
     let names = String::from_utf8_lossy(&ls.stdout);
     assert!(!names.contains("temp_auto_push.bat"));
     assert!(names.contains("keep.txt"));
+    assert!(!names.contains(".wormward-backup")); // backup must NOT be pushed to the remote
+}
+
+#[test]
+fn clean_apply_push_rewrite_yes_amends_remote() {
+    use std::process::Command as Cmd;
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        Cmd::new("git").arg("-C").arg(repo).args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+            .status().unwrap();
+    }
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    let remote = tmp.path().join("remote.git");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    Cmd::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+    fs::write(repo.join("postcss.config.mjs"), "export default {};\nglobal['!']='8-270-2';var _$_1e42=[];").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+    let out = bin().arg("clean").arg("--apply").arg("--push").arg("--rewrite").arg("--yes").arg(&repo).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    // HEAD amended in place, not appended.
+    let count = Cmd::new("git").arg("-C").arg(&remote).args(["rev-list", "--count", "main"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+    // Payload gone from the remote's file; backup not pushed.
+    let show = Cmd::new("git").arg("-C").arg(&remote).args(["show", "main:postcss.config.mjs"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&show.stdout).contains("_$_1e42"));
+    let ls = Cmd::new("git").arg("-C").arg(&remote).args(["ls-tree", "--name-only", "main"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&ls.stdout).contains(".wormward-backup"));
 }

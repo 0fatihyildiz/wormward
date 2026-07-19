@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn reflog_has_amend(repo: &Path) -> bool {
@@ -35,15 +35,27 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// `git add -A && git commit -m <message>`.
-pub fn commit_all(repo: &Path, message: &str) -> Result<(), String> {
-    run_git(repo, &["add", "-A"])?;
+/// Stage ONLY the given remediation paths (best-effort per path; ignores a path with
+/// nothing to stage, e.g. an untracked file that was deleted). Critically it never uses
+/// `add -A` on the whole tree, so it never stages the `.wormward-backup/` directory (which
+/// holds the removed payloads) nor unrelated working-tree changes.
+fn stage_paths(repo: &Path, paths: &[PathBuf]) {
+    for p in paths {
+        let s = p.to_string_lossy();
+        let _ = run_git(repo, &["add", "-A", "--", s.as_ref()]);
+    }
+}
+
+/// Stage the given remediation paths and commit them.
+pub fn commit_paths(repo: &Path, message: &str, paths: &[PathBuf]) -> Result<(), String> {
+    stage_paths(repo, paths);
     run_git(repo, &["commit", "-m", message])
 }
 
-/// `git add -A && git commit --amend --no-edit` (rewrites HEAD to include cleaned files).
-pub fn amend_head(repo: &Path) -> Result<(), String> {
-    run_git(repo, &["add", "-A"])?;
+/// Stage the given remediation paths and amend HEAD — rewrites the latest commit in place
+/// (HEAD only, no deeper history rewrite) and reattributes its authorship to wormward.
+pub fn amend_head(repo: &Path, paths: &[PathBuf]) -> Result<(), String> {
+    stage_paths(repo, paths);
     run_git(repo, &["commit", "--amend", "--no-edit"])
 }
 
@@ -117,7 +129,7 @@ mod tests {
         git(&repo, &["push", "-q", "-u", "origin", "main"]);
 
         std::fs::write(repo.join("a.txt"), "two").unwrap();
-        commit_all(&repo, "wormward: remediate").unwrap();
+        commit_paths(&repo, "wormward: remediate", &[PathBuf::from("a.txt")]).unwrap();
         push(&repo).unwrap();
 
         let show = Command::new("git").arg("-C").arg(&remote).args(["show", "main:a.txt"]).output().unwrap();
@@ -139,12 +151,57 @@ mod tests {
         git(&repo, &["push", "-q", "-u", "origin", "main"]);
 
         std::fs::write(repo.join("a.txt"), "clean").unwrap();
-        amend_head(&repo).unwrap();
+        amend_head(&repo, &[PathBuf::from("a.txt")]).unwrap();
         force_push_with_lease(&repo).unwrap();
 
         let show = Command::new("git").arg("-C").arg(&remote).args(["show", "main:a.txt"]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&show.stdout), "clean");
         let count = Command::new("git").arg("-C").arg(&remote).args(["rev-list", "--count", "main"]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+    }
+
+    #[test]
+    fn commit_paths_stages_only_given_paths() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("seed.txt"), "s").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "seed"]);
+        // A cleaned file plus an UNRELATED untracked file that must NOT be committed.
+        std::fs::write(repo.join("cleaned.txt"), "ok").unwrap();
+        std::fs::write(repo.join("unrelated-secret.txt"), "SECRET").unwrap();
+        commit_paths(repo, "wormward: remediate", &[PathBuf::from("cleaned.txt")]).unwrap();
+
+        let files = Command::new("git").arg("-C").arg(repo).args(["show", "--name-only", "--format=", "HEAD"]).output().unwrap();
+        let out = String::from_utf8_lossy(&files.stdout);
+        assert!(out.contains("cleaned.txt"));
+        assert!(!out.contains("unrelated-secret.txt"));
+    }
+
+    #[test]
+    fn force_push_with_lease_rejects_when_remote_moved() {
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("remote.git");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        Command::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        git(&a, &["init", "-q", "-b", "main"]);
+        std::fs::write(a.join("f.txt"), "1").unwrap();
+        git(&a, &["add", "."]);
+        git(&a, &["commit", "-q", "-m", "c1"]);
+        git(&a, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&a, &["push", "-q", "-u", "origin", "main"]);
+        // Clone B advances the remote underneath A.
+        Command::new("git").args(["clone", "-q"]).arg(&remote).arg(&b).status().unwrap();
+        std::fs::write(b.join("f.txt"), "2").unwrap();
+        git(&b, &["add", "."]);
+        git(&b, &["commit", "-q", "-m", "c2"]);
+        git(&b, &["push", "-q", "origin", "main"]);
+        // A is stale; the lease must reject the force-push.
+        std::fs::write(a.join("f.txt"), "3").unwrap();
+        amend_head(&a, &[PathBuf::from("f.txt")]).unwrap();
+        assert!(force_push_with_lease(&a).is_err());
     }
 }

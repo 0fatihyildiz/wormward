@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use wormward_core::{
-    amend_head, apply, commit_all, discover_repos, force_push_with_lease, plan_remediation, push,
+    amend_head, apply, commit_paths, discover_repos, force_push_with_lease, plan_remediation, push,
     restore, scan, scan_deep, scan_repo,
 };
 use wormward_osm::OsmClient;
@@ -248,10 +248,22 @@ fn main() -> ExitCode {
                             println!("  backup: {}", bd.display());
                         }
                         if do_push && !res.applied.is_empty() {
+                            // Stage ONLY the files wormward changed — never the backup dir
+                            // or unrelated working-tree changes.
+                            let paths: Vec<PathBuf> =
+                                res.applied.iter().map(|a| a.target().to_path_buf()).collect();
+                            let campaigns = {
+                                let mut c: Vec<&str> =
+                                    findings.iter().map(|f| f.campaign.as_str()).collect();
+                                c.sort();
+                                c.dedup();
+                                c.join(", ")
+                            };
                             let git_result = if rewrite {
-                                amend_head(&repo).and_then(|_| force_push_with_lease(&repo))
+                                amend_head(&repo, &paths).and_then(|_| force_push_with_lease(&repo))
                             } else {
-                                commit_all(&repo, "wormward: remediate").and_then(|_| push(&repo))
+                                commit_paths(&repo, &format!("wormward: remediate {campaigns}"), &paths)
+                                    .and_then(|_| push(&repo))
                             };
                             match git_result {
                                 Ok(()) => println!(
@@ -264,6 +276,7 @@ fn main() -> ExitCode {
                                 ),
                                 Err(e) => {
                                     eprintln!("  git error: {e}");
+                                    eprintln!("  note: local changes were applied; run 'wormward restore' to revert, or fix git and retry");
                                     total_failed += 1;
                                 }
                             }
