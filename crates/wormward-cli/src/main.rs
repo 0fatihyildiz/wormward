@@ -1,4 +1,3 @@
-mod online;
 mod report;
 
 use std::path::PathBuf;
@@ -172,7 +171,7 @@ fn main() -> ExitCode {
                     }
                 };
                 let client = OsmClient::new(osm_base_url(), token);
-                for w in online::enrich(&mut report.findings, &client) {
+                for w in wormward_osm::enrich(&mut report.findings, &client) {
                     eprintln!("warning: {w}");
                 }
             }

@@ -10,6 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 ureq = { workspace = true }
+wormward-core = { path = "../wormward-core" }
 
 [dev-dependencies]
 httpmock = { workspace = true }

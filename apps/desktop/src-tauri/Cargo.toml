@@ -1,0 +1,27 @@
+[package]
+name = "wormward-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Own workspace — keep out of the root workspace so core builds stay fast.
+[workspace]
+
+[lib]
+name = "wormward_desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wormward-core = { path = "../../../crates/wormward-core" }
+wormward-packs = { path = "../../../crates/wormward-packs" }
+wormward-osm = { path = "../../../crates/wormward-osm" }
+
+[dev-dependencies]
+tempfile = "3"

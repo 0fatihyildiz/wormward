@@ -2159,6 +2159,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "ureq",
+ "wormward-core",
 ]
 
 [[package]]
