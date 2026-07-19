@@ -1,8 +1,14 @@
 id: polinrider
 name: PolinRider
 description: >
-  DPRK supply-chain campaign. Obfuscated JavaScript is appended to the end of
-  JS build-config files; a temp_auto_push.bat propagates via amended commits.
+  DPRK supply-chain campaign. Obfuscated JavaScript is appended to the end of JS
+  build-config files; a temp_auto_push.bat propagates via amended commits, and
+  payloads pull staged code from blockchain dead-drops (TRON/Aptos) and Vercel
+  bootstrap C2. This pack detects the injected payload markers, decoder/seed
+  fingerprints, hardcoded C2 addresses and domains, dropped artifacts, and the
+  StakingGame template UUID. Note: the .woff2 "fake-font" sub-variant is not
+  covered — that filename (e.g. fa-solid-400.woff2) is a legitimate font and
+  flagging it by name would be a false positive.
 references:
   - https://github.com/OpenSourceMalware/PolinRider
 severity: critical
@@ -16,6 +22,16 @@ target_files:
   - "next.config.ts"
   - "babel.config.js"
   - "jest.config.js"
+  - "vite.config.js"
+  - "vite.config.mjs"
+  - "astro.config.mjs"
+  - "webpack.config.js"
+  - "vue.config.js"
+  - "gridsome.config.js"
+  - "truffle.js"
+  - "App.js"
+  - "index.js"
+  - ".vscode/tasks.json"
 
 content_signatures:
   - id: primary
@@ -27,6 +43,30 @@ content_signatures:
   - id: variant-april
     kind: literal
     value: '"Cot%3t=shtP"'
+  - id: decoder-v1
+    kind: literal
+    value: "_$_1e42"
+  - id: xor-key-primary
+    kind: literal
+    value: "2[gWfGj;<:-93Z^C"
+  - id: xor-key-secondary
+    kind: literal
+    value: "m6:tTh^D)cBz?NM]"
+  - id: c2-tron-primary
+    kind: literal
+    value: "TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP"
+  - id: c2-tron-secondary
+    kind: literal
+    value: "TXfxHUet9pJVU1BgVkBAbrES4YUc1nGzcG"
+  - id: c2-aptos-primary
+    kind: literal
+    value: "0xbe037400670fbf1c32364f762975908dc43eeb38759263e7dfcdabc76380811e"
+  - id: c2-aptos-secondary
+    kind: literal
+    value: "0x3f0e5781d0855fb460661ac63257376db1941b2bb522499e4757ecb3ebd5dce3"
+  - id: staking-uuid
+    kind: literal
+    value: "e9b53a7c-2342-4b15-b02d-bd8b8f6a03f9"
 
 artifacts:
   - path: "temp_auto_push.bat"
@@ -52,6 +92,7 @@ ioc_domains:
   - vscode-settings-config.vercel.app
   - vscode-bootstrapper.vercel.app
   - vscode-load-config.vercel.app
+  - 260120.vercel.app
 
 analyzer: polinrider
 
