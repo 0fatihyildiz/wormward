@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target
+**/target
+
+# Node / frontend
+node_modules/
+
+# Local scratch
+.superpowers/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

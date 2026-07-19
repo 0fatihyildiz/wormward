@@ -1,0 +1,136 @@
+use std::path::PathBuf;
+
+use serde::Deserialize;
+
+use crate::finding::{Finding, Severity};
+use crate::matchers::ContentSignature;
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Artifact {
+    pub path: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PayloadStrip {
+    pub strategy: String,
+    #[serde(default)]
+    pub markers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct Remediation {
+    #[serde(default)]
+    pub config_payload: Option<PayloadStrip>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PackManifest {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub references: Vec<String>,
+    pub severity: Severity,
+    #[serde(default)]
+    pub target_files: Vec<String>,
+    #[serde(default)]
+    pub content_signatures: Vec<ContentSignature>,
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub gitignore_injections: Vec<String>,
+    #[serde(default)]
+    pub bad_npm_packages: Vec<String>,
+    #[serde(default)]
+    pub ioc_domains: Vec<String>,
+    #[serde(default)]
+    pub analyzer: Option<String>,
+    #[serde(default)]
+    pub remediation: Option<Remediation>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PackError {
+    #[error("invalid pack manifest: {0}")]
+    Manifest(String),
+}
+
+impl PackManifest {
+    pub fn from_yaml(source: &str) -> Result<PackManifest, PackError> {
+        serde_yaml::from_str(source).map_err(|e| PackError::Manifest(e.to_string()))
+    }
+}
+
+pub struct ScannedFile {
+    pub repo: PathBuf,
+    pub path: PathBuf,
+    pub content: String,
+}
+
+pub trait CampaignAnalyzer: Send + Sync {
+    fn id(&self) -> &str;
+    fn analyze(&self, file: &ScannedFile) -> Vec<Finding>;
+}
+
+pub struct Pack {
+    pub manifest: PackManifest,
+    pub analyzer: Option<Box<dyn CampaignAnalyzer>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::matchers::SignatureKind;
+
+    const SAMPLE: &str = r#"
+id: polinrider
+name: PolinRider
+severity: critical
+target_files:
+  - "postcss.config.mjs"
+content_signatures:
+  - id: primary
+    kind: literal
+    value: '("rmcej%otb%",2857687)'
+artifacts:
+  - path: "temp_auto_push.bat"
+    label: "Propagation script"
+bad_npm_packages:
+  - tailwindcss-style-animate
+analyzer: polinrider
+remediation:
+  config_payload:
+    strategy: strip_after_marker
+    markers: ["global['!']="]
+"#;
+
+    #[test]
+    fn parses_full_manifest() {
+        let m = PackManifest::from_yaml(SAMPLE).unwrap();
+        assert_eq!(m.id, "polinrider");
+        assert_eq!(m.severity, Severity::Critical);
+        assert_eq!(m.target_files, vec!["postcss.config.mjs".to_string()]);
+        assert_eq!(m.content_signatures[0].kind, SignatureKind::Literal);
+        assert_eq!(m.artifacts[0].path, "temp_auto_push.bat");
+        assert_eq!(m.bad_npm_packages, vec!["tailwindcss-style-animate".to_string()]);
+        assert_eq!(m.analyzer.as_deref(), Some("polinrider"));
+        let strip = m.remediation.unwrap().config_payload.unwrap();
+        assert_eq!(strip.strategy, "strip_after_marker");
+    }
+
+    #[test]
+    fn missing_optional_fields_default_empty() {
+        let m = PackManifest::from_yaml("id: x\nname: X\nseverity: high\n").unwrap();
+        assert!(m.target_files.is_empty());
+        assert!(m.artifacts.is_empty());
+        assert!(m.analyzer.is_none());
+    }
+
+    #[test]
+    fn invalid_yaml_is_error() {
+        assert!(PackManifest::from_yaml("id: [unterminated").is_err());
+    }
+}
