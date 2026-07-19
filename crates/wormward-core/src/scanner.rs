@@ -4,11 +4,15 @@ use std::process::Command;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 
+use std::collections::HashSet;
+
+use crate::capability::{gate, is_exfil_staging, score, CapabilityScore};
 use crate::finding::{Finding, FindingKind, Severity};
 use crate::git::reflog_has_amend;
 use crate::matchers::signature_matches;
 use crate::pack::{Pack, ScannedFile};
 use crate::repo_files::{GitTree, RepoFiles, WorkingTree};
+use crate::surface::{classify, derived_targets, is_excluded_path, lifecycle_scripts, Surface};
 use crate::walk::discover_repos;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -179,9 +183,142 @@ pub fn scan_files(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Fin
     findings
 }
 
+fn cap_finding(repo: &Path, file: PathBuf, surface: Surface, s: &CapabilityScore) -> Finding {
+    let top = s.evidence.first().cloned().unwrap_or_else(|| "capability".into());
+    Finding {
+        campaign: "generic".into(),
+        severity: Severity::Critical,
+        repo: repo.to_path_buf(),
+        file: Some(file),
+        signature_id: format!("capability:{surface:?}:{top}"),
+        kind: FindingKind::Capability,
+        evidence: format!("auto-run {surface:?}: {}", s.evidence.join(" + ")),
+        remediable: false,
+        online: None,
+        git_ref: None,
+    }
+}
+
+fn push_if_gated(
+    findings: &mut Vec<Finding>,
+    repo: &Path,
+    file: PathBuf,
+    surface: Surface,
+    content: &str,
+) {
+    let s = score(content, surface);
+    if gate(surface, &s) {
+        findings.push(cap_finding(repo, file, surface, &s));
+    }
+}
+
+/// Promote local `node ./X.js` targets of an auto-run command to `DerivedScript`
+/// units and score them (one hop, deduped per tree).
+fn expand_derived(
+    findings: &mut Vec<Finding>,
+    repo: &Path,
+    files: &dyn RepoFiles,
+    seen: &mut HashSet<PathBuf>,
+    command: &str,
+) {
+    for tgt in derived_targets(command) {
+        let tp = PathBuf::from(&tgt);
+        if is_excluded_path(&tp) || !seen.insert(tp.clone()) {
+            continue;
+        }
+        if let Some(dc) = files.read(&tp) {
+            push_if_gated(findings, repo, tp, Surface::DerivedScript, &dc);
+        }
+    }
+}
+
+/// Campaign-agnostic capability pass over an auto-run surface. Works on any
+/// `RepoFiles` (working tree or a branch tip). The physical `.git/hooks` pass
+/// is separate (`scan_git_hooks`) because it applies only to the working tree.
+pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut derived_seen: HashSet<PathBuf> = HashSet::new();
+
+    for rel in files.paths() {
+        if is_excluded_path(rel) {
+            continue;
+        }
+        if let Some(surface) = classify(rel) {
+            if let Some(content) = files.read(rel) {
+                if surface == Surface::TasksJson {
+                    let low = content.to_lowercase();
+                    if !(low.contains("folderopen") || low.contains("allowautomatictasks")) {
+                        continue;
+                    }
+                }
+                push_if_gated(&mut findings, repo, rel.clone(), surface, &content);
+                if matches!(surface, Surface::WorkflowFile | Surface::TasksJson) {
+                    expand_derived(&mut findings, repo, files, &mut derived_seen, &content);
+                }
+            }
+        }
+
+        if rel.file_name().map(|n| n == "package.json").unwrap_or(false) {
+            if let Some(pj) = files.read(rel) {
+                for (key, script) in lifecycle_scripts(&pj) {
+                    let vfile = PathBuf::from(format!("{}#{}", rel.display(), key));
+                    push_if_gated(&mut findings, repo, vfile, Surface::LifecycleScript, &script);
+                    expand_derived(&mut findings, repo, files, &mut derived_seen, &script);
+                }
+            }
+        }
+
+        // ExfilStaging: root-level *.json holding a base64 credential blob.
+        if rel.parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true)
+            && rel.extension().map(|e| e == "json").unwrap_or(false)
+        {
+            if let Some(c) = files.read(rel) {
+                if is_exfil_staging(&c) {
+                    findings.push(Finding {
+                        campaign: "generic".into(),
+                        severity: Severity::Critical,
+                        repo: repo.to_path_buf(),
+                        file: Some(rel.clone()),
+                        signature_id: "capability:exfil-staging".into(),
+                        kind: FindingKind::Capability,
+                        evidence: format!("exfil-staging: base64 credential blob ({})", rel.display()),
+                        remediable: false,
+                        online: None,
+                        git_ref: None,
+                    });
+                }
+            }
+        }
+    }
+
+    findings
+}
+
+/// Physical `.git/hooks/*` (non-`.sample`) scan — working tree only; the hooks
+/// dir is pruned from `walk_repo_files` and absent from a `GitTree`.
+fn scan_git_hooks(repo: &Path) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let hooks_dir = repo.join(".git/hooks");
+    if let Ok(entries) = std::fs::read_dir(&hooks_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "sample").unwrap_or(false) {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&p) {
+                let rel = p.strip_prefix(repo).unwrap_or(&p).to_path_buf();
+                push_if_gated(&mut findings, repo, rel, Surface::GitHook, &content);
+            }
+        }
+    }
+    findings
+}
+
 pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
     let working = WorkingTree::new(repo);
     let mut findings = scan_files(repo, &working, packs);
+    findings.extend(scan_capabilities(repo, &working));
+    findings.extend(scan_git_hooks(repo));
 
     if !findings.is_empty() && reflog_has_amend(repo) {
         let campaign = findings[0].campaign.clone();
@@ -279,6 +416,7 @@ pub fn deep_scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
             None => continue,
         };
         let mut tree_findings = scan_files(repo, &tree, packs);
+        tree_findings.extend(scan_capabilities(repo, &tree));
         for f in &mut tree_findings {
             f.git_ref = Some(name.clone());
         }
@@ -343,6 +481,50 @@ mod tests {
         let repo = tmp.path().join("proj");
         fs::create_dir_all(repo.join(".git")).unwrap();
         repo
+    }
+
+    #[test]
+    fn capability_flags_obfuscated_config_without_pack() {
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='8-270-2';var _$_1e42=[];require('https')",
+        )
+        .unwrap();
+        let files = WorkingTree::new(&repo);
+        let f = scan_capabilities(&repo, &files);
+        assert!(f
+            .iter()
+            .any(|x| x.kind == FindingKind::Capability && x.campaign == "generic"));
+    }
+
+    #[test]
+    fn capability_reaches_dropped_file() {
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        fs::write(repo.join("package.json"), r#"{"scripts":{"preinstall":"node setup_bun.js"}}"#)
+            .unwrap();
+        fs::write(
+            repo.join("setup_bun.js"),
+            "global['r']=require;const x=String.fromCharCode(1,2,3,4,5);process.env.NPM_TOKEN;fetch('http://x')",
+        )
+        .unwrap();
+        let files = WorkingTree::new(&repo);
+        let f = scan_capabilities(&repo, &files);
+        assert!(f
+            .iter()
+            .any(|x| x.kind == FindingKind::Capability && x.file == Some(PathBuf::from("setup_bun.js"))));
+    }
+
+    #[test]
+    fn capability_clean_repo_silent() {
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        fs::write(repo.join("postcss.config.mjs"), "export default { plugins: {} };\n").unwrap();
+        fs::write(repo.join("package.json"), r#"{"scripts":{"build":"vite build"}}"#).unwrap();
+        let files = WorkingTree::new(&repo);
+        assert!(scan_capabilities(&repo, &files).is_empty());
     }
 
     #[test]

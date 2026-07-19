@@ -18,5 +18,7 @@ pub use remediate::{
     RestoreResult,
 };
 pub use repo_files::{GitTree, RepoFiles, WorkingTree};
-pub use scanner::{deep_scan_repo, scan, scan_deep, scan_files, scan_repo, ScanReport};
+pub use scanner::{
+    deep_scan_repo, scan, scan_capabilities, scan_deep, scan_files, scan_repo, ScanReport,
+};
 pub use walk::{discover_repos, walk_repo_files};
