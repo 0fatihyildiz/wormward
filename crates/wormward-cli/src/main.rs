@@ -545,9 +545,29 @@ fn main() -> ExitCode {
                 opts.yes = false;
             }
             let packs = builtin_packs();
+            // Progress only when a human is watching: text mode with stderr on a TTY.
+            // JSON mode, pipes and CI logs stay byte-identical.
+            let show_progress = matches!(format, OutputFormat::Text)
+                && std::io::IsTerminal::is_terminal(&std::io::stderr());
             // Phase 1: enumerate → API-scan every branch tip (no clones), to learn
             // which repos are infected.
-            let scan = match wormward_github::pipeline::scan_pass(&opts, &host, &packs, &token) {
+            let scan_result = wormward_github::pipeline::scan_pass_with_progress(
+                &opts,
+                &host,
+                &packs,
+                &token,
+                &|p: wormward_github::pipeline::ScanProgress| {
+                    if show_progress {
+                        // \r + width-clamped pad so a shorter repo name leaves no
+                        // residue from the previous, longer line.
+                        eprint!("\r  scanning {}/{} {:<60.60}", p.done, p.total, p.repo);
+                    }
+                },
+            );
+            if show_progress {
+                eprintln!(); // finish the progress line before any other output
+            }
+            let scan = match scan_result {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error: {e}");
