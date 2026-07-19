@@ -77,7 +77,7 @@ pub struct RestoreSummary {
 }
 
 #[tauri::command]
-fn scan(
+async fn scan(
     dirs: Vec<String>,
     deep: bool,
     online: bool,
@@ -118,7 +118,7 @@ fn list_packs() -> Vec<PackInfo> {
 }
 
 #[tauri::command]
-fn clean_preview(dirs: Vec<String>) -> Result<Vec<RepoPlan>, String> {
+async fn clean_preview(dirs: Vec<String>) -> Result<Vec<RepoPlan>, String> {
     let packs = builtin_packs();
     let mut out = Vec::new();
     for dir in to_paths(dirs) {
@@ -142,7 +142,7 @@ fn clean_preview(dirs: Vec<String>) -> Result<Vec<RepoPlan>, String> {
 /// re-discovering everything under the scanned dirs. Repos with no applicable action are a
 /// no-op.
 #[tauri::command]
-fn clean_apply(repos: Vec<String>) -> Result<CleanSummary, String> {
+async fn clean_apply(repos: Vec<String>) -> Result<CleanSummary, String> {
     let packs = builtin_packs();
     let mut summary = CleanSummary {
         repos: 0,
@@ -173,7 +173,7 @@ fn clean_apply(repos: Vec<String>) -> Result<CleanSummary, String> {
 }
 
 #[tauri::command]
-fn restore(dirs: Vec<String>) -> Result<RestoreSummary, String> {
+async fn restore(dirs: Vec<String>) -> Result<RestoreSummary, String> {
     let mut summary = RestoreSummary { repos: 0, restored: 0 };
     for dir in to_paths(dirs) {
         for repo in discover_repos(&dir) {
@@ -229,7 +229,7 @@ pub struct BranchCleanApplySummary {
 /// Deep-scan the given dirs and return a dry-run branch-clean plan per infected branch tip.
 /// Never mutates anything.
 #[tauri::command]
-fn clean_branches_preview(dirs: Vec<String>) -> Result<Vec<BranchCleanPreview>, String> {
+async fn clean_branches_preview(dirs: Vec<String>) -> Result<Vec<BranchCleanPreview>, String> {
     let packs = builtin_packs();
     let ts = now_secs();
     let mut out = Vec::new();
@@ -254,7 +254,7 @@ fn clean_branches_preview(dirs: Vec<String>) -> Result<Vec<BranchCleanPreview>, 
 /// the selected branches. `push` force-pushes cleaned tips to their remotes; remote-tracking
 /// branches without `push` are reported as skipped (expected).
 #[tauri::command]
-fn clean_branches_apply(
+async fn clean_branches_apply(
     selected: Vec<BranchSelection>,
     push: bool,
 ) -> Result<BranchCleanApplySummary, String> {
@@ -390,7 +390,7 @@ async fn github_scan(
 /// managed state) — not a freshly resolved one — so the redacted secret matches the one used
 /// for the on-demand clones and pushes.
 #[tauri::command]
-fn github_fix(
+async fn github_fix(
     selected: Vec<String>,
     state: tauri::State<'_, GithubScanState>,
 ) -> Result<Vec<GithubFixView>, String> {
