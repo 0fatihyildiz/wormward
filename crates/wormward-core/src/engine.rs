@@ -170,4 +170,33 @@ mod tests {
         // "aa" occurs twice (overlapping); still one hit for the signature.
         assert_eq!(engine.scan_content("aaaa").len(), 1);
     }
+
+    fn sig(kind: SignatureKind, id: &str, value: &str) -> ContentSignature {
+        ContentSignature { id: id.into(), kind, value: value.into() }
+    }
+
+    #[test]
+    fn regex_signature_matches() {
+        let pack = pack_with(vec![sig(SignatureKind::Regex, "g", r"global\['[!_A-Za-z]+'\]=")]);
+        let engine = SignatureEngine::build(&[pack]);
+        let hits = engine.scan_content("var x; global['!']='8-270-2';");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].signature_id, "g");
+    }
+
+    #[test]
+    fn invalid_regex_is_ignored() {
+        let pack = pack_with(vec![sig(SignatureKind::Regex, "bad", "(unclosed")]);
+        let engine = SignatureEngine::build(&[pack]);
+        assert!(engine.scan_content("anything").is_empty());
+    }
+
+    #[test]
+    fn sha256_signature_matches_exact_content() {
+        let digest = crate::matchers::sha256_hex(b"payload");
+        let pack = pack_with(vec![sig(SignatureKind::Sha256, "h", &digest)]);
+        let engine = SignatureEngine::build(&[pack]);
+        assert_eq!(engine.scan_content("payload").len(), 1);
+        assert!(engine.scan_content("other").is_empty());
+    }
 }
