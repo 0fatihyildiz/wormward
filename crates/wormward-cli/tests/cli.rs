@@ -154,6 +154,7 @@ fn scan_deep_flags_payload_on_other_branch() {
     use std::process::Command as Cmd;
     fn git(repo: &std::path::Path, args: &[&str]) {
         Cmd::new("git").arg("-C").arg(repo).args(args)
+            .env("GIT_TEMPLATE_DIR", "")
             .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
             .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
             .status().unwrap();
@@ -246,6 +247,7 @@ fn clean_apply_push_yes_updates_bare_remote() {
     use std::process::Command as Cmd;
     fn git(repo: &std::path::Path, args: &[&str]) {
         Cmd::new("git").arg("-C").arg(repo).args(args)
+            .env("GIT_TEMPLATE_DIR", "")
             .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
             .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
             .status().unwrap();
@@ -255,7 +257,7 @@ fn clean_apply_push_yes_updates_bare_remote() {
     let remote = tmp.path().join("remote.git");
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
-    Cmd::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+    Cmd::new("git").args(["init", "--bare", "-q"]).env("GIT_TEMPLATE_DIR", "").arg(&remote).status().unwrap();
     fs::write(repo.join("temp_auto_push.bat"), "@echo off").unwrap();
     fs::write(repo.join("keep.txt"), "x").unwrap();
     git(&repo, &["add", "."]);
@@ -277,6 +279,7 @@ fn clean_apply_push_rewrite_yes_amends_remote() {
     use std::process::Command as Cmd;
     fn git(repo: &std::path::Path, args: &[&str]) {
         Cmd::new("git").arg("-C").arg(repo).args(args)
+            .env("GIT_TEMPLATE_DIR", "")
             .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
             .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
             .status().unwrap();
@@ -286,7 +289,7 @@ fn clean_apply_push_rewrite_yes_amends_remote() {
     let remote = tmp.path().join("remote.git");
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
-    Cmd::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+    Cmd::new("git").args(["init", "--bare", "-q"]).env("GIT_TEMPLATE_DIR", "").arg(&remote).status().unwrap();
     fs::write(repo.join("postcss.config.mjs"), "export default {};\nglobal['!']='8-270-2';var _$_1e42=[];").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "init"]);

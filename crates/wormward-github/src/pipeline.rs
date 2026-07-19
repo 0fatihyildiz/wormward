@@ -177,7 +177,10 @@ pub struct ScanProgress {
 fn clone_repo(repo: &RepoRef, dest: &Path, token: &str) -> Result<(), String> {
     let out = Command::new("git")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .args(["clone", "--no-single-branch", "-q"])
+        // --template= (empty): machine-level git templates would otherwise copy their
+        // hooks into OUR temp clone, and the local re-scan would flag those hooks as
+        // findings about the repo. Hooks are local artifacts, never repo content.
+        .args(["clone", "--no-single-branch", "--template=", "-q"])
         .arg(authed_url(&repo.clone_url, token))
         .arg(dest)
         .output();
@@ -511,6 +514,7 @@ mod tests {
             .arg("-C")
             .arg(dir)
             .args(args)
+            .env("GIT_TEMPLATE_DIR", "")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@e.x")
             .env("GIT_COMMITTER_NAME", "t")
@@ -607,6 +611,7 @@ mod tests {
         let bare = tmp.path().join(format!("{name}.git"));
         Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
             .arg(&bare)
             .status()
             .unwrap();
@@ -638,6 +643,7 @@ mod tests {
         let bare = tmp.path().join(format!("{name}.git"));
         Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
             .arg(&bare)
             .status()
             .unwrap();
@@ -668,6 +674,7 @@ mod tests {
         // unborn default branch and lands an empty working tree.
         Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
             .arg(&bare)
             .status()
             .unwrap();
@@ -704,6 +711,11 @@ mod tests {
         assert!(!outcomes[0].actions.is_empty());
         // The fix cloned on demand into clone_dir.
         assert!(tmp.path().join("work").join("me__proj").exists());
+        // --template= keeps machine git templates from injecting hooks into our clone.
+        assert!(
+            !tmp.path().join("work").join("me__proj").join(".git/hooks/pre-commit").exists(),
+            "template hooks must not be copied into wormward's own clones"
+        );
     }
 
     #[test]
@@ -944,6 +956,7 @@ mod tests {
         let bare = tmp.path().join("clean.git");
         Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
             .arg(&bare)
             .status()
             .unwrap();

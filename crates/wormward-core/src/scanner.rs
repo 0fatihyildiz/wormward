@@ -700,6 +700,7 @@ mod tests {
         use std::process::Command;
         fn git(repo: &Path, args: &[&str]) {
             Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
                 .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
                 .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
                 .status().unwrap();
@@ -766,6 +767,7 @@ mod tests {
         use std::process::Command;
         fn git(repo: &Path, args: &[&str]) {
             Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
                 .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
                 .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
                 .status().unwrap();
@@ -795,6 +797,7 @@ mod tests {
         use std::process::Command;
         fn git(repo: &Path, args: &[&str]) {
             Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
                 .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
                 .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
                 .status().unwrap();
@@ -815,6 +818,7 @@ mod tests {
         use std::process::Command;
         fn git(repo: &Path, args: &[&str]) {
             Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
                 .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
                 .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
                 .status().unwrap();
@@ -836,6 +840,7 @@ mod tests {
         use std::process::Command;
         fn git(repo: &Path, args: &[&str]) {
             Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
                 .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
                 .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
                 .status().unwrap();
