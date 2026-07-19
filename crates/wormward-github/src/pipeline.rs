@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -99,20 +100,46 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn process_repo(
-    repo: &RepoRef,
-    opts: &GithubRunOpts,
-    packs: &[Pack],
-    base: &Path,
-    token: &str,
-) -> RepoOutcome {
-    let mut outcome = RepoOutcome {
-        repo: repo.clone(),
-        findings: Vec::new(),
-        actions: Vec::new(),
-        pushed: Vec::new(),
-        error: None,
-    };
+/// A repo cloned and scanned in phase one. The clone on disk at `dest` is reused by the
+/// fix phase — we never re-clone.
+pub struct ScannedRepo {
+    pub repo: RepoRef,
+    /// Working-tree path of the clone (empty/unused when `error` is set).
+    pub dest: PathBuf,
+    pub findings: Vec<Finding>,
+    /// Clone failure, if any. A scanned-but-errored repo carries no findings.
+    pub error: Option<String>,
+}
+
+impl ScannedRepo {
+    /// A repo is "infected" (a fix candidate) when the read-only scan found anything.
+    fn is_infected(&self) -> bool {
+        self.error.is_none() && !self.findings.is_empty()
+    }
+}
+
+/// Result of phase one: every repo cloned + scanned, with the clones kept alive on disk
+/// (via `_tmp` when a temp dir was used) so the fix phase can reuse them.
+pub struct ScanPass {
+    repos: Vec<ScannedRepo>,
+    // Held to keep the temp clone directory alive until the fix phase has run. `None`
+    // when the caller supplied an explicit `clone_dir`.
+    _tmp: Option<tempfile::TempDir>,
+}
+
+impl ScanPass {
+    /// `full_name`s of infected repos, i.e. the candidates for interactive selection.
+    pub fn infected_full_names(&self) -> Vec<String> {
+        self.repos
+            .iter()
+            .filter(|r| r.is_infected())
+            .map(|r| r.repo.full_name.clone())
+            .collect()
+    }
+}
+
+/// Clone (all branches, authenticated) and read-only scan a single repo. No fixes.
+fn clone_and_scan(repo: &RepoRef, base: &Path, packs: &[Pack], token: &str) -> ScannedRepo {
     let dest = base.join(repo.full_name.replace('/', "__"));
 
     // Clone all branches so the deep scan can inspect every branch tip. Authenticate via
@@ -128,28 +155,82 @@ fn process_repo(
     match clone {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
-            outcome.error = Some(redact(
-                format!("clone: {}", String::from_utf8_lossy(&out.stderr).trim()),
-                token,
-            ));
-            return outcome;
+            return ScannedRepo {
+                repo: repo.clone(),
+                dest,
+                findings: Vec::new(),
+                error: Some(redact(
+                    format!("clone: {}", String::from_utf8_lossy(&out.stderr).trim()),
+                    token,
+                )),
+            };
         }
         Err(e) => {
-            outcome.error = Some(redact(format!("clone: {e}"), token));
-            return outcome;
+            return ScannedRepo {
+                repo: repo.clone(),
+                dest,
+                findings: Vec::new(),
+                error: Some(redact(format!("clone: {e}"), token)),
+            };
         }
     }
 
     // Scan the working tree + every branch tip (read-only).
     let mut findings = scan_repo(&dest, packs);
     findings.extend(deep_scan_repo(&dest, packs));
-    outcome.findings = findings.clone();
+    ScannedRepo { repo: repo.clone(), dest, findings, error: None }
+}
 
-    if !opts.fix || findings.is_empty() {
+/// Phase one: enumerate the account's repos, then clone + scan each (bounded-parallel via
+/// rayon). No repo is fixed here. Per-repo clone failures are captured, never fatal.
+pub fn scan_pass(
+    opts: &GithubRunOpts,
+    host: &dyn RepoHost,
+    packs: &[Pack],
+    token: &str,
+) -> Result<ScanPass, GithubError> {
+    let repos = host.list_repos(opts.include_forks)?;
+
+    // Resolve a base clone directory (temp dir kept alive inside the returned ScanPass).
+    let mut tmp = None;
+    let base: PathBuf = match &opts.clone_dir {
+        Some(d) => {
+            std::fs::create_dir_all(d).map_err(|e| GithubError::Http(e.to_string()))?;
+            d.clone()
+        }
+        None => {
+            let dir = tempfile::TempDir::new().map_err(|e| GithubError::Http(e.to_string()))?;
+            let p = dir.path().to_path_buf();
+            tmp = Some(dir);
+            p
+        }
+    };
+
+    let scanned: Vec<ScannedRepo> = repos
+        .par_iter()
+        .map(|repo| clone_and_scan(repo, &base, packs, token))
+        .collect();
+    Ok(ScanPass { repos: scanned, _tmp: tmp })
+}
+
+/// Remediate one already-cloned repo, reusing its working tree. When `do_fix` is false
+/// the repo is only reported (findings preserved, no writes) — this is how deselected
+/// repos and clean/errored repos are passed through.
+fn fix_scanned(sr: &ScannedRepo, opts: &GithubRunOpts, packs: &[Pack], token: &str, do_fix: bool) -> RepoOutcome {
+    let mut outcome = RepoOutcome {
+        repo: sr.repo.clone(),
+        findings: sr.findings.clone(),
+        actions: Vec::new(),
+        pushed: Vec::new(),
+        error: sr.error.clone(),
+    };
+
+    if !do_fix || sr.error.is_some() || sr.findings.is_empty() {
         return outcome;
     }
 
-    let plan = plan_remediation(&findings, packs);
+    let dest = &sr.dest;
+    let plan = plan_remediation(&sr.findings, packs);
     if plan.actions.is_empty() {
         return outcome;
     }
@@ -161,7 +242,7 @@ fn process_repo(
     }
 
     // Apply to the working tree (backups land in <repo>/.wormward-backup/<ts>/).
-    let res = apply(&dest, &plan.actions, true);
+    let res = apply(dest, &plan.actions, true);
     outcome.actions = res.applied.iter().map(describe_action).collect();
     if res.applied.is_empty() {
         return outcome;
@@ -169,7 +250,7 @@ fn process_repo(
 
     let paths: Vec<PathBuf> = res.applied.iter().map(|a| a.target().to_path_buf()).collect();
     let campaigns = {
-        let mut c: Vec<&str> = findings.iter().map(|f| f.campaign.as_str()).collect();
+        let mut c: Vec<&str> = sr.findings.iter().map(|f| f.campaign.as_str()).collect();
         c.sort();
         c.dedup();
         c.join(", ")
@@ -179,12 +260,10 @@ fn process_repo(
     // would fail with "nothing to commit" — treat that as a no-op success, not an error.
     for p in &paths {
         let s = p.to_string_lossy();
-        let _ = git(&dest, &["add", "-A", "--", s.as_ref()]);
+        let _ = git(dest, &["add", "-A", "--", s.as_ref()]);
     }
-    if has_staged_changes(&dest) {
-        if let Err(e) =
-            commit_paths(&dest, &format!("wormward: remediate {campaigns}"), &paths)
-        {
+    if has_staged_changes(dest) {
+        if let Err(e) = commit_paths(dest, &format!("wormward: remediate {campaigns}"), &paths) {
             outcome.error = Some(redact(format!("commit: {e}"), token));
             return outcome;
         }
@@ -198,14 +277,14 @@ fn process_repo(
         let ts = now_secs();
         let backup = format!(
             "refs/remotes/origin/{b}:refs/heads/wormward-backup/{b}-{ts}",
-            b = repo.default_branch
+            b = sr.repo.default_branch
         );
-        if let Err(e) = git(&dest, &["push", "origin", &backup]) {
+        if let Err(e) = git(dest, &["push", "origin", &backup]) {
             outcome.error = Some(redact(format!("backup push: {e}"), token));
             return outcome;
         }
-        match force_push_with_lease(&dest) {
-            Ok(()) => outcome.pushed.push(repo.default_branch.clone()),
+        match force_push_with_lease(dest) {
+            Ok(()) => outcome.pushed.push(sr.repo.default_branch.clone()),
             Err(e) => outcome.error = Some(redact(format!("force-push: {e}"), token)),
         }
     }
@@ -213,34 +292,38 @@ fn process_repo(
     outcome
 }
 
-/// Enumerate the account's repos and process each one (bounded-parallel via rayon).
-/// Per-repo failures are captured in `RepoOutcome.error`; the run never aborts.
+/// Phase two: remediate the scanned repos, reusing their clones (no re-clone). When
+/// `selected` is `Some`, only repos whose `full_name` is in the set are fixed; every
+/// other repo is reported unchanged. `None` fixes all infected repos (subject to
+/// `opts.fix`). Per-repo failures are captured in `RepoOutcome.error`; the run never
+/// aborts.
+pub fn fix_pass(
+    scan: &ScanPass,
+    opts: &GithubRunOpts,
+    packs: &[Pack],
+    token: &str,
+    selected: Option<&HashSet<String>>,
+) -> Vec<RepoOutcome> {
+    scan.repos
+        .par_iter()
+        .map(|sr| {
+            let chosen = selected.is_none_or(|s| s.contains(&sr.repo.full_name));
+            fix_scanned(sr, opts, packs, token, opts.fix && chosen)
+        })
+        .collect()
+}
+
+/// Enumerate the account's repos and process each one: clone + scan, then fix all
+/// infected repos (no interactive selection). Per-repo failures are captured in
+/// `RepoOutcome.error`; the run never aborts.
 pub fn run(
     opts: &GithubRunOpts,
     host: &dyn RepoHost,
     packs: &[Pack],
     token: &str,
 ) -> Result<Vec<RepoOutcome>, GithubError> {
-    let repos = host.list_repos(opts.include_forks)?;
-
-    // Resolve a base clone directory (temp dir kept alive for the whole run).
-    let tmp_guard;
-    let base: PathBuf = match &opts.clone_dir {
-        Some(d) => {
-            std::fs::create_dir_all(d).map_err(|e| GithubError::Http(e.to_string()))?;
-            d.clone()
-        }
-        None => {
-            tmp_guard = tempfile::TempDir::new().map_err(|e| GithubError::Http(e.to_string()))?;
-            tmp_guard.path().to_path_buf()
-        }
-    };
-
-    let outcomes: Vec<RepoOutcome> = repos
-        .par_iter()
-        .map(|repo| process_repo(repo, opts, packs, &base, token))
-        .collect();
-    Ok(outcomes)
+    let scan = scan_pass(opts, host, packs, token)?;
+    Ok(fix_pass(&scan, opts, packs, token, None))
 }
 
 #[cfg(test)]
@@ -272,6 +355,40 @@ mod tests {
         fn list_repos(&self, _include_forks: bool) -> Result<Vec<RepoRef>, GithubError> {
             Ok(vec![self.repo.clone()])
         }
+    }
+
+    struct FakeMultiHost {
+        repos: Vec<RepoRef>,
+    }
+    impl RepoHost for FakeMultiHost {
+        fn list_repos(&self, _include_forks: bool) -> Result<Vec<RepoRef>, GithubError> {
+            Ok(self.repos.clone())
+        }
+    }
+
+    /// Build an infected bare origin under `tmp` in a uniquely-named subdir so several
+    /// can coexist in one test.
+    fn make_infected_origin_named(tmp: &TempDir, name: &str) -> PathBuf {
+        let src = tmp.path().join(format!("{name}-src"));
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='8-270-2';\n(\"rmcej%otb%\",2857687)\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "infected"]);
+
+        let bare = tmp.path().join(format!("{name}.git"));
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+        bare
     }
 
     fn make_infected_origin(tmp: &TempDir) -> PathBuf {
@@ -402,5 +519,62 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&branches.stdout).contains("wormward-backup/main-"));
+    }
+
+    #[test]
+    fn fix_pass_honors_selected_set() {
+        // Two infected repos are scanned; only one is selected for fixing. The selected
+        // repo gets remediation actions; the deselected one keeps its findings but is
+        // left untouched (no actions). Clones from the scan pass are reused — no re-clone.
+        let tmp = TempDir::new().unwrap();
+        let bare_a = make_infected_origin_named(&tmp, "a");
+        let bare_b = make_infected_origin_named(&tmp, "b");
+        let clone_dir = tmp.path().join("work");
+        let host = FakeMultiHost {
+            repos: vec![
+                RepoRef {
+                    full_name: "me/a".into(),
+                    clone_url: bare_a.to_string_lossy().to_string(),
+                    default_branch: "main".into(),
+                    fork: false,
+                },
+                RepoRef {
+                    full_name: "me/b".into(),
+                    clone_url: bare_b.to_string_lossy().to_string(),
+                    default_branch: "main".into(),
+                    fork: false,
+                },
+            ],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: Some(clone_dir.clone()),
+            include_forks: false,
+            fix: true,
+            push: false,
+            yes: true,
+        };
+
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        let mut infected = scan.infected_full_names();
+        infected.sort();
+        assert_eq!(infected, vec!["me/a".to_string(), "me/b".to_string()]);
+
+        // Select only me/a.
+        let selected: HashSet<String> = ["me/a".to_string()].into_iter().collect();
+        let outcomes = fix_pass(&scan, &opts, &builtin_packs(), "", Some(&selected));
+
+        let by = |name: &str| outcomes.iter().find(|o| o.repo.full_name == name).unwrap();
+        // Both repos are reported with their findings...
+        assert!(!by("me/a").findings.is_empty());
+        assert!(!by("me/b").findings.is_empty());
+        // ...but only the selected one was fixed.
+        assert!(!by("me/a").actions.is_empty(), "selected repo should be fixed");
+        assert!(by("me/b").actions.is_empty(), "deselected repo must be left alone");
+        assert!(by("me/a").error.is_none());
+        assert!(by("me/b").error.is_none());
+
+        // The deselected clone's working tree is still infected on disk (never remediated).
+        let b_file = clone_dir.join("me__b").join("postcss.config.mjs");
+        assert!(std::fs::read_to_string(&b_file).unwrap().contains("rmcej%otb%"));
     }
 }
