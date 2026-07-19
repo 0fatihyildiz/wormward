@@ -459,11 +459,12 @@ fn fix_scanned(
     // default tree, revert everything (restoring the committed file) and report manual review.
     // `.wormward-backup` holds the pristine original but the walker skips it, so it cannot
     // cause a false residual. This is the critical safety property of the whole pipeline.
-    let residual_strip = scan_repo(&dest, packs).into_iter().any(|f| {
-        f.git_ref.is_none()
-            && matches!(action_for(&f, packs), Some(RemediationAction::StripPayload { .. }))
-    });
-    if residual_strip {
+    // After a strip, the working tree must be clean of ALL default-branch findings — not
+    // just strippable ones. A surviving IocDomain/NpmPackage/Capability indicator (e.g. a C2
+    // domain above the strip marker, or a malicious package.json) means the file is still
+    // infected; revert and report manual rather than commit/push a still-flagged file.
+    let residual = scan_repo(&dest, packs).iter().any(|f| f.git_ref.is_none());
+    if residual {
         // Restore the working tree to the committed (infected) file; do NOT commit or push.
         let _ = git(&dest, &["checkout", "--", "."]);
         outcome.actions.clear();
@@ -1034,6 +1035,147 @@ mod tests {
         assert!(
             origin.contains("global['!']") && origin.contains("TAIL"),
             "origin must be the original file (reverted), not a half-stripped push"
+        );
+    }
+
+    #[test]
+    fn ioc_domain_above_marker_is_not_pushed() {
+        // A config file that IS offered fixable (strippable ContentSignature below a
+        // `global['!']=` marker) but carries an IocDomain C2 reference ABOVE the marker.
+        // Stripping at the marker removes the signature but leaves the domain -> the file
+        // is still infected. `action_for` returns None for IocDomain, so a residual gate
+        // that only re-checks strippable findings would wrongly push it. Must revert+manual.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("d-src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        // Domain (non-strippable IOC) above the marker survives the cut; the strippable
+        // signature sits after the marker so the strip has real work to do (fixable).
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nvar d='260120.vercel.app';\nglobal['!']='x';(\"rmcej%otb%\",2857687)\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "domain-above-marker"]);
+        let bare = tmp.path().join("d.git");
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/d".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: Some(tmp.path().join("work")),
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: true,
+        };
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
+        let o = &outcomes[0];
+        assert!(o.pushed.is_empty(), "must not push a file with a surviving C2 domain");
+        assert!(
+            !(o.error.is_none() && !o.actions.is_empty()),
+            "must not report as cleanly fixed"
+        );
+        assert!(o.manual_review, "must flag the repo for manual review");
+        // A real revert restores the WHOLE file, including the marker and the signature
+        // after it (both removed by a strip) as well as the domain -> proves no push.
+        let show = Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["show", "main:postcss.config.mjs"])
+            .output()
+            .unwrap();
+        let origin = String::from_utf8_lossy(&show.stdout);
+        assert!(
+            origin.contains("260120.vercel.app") && origin.contains("global['!']"),
+            "origin must be the original file (reverted), not a stripped push"
+        );
+    }
+
+    #[test]
+    fn malicious_package_json_alongside_strippable_config_is_not_pushed() {
+        // A fully strippable config (canonical `global['!']=` + `rmcej%otb%` signature that a
+        // strip cleanly removes) sits next to a package.json carrying a malicious npm
+        // dependency. The config strip succeeds, but the NpmPackage finding survives ->
+        // the repo is still infected. `action_for` returns None for NpmPackage, so the
+        // narrow gate would push a repo that still ships a malicious package.json.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("p-src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='x';(\"rmcej%otb%\",2857687)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            "{\"name\":\"x\",\"dependencies\":{\"tailwindcss-style-animate\":\"1.0.0\"}}\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "config+bad-pkg"]);
+        let bare = tmp.path().join("p.git");
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/p".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: Some(tmp.path().join("work")),
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: true,
+        };
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
+        let o = &outcomes[0];
+        assert!(
+            o.pushed.is_empty(),
+            "must not push while a malicious package.json survives the strip"
+        );
+        assert!(
+            !(o.error.is_none() && !o.actions.is_empty()),
+            "must not report as cleanly fixed"
+        );
+        assert!(o.manual_review, "must flag the repo for manual review");
+        // Revert restores the working tree; the bad dependency remains in origin untouched.
+        let show = Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["show", "main:package.json"])
+            .output()
+            .unwrap();
+        let origin = String::from_utf8_lossy(&show.stdout);
+        assert!(
+            origin.contains("tailwindcss-style-animate"),
+            "origin package.json must still carry the malicious dependency (not modified)"
         );
     }
 
