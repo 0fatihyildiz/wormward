@@ -352,11 +352,16 @@ fn main() -> ExitCode {
                     bypass: all,
                     non_interactive: !select::stdio_is_tty(),
                 };
-                select::select_repos(fixable.clone(), opts, |i| works[*i].repo.display().to_string())
-                    .into_iter()
-                    .collect()
+                match select::select_repos(fixable, opts, |i| works[*i].repo.display().to_string()) {
+                    Some(sel) => sel.into_iter().collect(),
+                    // Aborted prompt (Ctrl-C / interrupt): fail closed — fix nothing.
+                    None => {
+                        eprintln!("selection aborted; no repos fixed");
+                        return ExitCode::from(0);
+                    }
+                }
             } else {
-                fixable.iter().copied().collect()
+                fixable.into_iter().collect()
             };
 
             // Phase 2: apply only to the selected repos.
@@ -503,20 +508,26 @@ fn main() -> ExitCode {
             };
 
             // Selection only matters when we will actually write (fix/push + yes). A
-            // dry-run never prompts. With >1 infected repo, let the user deselect any to
-            // leave alone; JSON output or no TTY keeps all.
+            // dry-run never prompts. Only offer repos that `fix_pass` can actually
+            // remediate (a working-tree action on the default branch); repos infected
+            // only on other branches are still reported but not selectable. With >1 such
+            // repo, let the user deselect any to leave alone; JSON output or no TTY keeps
+            // all.
             let writes = yes && (fix || push);
-            let infected = scan.infected_full_names();
-            let selected: Option<HashSet<String>> = if writes && infected.len() >= 2 {
+            let fixable = scan.fixable_full_names(&packs);
+            let selected: Option<HashSet<String>> = if writes && fixable.len() >= 2 {
                 let sel_opts = select::SelectOpts {
                     bypass: all,
                     non_interactive: matches!(format, OutputFormat::Json) || !select::stdio_is_tty(),
                 };
-                Some(
-                    select::select_repos(infected, sel_opts, |n| n.clone())
-                        .into_iter()
-                        .collect(),
-                )
+                match select::select_repos(fixable, sel_opts, |n| n.clone()) {
+                    Some(sel) => Some(sel.into_iter().collect()),
+                    // Aborted prompt (Ctrl-C / interrupt): fail closed — fix nothing.
+                    None => {
+                        eprintln!("selection aborted; no repos fixed");
+                        return ExitCode::from(0);
+                    }
+                }
             } else {
                 None
             };
