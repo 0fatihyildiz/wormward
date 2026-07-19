@@ -180,4 +180,65 @@ mod tests {
         fs::write(repo.join("public/fonts/fa-solid-400.woff2"), "binary-font-bytes").unwrap();
         assert!(scan_repo(&repo, &builtin_packs()).is_empty());
     }
+
+    #[test]
+    fn detects_shai_hulud_workflow_artifact() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".github/workflows/shai-hulud-workflow.yml"), "on: push\n").unwrap();
+        let f = scan_repo(&repo, &builtin_packs());
+        assert!(f.iter().any(|x| x.campaign == "shai-hulud" && x.kind == FindingKind::Artifact));
+    }
+
+    #[test]
+    fn detects_webhook_uuid_in_arbitrary_workflow() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        // Different filename than shai-hulud-workflow.yml — caught by content, not name.
+        fs::write(
+            repo.join(".github/workflows/ci.yml"),
+            "run: curl https://webhook.site/bb8ca5f6-4175-45d2-b042-fc9ebb8170b7\n",
+        )
+        .unwrap();
+        let f = scan_repo(&repo, &builtin_packs());
+        assert!(f.iter().any(|x| x.campaign == "shai-hulud"
+            && x.kind == FindingKind::ContentSignature
+            && x.signature_id == "webhook-c2"));
+    }
+
+    #[test]
+    fn detects_sha1hulud_string_in_bun_environment() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("bun_environment.js"), "config('--name','SHA1HULUD')").unwrap();
+        let f = scan_repo(&repo, &builtin_packs());
+        assert!(f.iter().any(|x| x.campaign == "shai-hulud"
+            && x.kind == FindingKind::ContentSignature
+            && x.signature_id == "runner-sha1hulud"));
+    }
+
+    #[test]
+    fn clean_workflow_not_flagged() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("clean");
+        fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".github/workflows/ci.yml"), "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n").unwrap();
+        assert!(scan_repo(&repo, &builtin_packs()).is_empty());
+    }
+
+    #[test]
+    fn generic_bundle_and_data_json_not_flagged() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("clean");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("bundle.js"), "console.log('legit webpack output');").unwrap();
+        fs::write(repo.join("data.json"), "{}").unwrap();
+        assert!(scan_repo(&repo, &builtin_packs()).is_empty());
+    }
 }

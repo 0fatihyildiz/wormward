@@ -3,21 +3,39 @@ name: Shai-Hulud
 description: >
   Self-propagating npm worm. A malicious preinstall (setup_bun.js) installs the Bun
   runtime and runs bun_environment.js to harvest and exfiltrate developer credentials,
-  then republishes infected packages. This pack detects the on-disk artifacts and the
-  package.json preinstall injection. Runtime/process behaviors (node spawning bun,
-  trufflehog credential theft, SHA1HULUD GitHub Actions runner, fake commit authors) are
-  out of scope for a static file scanner and require EDR-class tooling.
+  sets up a rogue GitHub Actions runner (SHA1HULUD), and republishes infected packages.
+  This pack detects the on-disk artifacts, the package.json preinstall injection, the
+  malicious exfil workflow, and distinctive strings (webhook.site exfil UUID, SHA1HULUD,
+  the "Second Coming" repo-description marker). Out of scope for a static file scanner:
+  runtime/process behavior, GitHub repo/branch metadata (the "-migration" repos and
+  "shai-hulud" branch), and /tmp runtime scripts. Generic filenames it also drops
+  (data.json, cloud.json, contents.json, bundle.js) are NOT flagged by name — they are
+  legitimate in most projects.
 references:
   - https://www.microsoft.com/en-us/security/blog/2025/12/09/shai-hulud-2-0-guidance-for-detecting-investigating-and-defending-against-the-supply-chain-attack/
+  - https://www.wiz.io/blog/shai-hulud-npm-supply-chain-attack
 severity: critical
 
 target_files:
   - "package.json"
+  - ".github/workflows/*.yml"
+  - ".github/workflows/*.yaml"
+  - "setup_bun.js"
+  - "bun_environment.js"
 
 content_signatures:
   - id: preinstall-setup-bun
     kind: regex
     value: '"preinstall"\s*:\s*"[^"]*setup_bun'
+  - id: webhook-c2
+    kind: literal
+    value: "bb8ca5f6-4175-45d2-b042-fc9ebb8170b7"
+  - id: runner-sha1hulud
+    kind: literal
+    value: "SHA1HULUD"
+  - id: second-coming
+    kind: literal
+    value: "Sha1-Hulud: The Second Coming."
 
 artifacts:
   - path: "setup_bun.js"
@@ -32,3 +50,7 @@ artifacts:
     label: "Exfiltrated GitHub Actions secrets"
   - path: ".claude/setup.mjs"
     label: "Claude Code persistence bootstrap"
+  - path: ".github/workflows/shai-hulud-workflow.yml"
+    label: "Malicious secret-exfil workflow"
+  - path: ".github/workflows/Shai-hulud-workflow.yml"
+    label: "Malicious secret-exfil workflow (capitalized variant)"
