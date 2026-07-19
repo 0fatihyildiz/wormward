@@ -35,8 +35,10 @@ const ASSET_EXTS: &[&str] = &["woff", "woff2", "ttf", "otf", "eot", "png", "jpg"
 // `node_modules` / `.wormward-backup` mirror the working-tree walk prune (walk::is_pruned_dir)
 // so a GitTree / ApiTree — whose path lists are NOT pre-pruned — scan the same file set the
 // WorkingTree does. Without this, a committed node_modules produces deep-scan-only phantom findings.
-const EXCLUDED_DIRS: &[&str] =
-    &["dist", "build", ".next", "out", "coverage", "vendor", "node_modules", ".wormward-backup"];
+const EXCLUDED_DIRS: &[&str] = &[
+    "dist", "build", ".next", "out", "coverage", "vendor", "node_modules", ".wormward-backup",
+    "target",
+];
 
 const LIFECYCLE_KEYS: &[&str] = &[
     "preinstall", "install", "postinstall", "prepare", "prepublish", "prepublishOnly", "prepack",

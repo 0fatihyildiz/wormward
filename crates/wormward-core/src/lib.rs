@@ -30,7 +30,7 @@ pub use rewrite::{
     BranchCleanStatus,
 };
 pub use scanner::{
-    deep_scan_repo, scan, scan_capabilities, scan_deep, scan_files, scan_repo, scan_tree,
-    ScanReport,
+    deep_scan_repo, scan, scan_capabilities, scan_deep, scan_files, scan_repo, scan_streaming,
+    scan_tree, ScanReport,
 };
 pub use walk::{discover_repos, walk_repo_files};

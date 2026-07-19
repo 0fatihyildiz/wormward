@@ -76,6 +76,7 @@
                   {f.file ?? "—"}
                   {#if f.git_ref}<span class="chip">branch: {f.git_ref}</span>{/if}
                 </div>
+                <div class="faint micro mono">{f.repo}</div>
                 <div class="muted small">{f.evidence}</div>
                 {#if f.online}
                   <div class="small {f.online.malicious ? 'crit' : 'muted'}">

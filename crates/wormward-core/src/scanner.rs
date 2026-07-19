@@ -359,13 +359,23 @@ pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
         if is_excluded_path(rel) {
             continue;
         }
-        // Read each file once; skip oversized/binary blobs (mirrors scan_files).
+        // Path-only interest gate: classify() needs no I/O, so only READ files that can
+        // actually be a surface, a package.json (lifecycle), or a root *.json (exfil blob).
+        // Without this, the whole working tree (multi-GB target/ dirs) was read every scan.
+        let surface = classify(rel);
+        let is_pkg = rel.file_name().map(|n| n == "package.json").unwrap_or(false);
+        let is_root_json = rel.parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true)
+            && rel.extension().map(|e| e == "json").unwrap_or(false);
+        if surface.is_none() && !is_pkg && !is_root_json {
+            continue;
+        }
+        // Read once; skip oversized/binary blobs (mirrors scan_files).
         let content = match files.read(rel) {
             Some(c) if c.len() <= MAX_CONTENT_BYTES && !looks_binary(&c) => c,
             _ => continue,
         };
 
-        if let Some(surface) = classify(rel) {
+        if let Some(surface) = surface {
             // A folderOpen precondition gates TasksJson (auto-runs on folder open only).
             let auto_run_ok = surface != Surface::TasksJson || {
                 let low = content.to_lowercase();
@@ -377,7 +387,7 @@ pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
             }
         }
 
-        if rel.file_name().map(|n| n == "package.json").unwrap_or(false) {
+        if is_pkg {
             for (key, script) in lifecycle_scripts(&content) {
                 let vfile = PathBuf::from(format!("{}#{}", rel.display(), key));
                 push_if_gated(&mut findings, repo, vfile, Surface::LifecycleScript, &script);
@@ -385,10 +395,7 @@ pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
         }
 
         // ExfilStaging: root-level *.json holding a base64 credential blob.
-        if rel.parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true)
-            && rel.extension().map(|e| e == "json").unwrap_or(false)
-            && is_exfil_staging(&content)
-        {
+        if is_root_json && is_exfil_staging(&content) {
             findings.push(Finding {
                 campaign: "generic".into(),
                 severity: Severity::Critical,
@@ -552,10 +559,23 @@ fn head_commit(repo: &Path) -> Option<String> {
 /// Scan the tip tree of every local/remote branch (deduped by commit, excluding HEAD's
 /// commit which the working-tree pass already covers). Findings carry the branch ref.
 pub fn deep_scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
+    deep_scan_repo_cancellable(repo, packs, &std::sync::atomic::AtomicBool::new(false))
+}
+
+/// Like [`deep_scan_repo`] but bails out between branch tips as soon as `cancel` is set, so a
+/// repo with many branches can't block a Stop request or freeze a streaming scan mid-repo.
+pub fn deep_scan_repo_cancellable(
+    repo: &Path,
+    packs: &[Pack],
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Vec<Finding> {
     let head = head_commit(repo);
     let mut seen = std::collections::HashSet::new();
     let mut findings = Vec::new();
     for (oid, name) in branch_commits(repo) {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         if head.as_deref() == Some(oid.as_str()) {
             continue;
         }
@@ -593,6 +613,44 @@ pub fn scan_deep(roots: &[PathBuf], packs: &[Pack]) -> ScanReport {
         .collect();
 
     ScanReport { findings, repos_scanned: repos.len() }
+}
+
+/// Sequential, cancellable scan with per-repo progress. Discovers repos under `roots`,
+/// scans each (`deep` = also branch tips), and calls `on_repo(done, total, repo)` after each.
+/// Checks `cancel` before each repo and stops early with a partial report when set. Runs
+/// sequentially (unlike the parallel `scan`/`scan_deep`) so progress order and cancellation
+/// are deterministic and immediate at repo boundaries — the GUI drives it for a live log and
+/// a Stop button.
+pub fn scan_streaming(
+    roots: &[PathBuf],
+    packs: &[Pack],
+    deep: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_repo: &dyn Fn(usize, usize, &Path),
+) -> ScanReport {
+    let mut repos: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        repos.extend(discover_repos(root));
+    }
+    repos.sort();
+    repos.dedup();
+    let total = repos.len();
+
+    let mut findings = Vec::new();
+    let mut scanned = 0usize;
+    for repo in &repos {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        findings.extend(scan_repo(repo, packs));
+        if deep {
+            // Cancellable between branch tips so Stop is honored even mid-repo.
+            findings.extend(deep_scan_repo_cancellable(repo, packs, cancel));
+        }
+        scanned += 1;
+        on_repo(scanned, total, repo);
+    }
+    ScanReport { findings, repos_scanned: scanned }
 }
 
 #[cfg(test)]
@@ -715,6 +773,85 @@ mod tests {
     }
 
     #[test]
+    fn capability_pass_only_reads_surface_files() {
+        // Regression: scan_capabilities must NOT read every file in the tree (that made
+        // scan_repo read multi-GB target/ dirs and hang the Clean preview). classify() is
+        // path-only, so only surface / package.json / root-json files should be read.
+        use std::cell::RefCell;
+        use std::collections::HashMap as Map;
+
+        struct Counting {
+            paths: Vec<PathBuf>,
+            contents: Map<PathBuf, String>,
+            reads: RefCell<usize>,
+        }
+        impl RepoFiles for Counting {
+            fn paths(&self) -> &[PathBuf] {
+                &self.paths
+            }
+            fn read(&self, rel: &Path) -> Option<String> {
+                *self.reads.borrow_mut() += 1;
+                self.contents.get(rel).cloned()
+            }
+        }
+
+        let mut paths = Vec::new();
+        let mut contents = Map::new();
+        for i in 0..500 {
+            let p = PathBuf::from(format!("src/mod{i}.rs"));
+            contents.insert(p.clone(), "fn main() {}".into());
+            paths.push(p);
+        }
+        let cfg = PathBuf::from("postcss.config.mjs");
+        contents.insert(cfg.clone(), "export default {};".into());
+        paths.push(cfg);
+
+        let files = Counting { paths, contents, reads: RefCell::new(0) };
+        let _ = scan_capabilities(Path::new("/repo"), &files);
+        assert!(
+            *files.reads.borrow() <= 2,
+            "read {} files; non-surface files must be skipped without reading",
+            files.reads.borrow()
+        );
+    }
+
+    #[test]
+    fn deep_scan_cancellable_bails_when_flag_set() {
+        use std::process::Command;
+        use std::sync::atomic::AtomicBool;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status()
+                .unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "export default {};").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "c"]);
+        git(&repo, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        git(&repo, &["commit", "-q", "-am", "p"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        // Not cancelled: finds the payload on the 'evil' branch tip.
+        let live = deep_scan_repo_cancellable(&repo, &[literal_pack()], &AtomicBool::new(false));
+        assert!(live.iter().any(|f| f.git_ref.as_deref() == Some("evil")));
+        // Cancelled up front: bails before scanning any branch.
+        let cancelled = deep_scan_repo_cancellable(&repo, &[literal_pack()], &AtomicBool::new(true));
+        assert!(cancelled.is_empty());
+    }
+
+    #[test]
     fn capability_clean_repo_silent() {
         let tmp = TempDir::new().unwrap();
         let repo = make_repo(&tmp);
@@ -808,6 +945,46 @@ mod tests {
         let report = scan(&[tmp.path().to_path_buf()], &[literal_pack()]);
         assert_eq!(report.repos_scanned, 1);
         assert_eq!(report.findings.len(), 1);
+    }
+
+    #[test]
+    fn scan_streaming_reports_each_repo_and_cancels_at_boundary() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = TempDir::new().unwrap();
+        for name in ["a", "b"] {
+            let repo = tmp.path().join(name);
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        }
+        // Full run: on_repo fires once per repo with the running (done, total).
+        let seen: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
+        let cancel = AtomicBool::new(false);
+        let report = scan_streaming(
+            &[tmp.path().to_path_buf()],
+            &[literal_pack()],
+            false,
+            &cancel,
+            &|done, total, _repo| seen.borrow_mut().push((done, total)),
+        );
+        assert_eq!(report.repos_scanned, 2);
+        assert_eq!(*seen.borrow(), vec![(1, 2), (2, 2)]);
+
+        // Cancel after the first repo (flag flipped in the callback) → second repo skipped,
+        // and the report is partial.
+        let cancel2 = AtomicBool::new(false);
+        let calls = std::cell::Cell::new(0usize);
+        let report2 = scan_streaming(
+            &[tmp.path().to_path_buf()],
+            &[literal_pack()],
+            false,
+            &cancel2,
+            &|_d, _t, _r| {
+                calls.set(calls.get() + 1);
+                cancel2.store(true, Ordering::Relaxed);
+            },
+        );
+        assert_eq!(report2.repos_scanned, 1, "cancel after the first repo stops the run");
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

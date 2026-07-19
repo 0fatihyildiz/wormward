@@ -104,9 +104,12 @@ lazy_re!(
     net_re,
     r#"require\(\s*['"](?:https?|net|dgram|tls)['"]|from\s+['"](?:node:)?(?:https?|net|dgram|tls)['"]|\bfetch\s*\(|\baxios\b|XMLHttpRequest|\bWebSocket\b|\bcurl\b|\bwget\b|Invoke-WebRequest|\biwr\b"#
 );
-lazy_re!(url_re, r#"https?://[\w.-]+"#);
-fn network_egress(content: &str, surface: Surface) -> bool {
-    net_re().is_match(content) || (matches!(surface, Surface::ConfigFile) && url_re().is_match(content))
+// Egress requires an actual outbound-call token (fetch/require('https')/axios/curl/…). A bare
+// URL *string literal* is NOT egress — configs legitimately embed redirect destinations and doc
+// links (e.g. `destination: 'https://docs.example.com'`). Known C2 domains are caught separately
+// by the per-pack IOC-domain check, so this only sheds false positives, not real detections.
+fn network_egress(content: &str) -> bool {
+    net_re().is_match(content)
 }
 
 // --- ProcessSpawn ---
@@ -169,7 +172,8 @@ lazy_re!(forcepush_re, r"push\s+.*(?:--force\b|--force-with-lease\b|-f\b|-uf\b)"
 lazy_re!(noverify_re, r"--no-verify");
 lazy_re!(
     publish_re,
-    r"npm\s+publish\b|gh\s+api\s+[^\n]*repos|gh\s+repo\s+create\b|gh\s+workflow\b"
+    // `\bnpm` so `pnpm publish-packages` / `yarn ...` scripts don't false-match the "npm" inside.
+    r"\bnpm\s+publish\b|gh\s+api\s+[^\n]*repos|gh\s+repo\s+create\b|gh\s+workflow\b"
 );
 fn propagation(content: &str, surface: Surface) -> bool {
     let git_conj = amend_re().is_match(content)
@@ -271,7 +275,13 @@ fn trailing_code(content: &str, surface: Surface) -> bool {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    meaningful.len() > 8 && meaningful.contains('(')
+    // A multi-line expression export (e.g. `export default cond ? withA(...) : withB(...)`)
+    // continues past the apparent statement end; content that BEGINS with an expression-
+    // continuation operator (a ternary `:`/`?`, a method-chain `.`, `||`/`&&`, a comma or a
+    // closing bracket) is part of the export, not injected payload. Real payloads start a new
+    // statement (`;`, `(`, `!`, an identifier, …), never these.
+    let continues = meaningful.chars().next().is_some_and(|c| ":?.,)]}|&".contains(c));
+    meaningful.len() > 8 && meaningful.contains('(') && !continues
 }
 
 // --- DestructiveWipe ---
@@ -308,7 +318,7 @@ pub fn score(content: &str, surface: Surface) -> CapabilityScore {
         &mut s.evidence,
     );
     mark(
-        network_egress(content, surface),
+        network_egress(content),
         &mut s.network_egress,
         "network-egress",
         &mut s.evidence,
@@ -522,6 +532,42 @@ mod tests {
         // Payload appended on the SAME line after the export body must still trip.
         let cfg = "module.exports={};(function(){fetch('http://x')})()";
         assert!(score(cfg, Surface::ConfigFile).trailing_code);
+    }
+
+    #[test]
+    fn propagation_ignores_pnpm_publish_false_match() {
+        // `pnpm publish-packages` (a script name) must NOT match the `npm publish` propagation
+        // tell: the regex must be word-boundaried so it never fires on the "npm" inside "pnpm".
+        let wf = "env:\n  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n- run: pnpm publish-packages\n";
+        assert!(!score(wf, Surface::WorkflowFile).propagation);
+        assert!(!gate(Surface::WorkflowFile, &score(wf, Surface::WorkflowFile)));
+        // A real `npm publish` still fires.
+        assert!(score("- run: npm publish --access public\n", Surface::WorkflowFile).propagation);
+    }
+
+    #[test]
+    fn config_url_literal_alone_is_not_network_egress() {
+        // A benign config that only embeds URL string literals (redirect destinations, doc
+        // links) with NO fetch/require/axios token is not network egress on a ConfigFile.
+        let cfg = "const DOCS = 'https://docs.example.com';\nexport default { redirects: [{ destination: 'https://code.example.com' }] };\n";
+        assert!(!score(cfg, Surface::ConfigFile).network_egress);
+        // A real fetch / node-module require still fires.
+        assert!(score("fetch('https://x')", Surface::ConfigFile).network_egress);
+        assert!(score("const https = require('https')", Surface::ConfigFile).network_egress);
+    }
+
+    #[test]
+    fn trailing_code_false_on_ternary_expression_export() {
+        // A multi-line ternary export (plugin-wrapped Next.js config) must NOT read as trailing
+        // payload: the `: g(...)` branch continues the export expression, it is not injected code.
+        let cfg = "const nextConfig = {};\nexport default cond\n  ? withSentryConfig(withMDX(nextConfig), opts)\n  : withMDX(nextConfig);\n";
+        assert!(!score(cfg, Surface::ConfigFile).trailing_code);
+        // A real payload appended after a completed export still trips.
+        assert!(score(
+            "export default {}\n;(function(){fetch('http://x')})()",
+            Surface::ConfigFile
+        )
+        .trailing_code);
     }
 
     #[test]

@@ -7,6 +7,7 @@
   import Settings from "./routes/Settings.svelte";
   import { fly } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
+  import logo from "./assets/logo.png";
 
   const tabs = [
     ["scan", "Scan"],
@@ -49,15 +50,7 @@
 
 <header class="topbar">
   <div class="brand">
-    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M12 2.5 4 5.5v6c0 5 3.4 8.4 8 10 4.6-1.6 8-5 8-10v-6L12 2.5Z"
-        stroke="var(--accent)"
-        stroke-width="1.7"
-        stroke-linejoin="round"
-      />
-      <path d="M9 12.2 11.2 14.4 15 9.8" stroke="var(--accent)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
-    </svg>
+    <img class="logo" src={logo} alt="" aria-hidden="true" width="20" height="20" />
     <span class="wordmark">wormward</span>
   </div>
   <nav bind:this={navEl}>
@@ -115,6 +108,7 @@
     backdrop-filter: blur(12px);
   }
   .brand { display: flex; align-items: center; gap: 8px; }
+  .logo { width: 20px; height: 20px; border-radius: 5px; display: block; }
   .wordmark {
     font-size: 14px;
     font-weight: 600;
