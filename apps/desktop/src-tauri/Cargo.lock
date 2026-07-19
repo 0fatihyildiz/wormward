@@ -4652,6 +4652,7 @@ dependencies = [
  "rayon",
  "regex",
  "serde",
+ "serde_json",
  "serde_yaml",
  "sha2",
  "thiserror 1.0.69",
@@ -4677,6 +4678,7 @@ dependencies = [
 name = "wormward-github"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "rayon",
  "serde",
  "serde_json",
@@ -4702,6 +4704,7 @@ dependencies = [
 name = "wormward-packs"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "wormward-core",
 ]
 
