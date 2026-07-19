@@ -13,19 +13,16 @@ use wormward_github::{resolve_token, GitHubHost};
 use wormward_osm::{enrich, OsmClient};
 use wormward_packs::builtin_packs;
 
-/// The clones + findings from a GitHub `scan_pass`, plus the exact token that was resolved at
-/// scan time and baked into each clone's credentialed `origin` URL. The fix phase reuses this
-/// stored token so it redacts the *same* secret that is embedded in the clones — re-resolving
-/// independently could redact a different (newer) token and leak the scan-time one in a push
-/// error echoing the credentialed URL.
+/// The findings from a GitHub `scan_pass` (API-based, no clones), plus the exact token
+/// resolved at scan time. The fix phase reuses this stored token for its on-demand
+/// clones and pushes so the secret it redacts is the one it actually used.
 struct GithubScanCache {
     scan: ScanPass,
     token: String,
 }
 
-/// Managed Tauri state holding the clones + findings from a GitHub `scan_pass` between the
-/// scan and fix phases. The `TempDir` inside `ScanPass` keeps the clones alive on disk so the
-/// fix phase can reuse them without re-cloning.
+/// Managed Tauri state holding the findings from a GitHub `scan_pass` between the scan
+/// and fix phases. Lightweight: no clones exist until a fix is requested.
 type GithubScanState = Mutex<Option<GithubScanCache>>;
 
 fn to_paths(dirs: Vec<String>) -> Vec<PathBuf> {
@@ -338,9 +335,9 @@ pub struct GithubFixView {
     error: Option<String>,
 }
 
-/// Enumerate + clone + scan the token owner's GitHub repos (read-only), stash the clones in
-/// managed state for a later fix, and return a view of the infected repos. Token: explicit
-/// (non-empty) or resolved from `gh auth token`/`GITHUB_TOKEN`/`GH_TOKEN` when blank.
+/// Enumerate + API-scan (no clones) the token owner's GitHub repos (read-only), stash the
+/// findings in managed state for a later fix, and return a view of the infected repos. Token:
+/// explicit (non-empty) or resolved from `gh auth token`/`GITHUB_TOKEN`/`GH_TOKEN` when blank.
 #[tauri::command]
 fn github_scan(
     token: Option<String>,
@@ -380,11 +377,12 @@ fn github_scan(
     Ok(views)
 }
 
-/// Fix the selected GitHub repos, reusing the clones from the last `github_scan`. Fixing a
-/// GitHub repo always pushes (a no-push GitHub fix would be discarded with the temp clone), so
-/// this force-pushes cleaned history to the remote. Returns per-repo outcomes for the
-/// selected repos. Uses the token resolved at scan time (stored alongside the clones) — not a
-/// freshly resolved one — so the redacted secret matches the one embedded in the clones.
+/// Fix the selected GitHub repos, cloning each on demand inside `fix_pass` (the clones are
+/// deleted when it returns). Fixing a GitHub repo always pushes (a no-push GitHub fix would be
+/// discarded with the temp clone), so this force-pushes cleaned history to the remote. Returns
+/// per-repo outcomes for the selected repos. Uses the token resolved at scan time (stored in
+/// managed state) — not a freshly resolved one — so the redacted secret matches the one used
+/// for the on-demand clones and pushes.
 #[tauri::command]
 fn github_fix(
     selected: Vec<String>,
@@ -418,9 +416,9 @@ fn github_fix(
         })
         .collect();
 
-    // Drop the credentialed clones promptly: their `origin` embeds the token, so we don't want
-    // them lingering in managed state for the app's lifetime. The frontend re-scans before any
-    // subsequent fix, which repopulates this state.
+    // fix_pass's on-demand clones are already gone (its temp dir is dropped on return).
+    // Reset the state so a stale token/finding set can't be reused; the frontend
+    // re-scans before any subsequent fix.
     *guard = None;
     Ok(views)
 }
