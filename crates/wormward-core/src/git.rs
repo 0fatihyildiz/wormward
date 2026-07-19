@@ -76,7 +76,8 @@ pub fn force_push_with_lease(repo: &Path) -> Result<(), String> {
 /// branch. Used when cleaning a remote-tracking tip (e.g. `origin/evil`), where the temp
 /// worktree's local branch has no upstream configured for a bare `push`.
 pub fn force_push_with_lease_to(repo: &Path, remote: &str, branch: &str) -> Result<(), String> {
-    run_git(repo, &["push", "--force-with-lease", remote, branch])
+    // `--` ends option parsing so a refspec/branch beginning with `-` cannot be read as a flag.
+    run_git(repo, &["push", "--force-with-lease", remote, "--", branch])
 }
 
 /// Run git and capture trimmed stdout on success.
@@ -108,7 +109,8 @@ pub fn verify_ref(repo: &Path, refname: &str) -> bool {
 /// Point a ref at a value (`git update-ref <name> <value>`). Used to snapshot a branch tip
 /// into `refs/wormward-backup/...` before rewriting it.
 pub fn update_ref(repo: &Path, name: &str, value: &str) -> Result<(), String> {
-    run_git(repo, &["update-ref", name, value])
+    // `--` guards against a ref name beginning with `-` being parsed as an option.
+    run_git(repo, &["update-ref", "--", name, value])
 }
 
 /// The all-zero oid: `git update-ref <name> <new> <old>` with this as `<old>` means
@@ -119,7 +121,8 @@ const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 /// Fails (non-zero) if the ref is already present, so a same-second rerun cannot clobber an
 /// existing backup ref and destroy its rollback target.
 pub fn create_ref(repo: &Path, name: &str, value: &str) -> Result<(), String> {
-    run_git(repo, &["update-ref", name, value, ZERO_OID])
+    // `--` guards against a ref name beginning with `-` being parsed as an option.
+    run_git(repo, &["update-ref", "--", name, value, ZERO_OID])
 }
 
 /// The configured remote for a local branch (`git config --get branch.<branch>.remote`),
@@ -138,14 +141,16 @@ pub fn worktree_prune(repo: &Path) -> Result<(), String> {
 /// `git branch -D <name>` — force-delete a local branch. Used to remove the throwaway branch
 /// created for a remote-tracking clean so no real-named local branch is left behind.
 pub fn delete_branch(repo: &Path, name: &str) -> Result<(), String> {
-    run_git(repo, &["branch", "-D", name])
+    // `--` guards against a branch name beginning with `-` being parsed as an option.
+    run_git(repo, &["branch", "-D", "--", name])
 }
 
 /// `git worktree add <path> <branch>` — check out an existing local branch into an isolated
 /// worktree so its tip can be cleaned without disturbing the user's checkout.
 pub fn worktree_add(repo: &Path, path: &Path, branch: &str) -> Result<(), String> {
     let p = path.to_string_lossy();
-    run_git(repo, &["worktree", "add", p.as_ref(), branch])
+    // `--` ends option parsing so a branch beginning with `-` is not read as a flag.
+    run_git(repo, &["worktree", "add", p.as_ref(), "--", branch])
 }
 
 /// `git worktree add <path> -b <new_branch> <start>` — create a fresh local branch from a
@@ -157,7 +162,8 @@ pub fn worktree_add_new_branch(
     start: &str,
 ) -> Result<(), String> {
     let p = path.to_string_lossy();
-    run_git(repo, &["worktree", "add", p.as_ref(), "-b", new_branch, start])
+    // `--` ends option parsing so a start-point beginning with `-` is not read as a flag.
+    run_git(repo, &["worktree", "add", p.as_ref(), "-b", new_branch, "--", start])
 }
 
 /// `git worktree remove --force <path>` — always run after a branch clean, success or not.
