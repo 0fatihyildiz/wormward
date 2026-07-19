@@ -1,0 +1,34 @@
+id: shai-hulud
+name: Shai-Hulud
+description: >
+  Self-propagating npm worm. A malicious preinstall (setup_bun.js) installs the Bun
+  runtime and runs bun_environment.js to harvest and exfiltrate developer credentials,
+  then republishes infected packages. This pack detects the on-disk artifacts and the
+  package.json preinstall injection. Runtime/process behaviors (node spawning bun,
+  trufflehog credential theft, SHA1HULUD GitHub Actions runner, fake commit authors) are
+  out of scope for a static file scanner and require EDR-class tooling.
+references:
+  - https://www.microsoft.com/en-us/security/blog/2025/12/09/shai-hulud-2-0-guidance-for-detecting-investigating-and-defending-against-the-supply-chain-attack/
+severity: critical
+
+target_files:
+  - "package.json"
+
+content_signatures:
+  - id: preinstall-setup-bun
+    kind: regex
+    value: '"preinstall"\s*:\s*"[^"]*setup_bun'
+
+artifacts:
+  - path: "setup_bun.js"
+    label: "Bun-installer preinstall dropper"
+  - path: "bun_environment.js"
+    label: "Credential harvester"
+  - path: "router_runtime.js"
+    label: "Persistence self-copy"
+  - path: "truffleSecrets.json"
+    label: "Exfiltrated credential dump"
+  - path: "actionsSecrets.json"
+    label: "Exfiltrated GitHub Actions secrets"
+  - path: ".claude/setup.mjs"
+    label: "Claude Code persistence bootstrap"
