@@ -38,7 +38,7 @@ fn check_artifacts(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Findi
     let mut findings = Vec::new();
     for artifact in &pack.manifest.artifacts {
         let ap = PathBuf::from(&artifact.path);
-        if files.paths().iter().any(|p| p == &ap) {
+        if files.exists(&ap) {
             findings.push(Finding {
                 campaign: pack.manifest.id.clone(),
                 severity: pack.manifest.severity.clone(),
@@ -221,6 +221,8 @@ pub fn scan(roots: &[PathBuf], packs: &[Pack]) -> ScanReport {
 }
 
 fn branch_commits(repo: &Path) -> Vec<(String, String)> {
+    // Output format is "<40-char oid> <short refname>"; neither field contains a
+    // space, so splitn(2, ' ') below is safe.
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -581,5 +583,56 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "clean"]);
         git(&repo, &["branch", "feature"]);
         assert!(deep_scan_repo(&repo, &[literal_pack()]).is_empty());
+    }
+
+    #[test]
+    fn deep_scan_excludes_head_commit() {
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status().unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "p"]);
+        // Payload is on the current branch (HEAD); the working-tree pass covers it,
+        // so deep_scan_repo must NOT re-report it.
+        assert!(deep_scan_repo(&repo, &[literal_pack()]).is_empty());
+    }
+
+    #[test]
+    fn deep_scan_dedupes_refs_at_same_commit() {
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status().unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "export default {};").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "clean"]);
+        git(&repo, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        git(&repo, &["commit", "-q", "-am", "p"]);
+        git(&repo, &["branch", "dup", "evil"]); // second ref at the same commit
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let deep = deep_scan_repo(&repo, &[literal_pack()]);
+        // 'evil' and 'dup' point at the same commit → its tree is scanned once.
+        assert_eq!(
+            deep.iter().filter(|f| f.kind == FindingKind::ContentSignature).count(),
+            1
+        );
     }
 }

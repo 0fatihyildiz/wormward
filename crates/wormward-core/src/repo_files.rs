@@ -7,6 +7,11 @@ use crate::walk::walk_repo_files;
 pub trait RepoFiles {
     fn paths(&self) -> &[PathBuf];
     fn read(&self, rel: &Path) -> Option<String>;
+    /// Whether a specific file is present. Default = membership in `paths()`;
+    /// `WorkingTree` overrides to follow symlinks like the previous `is_file()` check.
+    fn exists(&self, rel: &Path) -> bool {
+        self.paths().iter().any(|p| p == rel)
+    }
 }
 
 pub struct WorkingTree {
@@ -31,6 +36,9 @@ impl RepoFiles for WorkingTree {
     fn read(&self, rel: &Path) -> Option<String> {
         std::fs::read_to_string(self.repo.join(rel)).ok()
     }
+    fn exists(&self, rel: &Path) -> bool {
+        self.repo.join(rel).is_file()
+    }
 }
 
 pub struct GitTree {
@@ -45,14 +53,17 @@ impl GitTree {
         let out = Command::new("git")
             .arg("-C")
             .arg(repo)
-            .args(["ls-tree", "-r", "--name-only", commit])
+            // -z: NUL-separated, and disables git's C-quoting of non-ASCII/special
+            // paths so filenames on branch tips are matched and read correctly.
+            .args(["ls-tree", "-r", "-z", "--name-only", commit])
             .output()
             .ok()?;
         if !out.status.success() {
             return None;
         }
         let paths = String::from_utf8_lossy(&out.stdout)
-            .lines()
+            .split('\0')
+            .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .collect();
         Some(GitTree { repo: repo.to_path_buf(), commit: commit.to_string(), paths })
