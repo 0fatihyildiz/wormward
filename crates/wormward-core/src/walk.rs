@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use walkdir::WalkDir;
+use ignore::{WalkBuilder, WalkState};
 
 fn is_pruned_dir(name: &str) -> bool {
     // `.wormward-backup` holds pristine copies of removed payloads — never rescan it,
@@ -8,38 +9,70 @@ fn is_pruned_dir(name: &str) -> bool {
     name == ".git" || name == "node_modules" || name == ".wormward-backup"
 }
 
+fn base_builder(root: &Path) -> WalkBuilder {
+    let mut b = WalkBuilder::new(root);
+    // Walk everything: the worm hides artifacts via .gitignore, so ignore rules
+    // must NOT filter our view. We only use `ignore` for its fast parallel walker.
+    b.git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        .ignore(false)
+        .hidden(false)
+        .parents(false)
+        .standard_filters(false);
+    b
+}
+
 pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
-    let mut repos = Vec::new();
-    let mut it = WalkDir::new(root).into_iter();
-    while let Some(entry) = it.next() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if entry.file_type().is_dir() && entry.file_name() == ".git" {
-            if let Some(parent) = entry.path().parent() {
-                repos.push(parent.to_path_buf());
+    let found = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+    let b = base_builder(root);
+    // Descend everywhere (including node_modules): the worm can vendor an infected
+    // repo at node_modules/<pkg>/.git, so we must still discover it. We only avoid
+    // descending into .git internals, via WalkState::Skip in the callback below.
+    b.build_parallel().run(|| {
+        let found = Arc::clone(&found);
+        Box::new(move |res| {
+            if let Ok(entry) = res {
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir && entry.file_name() == ".git" {
+                    if let Some(parent) = entry.path().parent() {
+                        found.lock().unwrap().push(parent.to_path_buf());
+                    }
+                    return WalkState::Skip; // do not descend into .git internals
+                }
             }
-            it.skip_current_dir(); // do not descend into .git internals
-        }
-    }
+            WalkState::Continue
+        })
+    });
+    let mut repos = Arc::try_unwrap(found).unwrap().into_inner().unwrap();
     repos.sort();
     repos.dedup();
     repos
 }
 
 pub fn walk_repo_files(repo: &Path) -> Vec<PathBuf> {
-    WalkDir::new(repo)
-        .into_iter()
-        .filter_entry(|e| {
-            !(e.file_type().is_dir()
-                && e.depth() > 0
-                && is_pruned_dir(&e.file_name().to_string_lossy()))
+    let files = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+    let mut b = base_builder(repo);
+    b.filter_entry(|e| {
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        !(is_dir && e.depth() > 0 && is_pruned_dir(&e.file_name().to_string_lossy()))
+    });
+    b.build_parallel().run(|| {
+        let files = Arc::clone(&files);
+        Box::new(move |res| {
+            if let Ok(entry) = res {
+                if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    files.lock().unwrap().push(entry.into_path());
+                }
+            }
+            WalkState::Continue
         })
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
-        .collect()
+    });
+    let mut files = Arc::try_unwrap(files).unwrap().into_inner().unwrap();
+    // The parallel walker yields files in nondeterministic order; sort so findings
+    // (and reflog attribution via findings[0]) are deterministic across runs.
+    files.sort();
+    files
 }
 
 #[cfg(test)]
@@ -69,6 +102,20 @@ mod tests {
     }
 
     #[test]
+    fn discovers_repo_vendored_under_node_modules() {
+        // The worm can vendor an infected repo at node_modules/<pkg>/.git; discover_repos
+        // must descend into node_modules and still find it.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("app/.git")).unwrap();
+        fs::create_dir_all(root.join("app/node_modules/evil-pkg/.git")).unwrap();
+
+        let repos = discover_repos(root);
+        assert!(repos.contains(&root.join("app")));
+        assert!(repos.contains(&root.join("app/node_modules/evil-pkg")));
+    }
+
+    #[test]
     fn walk_skips_git_and_node_modules() {
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path();
@@ -88,5 +135,23 @@ mod tests {
         assert!(!names.iter().any(|n| n.starts_with(".git/")));
         assert!(!names.iter().any(|n| n.starts_with("node_modules/")));
         assert!(!names.iter().any(|n| n.starts_with(".wormward-backup/")));
+    }
+
+    #[test]
+    fn walk_includes_gitignored_files() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        touch(&repo.join(".gitignore"));
+        fs::write(repo.join(".gitignore"), "config.bat\n").unwrap();
+        touch(&repo.join("config.bat")); // hidden by .gitignore, must still be walked
+        touch(&repo.join(".git/config"));
+
+        let files = walk_repo_files(repo);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.strip_prefix(repo).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(names.contains(&"config.bat".to_string()));
+        assert!(!names.iter().any(|n| n.starts_with(".git/")));
     }
 }

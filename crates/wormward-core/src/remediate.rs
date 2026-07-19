@@ -36,17 +36,38 @@ fn strip_markers<'a>(campaign: &str, packs: &'a [Pack]) -> Option<&'a Vec<String
     }
 }
 
+/// Map a single finding to its auto-remediation action, or `None` if it cannot be
+/// cleaned automatically (no file, unknown kind, or a strip with no configured marker).
+///
+/// This is the SINGLE source of the kind→action mapping. Both the working-tree planner
+/// (`plan_remediation`) and the cross-branch planner (`rewrite::plan_branch_cleans`) call
+/// it so the two paths never drift. It intentionally ignores `git_ref` — callers decide
+/// how to route branch-tip findings.
+pub fn action_for(finding: &Finding, packs: &[Pack]) -> Option<RemediationAction> {
+    let file = finding.file.clone()?;
+    match finding.kind {
+        FindingKind::Artifact => Some(RemediationAction::DeleteFile { file }),
+        FindingKind::GitignoreInjection => {
+            let line = finding
+                .signature_id
+                .strip_prefix("gitignore:")
+                .unwrap_or("")
+                .to_string();
+            Some(RemediationAction::RemoveGitignoreLine { file, line })
+        }
+        FindingKind::ContentSignature | FindingKind::Analyzer => {
+            let markers = strip_markers(&finding.campaign, packs)?;
+            Some(RemediationAction::StripPayload { file, markers: markers.clone() })
+        }
+        _ => None,
+    }
+}
+
 /// Derive remediation actions from findings. Working-tree findings only; auto-cleanable
 /// kinds become actions (deduped by target), the rest are returned as `manual`.
 pub fn plan_remediation(findings: &[Finding], packs: &[Pack]) -> RemediationPlan {
     let mut actions: Vec<RemediationAction> = Vec::new();
     let mut manual: Vec<Finding> = Vec::new();
-
-    fn push_unique(a: RemediationAction, actions: &mut Vec<RemediationAction>) {
-        if !actions.contains(&a) {
-            actions.push(a);
-        }
-    }
 
     for f in findings {
         // Deep-scan findings live on other branches — cannot edit safely here.
@@ -54,35 +75,13 @@ pub fn plan_remediation(findings: &[Finding], packs: &[Pack]) -> RemediationPlan
             manual.push(f.clone());
             continue;
         }
-        let file = match &f.file {
-            Some(p) => p.clone(),
-            None => {
-                manual.push(f.clone());
-                continue;
-            }
-        };
-        match f.kind {
-            FindingKind::Artifact => {
-                push_unique(RemediationAction::DeleteFile { file }, &mut actions)
-            }
-            FindingKind::GitignoreInjection => {
-                let line = f
-                    .signature_id
-                    .strip_prefix("gitignore:")
-                    .unwrap_or("")
-                    .to_string();
-                push_unique(RemediationAction::RemoveGitignoreLine { file, line }, &mut actions);
-            }
-            FindingKind::ContentSignature | FindingKind::Analyzer => {
-                match strip_markers(&f.campaign, packs) {
-                    Some(markers) => push_unique(
-                        RemediationAction::StripPayload { file, markers: markers.clone() },
-                        &mut actions,
-                    ),
-                    None => manual.push(f.clone()),
+        match action_for(f, packs) {
+            Some(a) => {
+                if !actions.contains(&a) {
+                    actions.push(a);
                 }
             }
-            _ => manual.push(f.clone()),
+            None => manual.push(f.clone()),
         }
     }
     RemediationPlan { actions, manual }

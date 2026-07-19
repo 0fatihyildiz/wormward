@@ -1,15 +1,14 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 
-use std::collections::HashSet;
-
 use crate::capability::{gate, is_exfil_staging, score, CapabilityScore};
+use crate::engine::SignatureEngine;
 use crate::finding::{Finding, FindingKind, Severity};
 use crate::git::reflog_has_amend;
-use crate::matchers::signature_matches;
 use crate::pack::{Pack, ScannedFile};
 use crate::repo_files::{GitTree, RepoFiles, WorkingTree};
 use crate::surface::{classify, derived_targets, is_excluded_path, lifecycle_scripts, Surface};
@@ -119,38 +118,68 @@ fn check_npm(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Finding> {
     findings
 }
 
+const MAX_CONTENT_BYTES: usize = 5 * 1024 * 1024;
+
+fn looks_binary(content: &str) -> bool {
+    content.as_bytes().iter().take(8192).any(|&b| b == 0)
+}
+
 /// Apply all file-based pack checks to a file source. Findings have git_ref = None;
 /// the deep-scan caller stamps the branch ref afterward.
 pub fn scan_files(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Finding> {
+    let engine = SignatureEngine::build(packs);
+    // Per-pack target globsets, indexed alongside `packs`.
+    let globsets: Vec<GlobSet> =
+        packs.iter().map(|p| build_globset(&p.manifest.target_files)).collect();
+
     let mut findings = Vec::new();
-    for pack in packs {
-        let globset = build_globset(&pack.manifest.target_files);
-        for rel in files.paths() {
-            if !globset.is_match(rel) {
+
+    for rel in files.paths() {
+        // Which packs target this file?
+        let targeting: Vec<usize> = globsets
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.is_match(rel))
+            .map(|(i, _)| i)
+            .collect();
+        if targeting.is_empty() {
+            continue;
+        }
+        let content = match files.read(rel) {
+            Some(c) => c,
+            None => continue,
+        };
+        if content.len() > MAX_CONTENT_BYTES || looks_binary(&content) {
+            continue;
+        }
+        let targeting_ids: std::collections::HashSet<&str> =
+            targeting.iter().map(|&i| packs[i].manifest.id.as_str()).collect();
+
+        // Content signatures via the shared engine, gated by target membership.
+        for hit in engine.scan_content(&content) {
+            // Relies on pack ids being unique: a hit's pack_id must map to exactly one
+            // pack, so this membership check correctly scopes hits to packs targeting
+            // this file. Duplicate pack ids would misattribute or drop hits here.
+            if !targeting_ids.contains(hit.pack_id.as_str()) {
                 continue;
             }
-            let content = match files.read(rel) {
-                Some(c) => c,
-                None => continue,
-            };
-            for sig in &pack.manifest.content_signatures {
-                if signature_matches(sig, &content) {
-                    findings.push(Finding {
-                        campaign: pack.manifest.id.clone(),
-                        severity: pack.manifest.severity.clone(),
-                        repo: repo.to_path_buf(),
-                        file: Some(rel.clone()),
-                        signature_id: sig.id.clone(),
-                        kind: FindingKind::ContentSignature,
-                        evidence: format!("content signature '{}' matched", sig.id),
-                        remediable: true,
-                        online: None,
-                        git_ref: None,
-                    });
-                }
-            }
-            // C2 indicator domains referenced in a scanned config file. Caught
-            // even when no content signature fires (e.g. a rotated payload).
+            findings.push(Finding {
+                campaign: hit.pack_id.clone(),
+                severity: hit.severity.clone(),
+                repo: repo.to_path_buf(),
+                file: Some(rel.clone()),
+                signature_id: hit.signature_id.clone(),
+                kind: FindingKind::ContentSignature,
+                evidence: format!("content signature '{}' matched", hit.signature_id),
+                remediable: true,
+                online: None,
+                git_ref: None,
+            });
+        }
+
+        // IOC domains + analyzer stay per-pack (small lists; not worth the engine).
+        for &i in &targeting {
+            let pack = &packs[i];
             for domain in &pack.manifest.ioc_domains {
                 if content.contains(domain) {
                     findings.push(Finding {
@@ -171,11 +200,14 @@ pub fn scan_files(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Fin
                 let scanned = ScannedFile {
                     repo: repo.to_path_buf(),
                     path: rel.clone(),
-                    content,
+                    content: content.clone(),
                 };
                 findings.extend(analyzer.analyze(&scanned));
             }
         }
+    }
+
+    for pack in packs {
         findings.extend(check_artifacts(repo, files, pack));
         findings.extend(check_gitignore(repo, files, pack));
         findings.extend(check_npm(repo, files, pack));
@@ -541,6 +573,17 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].campaign, "polinrider");
         assert_eq!(findings[0].signature_id, "primary");
+    }
+
+    #[test]
+    fn binary_file_is_not_content_matched() {
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        // Target-named file, signature present, but contains a NUL byte early.
+        let mut bytes = b"\x00".to_vec();
+        bytes.extend_from_slice(b"rmcej%otb%");
+        std::fs::write(repo.join("postcss.config.mjs"), bytes).unwrap();
+        assert!(scan_repo(&repo, &[literal_pack()]).is_empty());
     }
 
     #[test]

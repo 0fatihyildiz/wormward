@@ -22,6 +22,9 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
         .arg("-C")
         .arg(repo)
         .args(args)
+        // Never block on an interactive credential prompt (e.g. force-push to a private
+        // remote without cached auth); fail fast with an error instead.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_AUTHOR_NAME", "wormward")
         .env("GIT_AUTHOR_EMAIL", "wormward@localhost")
         .env("GIT_COMMITTER_NAME", "wormward")
@@ -67,6 +70,106 @@ pub fn push(repo: &Path) -> Result<(), String> {
 /// `git push --force-with-lease` (safe force-push; fails if the remote moved).
 pub fn force_push_with_lease(repo: &Path) -> Result<(), String> {
     run_git(repo, &["push", "--force-with-lease"])
+}
+
+/// `git push --force-with-lease <remote> <branch>` — a force-push scoped to exactly one
+/// branch. Used when cleaning a remote-tracking tip (e.g. `origin/evil`), where the temp
+/// worktree's local branch has no upstream configured for a bare `push`.
+pub fn force_push_with_lease_to(repo: &Path, remote: &str, branch: &str) -> Result<(), String> {
+    // `--` ends option parsing so a refspec/branch beginning with `-` cannot be read as a flag.
+    run_git(repo, &["push", "--force-with-lease", remote, "--", branch])
+}
+
+/// Run git and capture trimmed stdout on success.
+fn run_git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Resolve a revision to its full commit oid (`git rev-parse <rev>`).
+pub fn rev_parse(repo: &Path, rev: &str) -> Option<String> {
+    run_git_stdout(repo, &["rev-parse", rev])
+}
+
+/// Whether a ref resolves (`git rev-parse --verify --quiet <refname>`).
+pub fn verify_ref(repo: &Path, refname: &str) -> bool {
+    run_git(repo, &["rev-parse", "--verify", "--quiet", refname]).is_ok()
+}
+
+/// Point a ref at a value (`git update-ref <name> <value>`). Used to snapshot a branch tip
+/// into `refs/wormward-backup/...` before rewriting it.
+pub fn update_ref(repo: &Path, name: &str, value: &str) -> Result<(), String> {
+    // `--` guards against a ref name beginning with `-` being parsed as an option.
+    run_git(repo, &["update-ref", "--", name, value])
+}
+
+/// The all-zero oid: `git update-ref <name> <new> <old>` with this as `<old>` means
+/// "only create; fail if the ref already exists".
+const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+
+/// Create a ref *only if it does not already exist* (`git update-ref <name> <value> <zero>`).
+/// Fails (non-zero) if the ref is already present, so a same-second rerun cannot clobber an
+/// existing backup ref and destroy its rollback target.
+pub fn create_ref(repo: &Path, name: &str, value: &str) -> Result<(), String> {
+    // `--` guards against a ref name beginning with `-` being parsed as an option.
+    run_git(repo, &["update-ref", "--", name, value, ZERO_OID])
+}
+
+/// The configured remote for a local branch (`git config --get branch.<branch>.remote`),
+/// e.g. `origin`. `None` when the branch has no upstream remote configured.
+pub fn branch_remote(repo: &Path, branch: &str) -> Option<String> {
+    run_git_stdout(repo, &["config", "--get", &format!("branch.{branch}.remote")])
+        .filter(|s| !s.is_empty())
+}
+
+/// `git worktree prune` — drop stale administrative worktree entries under
+/// `.git/worktrees/` (used as a fallback when a worktree dir vanished without a clean remove).
+pub fn worktree_prune(repo: &Path) -> Result<(), String> {
+    run_git(repo, &["worktree", "prune"])
+}
+
+/// `git branch -D <name>` — force-delete a local branch. Used to remove the throwaway branch
+/// created for a remote-tracking clean so no real-named local branch is left behind.
+pub fn delete_branch(repo: &Path, name: &str) -> Result<(), String> {
+    // `--` guards against a branch name beginning with `-` being parsed as an option.
+    run_git(repo, &["branch", "-D", "--", name])
+}
+
+/// `git worktree add <path> <branch>` — check out an existing local branch into an isolated
+/// worktree so its tip can be cleaned without disturbing the user's checkout.
+pub fn worktree_add(repo: &Path, path: &Path, branch: &str) -> Result<(), String> {
+    let p = path.to_string_lossy();
+    // `--` ends option parsing so a branch beginning with `-` is not read as a flag.
+    run_git(repo, &["worktree", "add", p.as_ref(), "--", branch])
+}
+
+/// `git worktree add <path> -b <new_branch> <start>` — create a fresh local branch from a
+/// start-point (e.g. a remote-tracking ref) in an isolated worktree.
+pub fn worktree_add_new_branch(
+    repo: &Path,
+    path: &Path,
+    new_branch: &str,
+    start: &str,
+) -> Result<(), String> {
+    let p = path.to_string_lossy();
+    // `--` ends option parsing so a start-point beginning with `-` is not read as a flag.
+    run_git(repo, &["worktree", "add", p.as_ref(), "-b", new_branch, "--", start])
+}
+
+/// `git worktree remove --force <path>` — always run after a branch clean, success or not.
+pub fn worktree_remove(repo: &Path, path: &Path) -> Result<(), String> {
+    let p = path.to_string_lossy();
+    run_git(repo, &["worktree", "remove", "--force", p.as_ref()])
 }
 
 #[cfg(test)]
@@ -177,6 +280,23 @@ mod tests {
         let out = String::from_utf8_lossy(&files.stdout);
         assert!(out.contains("cleaned.txt"));
         assert!(!out.contains("unrelated-secret.txt"));
+    }
+
+    #[test]
+    fn create_ref_is_create_only() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f.txt"), "a").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "c"]);
+        let oid = rev_parse(repo, "HEAD").unwrap();
+
+        let name = "refs/wormward-backup/x-1";
+        create_ref(repo, name, &oid).unwrap();
+        // A second create-only attempt must FAIL rather than clobber the existing ref.
+        assert!(create_ref(repo, name, &oid).is_err());
+        assert_eq!(rev_parse(repo, name).unwrap(), oid);
     }
 
     #[test]

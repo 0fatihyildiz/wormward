@@ -1,12 +1,15 @@
 mod report;
+mod select;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use wormward_core::{
-    amend_head, apply, commit_paths, discover_repos, force_push_with_lease, plan_remediation, push,
-    restore, scan, scan_deep, scan_repo,
+    amend_head, apply, apply_branch_cleans, commit_paths, deep_scan_repo, discover_repos,
+    force_push_with_lease, now_secs, plan_branch_cleans, plan_remediation, push, restore, scan,
+    scan_deep, scan_repo, BranchCleanStatus,
 };
 use wormward_osm::OsmClient;
 use wormward_packs::builtin_packs;
@@ -69,14 +72,47 @@ enum Command {
         /// With --push, amend HEAD instead of adding a commit, then push --force-with-lease.
         #[arg(long)]
         rewrite: bool,
+        /// Also clean infected tips of branches other than the one checked out (via isolated
+        /// worktrees). With --apply --push --yes, force-pushes each cleaned branch.
+        #[arg(long = "all-branches")]
+        all_branches: bool,
         /// Required confirmation for the destructive --push / --rewrite git operations.
         #[arg(long)]
         yes: bool,
+        /// Fix every infected repo without the interactive selection prompt.
+        #[arg(long)]
+        all: bool,
     },
     /// Restore files from the latest wormward backup.
     Restore {
         #[arg(default_value = ".")]
         dirs: Vec<PathBuf>,
+    },
+    /// Scan (and optionally remediate) every repo on the logged-in GitHub account.
+    Github {
+        /// GitHub token (else GITHUB_TOKEN/GH_TOKEN, else `gh auth token`).
+        #[arg(long)]
+        token: Option<String>,
+        /// Directory to clone into (default: a temp dir removed after the run).
+        #[arg(long)]
+        clone_dir: Option<PathBuf>,
+        /// Include forks (default: skip them).
+        #[arg(long)]
+        include_forks: bool,
+        /// Remediate infected working trees (requires --yes to write).
+        #[arg(long)]
+        fix: bool,
+        /// Force-push cleaned default branches back to origin (backs up first; requires --yes).
+        #[arg(long)]
+        push: bool,
+        /// Actually perform writes/pushes. Without this, only prints the plan.
+        #[arg(long)]
+        yes: bool,
+        /// Fix every infected repo without the interactive selection prompt.
+        #[arg(long)]
+        all: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
 }
 
@@ -97,6 +133,38 @@ fn describe_action(a: &wormward_core::RemediationAction) -> String {
         StripPayload { file, .. } => format!("strip payload from {}", file.display()),
         DeleteFile { file } => format!("delete {}", file.display()),
         RemoveGitignoreLine { file, line } => format!("remove '{line}' from {}", file.display()),
+    }
+}
+
+/// Exit code for the `github` command, per the unified scan/clean/github convention:
+///   0 — no findings, or every infected repo was actually remediated (fixed AND persisted).
+///   1 — unresolved findings remain: a dry-run that found infections, a fix that failed or
+///       could not persist (temp clone / no push), or manual/branch-only findings.
+///   2 — a repo errored and no unresolved findings remain to take precedence over it.
+/// A repo's findings only count as "resolved" when the cleaned default branch was actually
+/// force-pushed back to origin with no error; a local-only clone or a dry-run leaves origin
+/// infected, so it stays unresolved. (Auth/enumeration failures before the run are handled
+/// separately and also exit 2.)
+fn github_exit_code(outcomes: &[wormward_github::pipeline::RepoOutcome]) -> u8 {
+    let mut any_unresolved = false;
+    let mut any_error = false;
+    for o in outcomes {
+        if o.error.is_some() {
+            any_error = true;
+        }
+        if !o.findings.is_empty() {
+            let resolved = o.error.is_none() && !o.pushed.is_empty();
+            if !resolved {
+                any_unresolved = true;
+            }
+        }
+    }
+    if any_unresolved {
+        1
+    } else if any_error {
+        2
+    } else {
+        0
     }
 }
 
@@ -185,7 +253,16 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Clean { dirs, apply: do_apply, no_backup, push: do_push, rewrite, yes } => {
+        Command::Clean {
+            dirs,
+            apply: do_apply,
+            no_backup,
+            push: do_push,
+            rewrite,
+            all_branches,
+            yes,
+            all,
+        } => {
             for dir in &dirs {
                 if !dir.exists() {
                     eprintln!("error: path does not exist: {}", dir.display());
@@ -210,84 +287,204 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
             let packs = builtin_packs();
-            let mut total_actions = 0usize;
-            let mut total_failed = 0usize;
+
+            // Phase 1: scan every repo and build its plan. Nothing is written here.
+            struct RepoWork {
+                repo: PathBuf,
+                findings: Vec<wormward_core::Finding>,
+                plan: wormward_core::RemediationPlan,
+                branch_plans: Vec<wormward_core::BranchCleanPlan>,
+            }
+            let mut works: Vec<RepoWork> = Vec::new();
             for dir in &dirs {
                 for repo in discover_repos(dir) {
                     let findings = scan_repo(&repo, &packs);
                     let plan = plan_remediation(&findings, &packs);
-                    if plan.actions.is_empty() && plan.manual.is_empty() {
+                    // Cross-branch: plan cleans for infected tips of other branches.
+                    let branch_plans = if all_branches {
+                        plan_branch_cleans(&deep_scan_repo(&repo, &packs), &packs, now_secs())
+                    } else {
+                        Vec::new()
+                    };
+                    if plan.actions.is_empty() && plan.manual.is_empty() && branch_plans.is_empty() {
                         continue;
                     }
-                    println!("{}", repo.display());
-                    for a in &plan.actions {
-                        println!("  would {}", describe_action(a));
+                    works.push(RepoWork { repo, findings, plan, branch_plans });
+                }
+            }
+
+            // Print every repo's plan (the "would …" lines) up front, for both dry-run
+            // and apply. total_actions drives the dry-run exit code.
+            let mut total_actions = 0usize;
+            for w in &works {
+                println!("{}", w.repo.display());
+                for a in &w.plan.actions {
+                    println!("  would {}", describe_action(a));
+                }
+                for m in &w.plan.manual {
+                    let file = m
+                        .file
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    let branch = m
+                        .git_ref
+                        .as_deref()
+                        .map(|r| format!(" (branch: {r})"))
+                        .unwrap_or_default();
+                    println!("  manual: {} {}{} — {}", m.campaign, file, branch, m.evidence);
+                }
+                total_actions += w.plan.actions.len();
+                for bp in &w.branch_plans {
+                    println!("  branch {}:", bp.branch);
+                    for a in &bp.actions {
+                        println!("    would {}", describe_action(a));
                     }
-                    for m in &plan.manual {
-                        let file = m
-                            .file
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default();
-                        let branch = m
-                            .git_ref
-                            .as_deref()
-                            .map(|r| format!(" (branch: {r})"))
-                            .unwrap_or_default();
-                        println!("  manual: {} {}{} — {}", m.campaign, file, branch, m.evidence);
+                    total_actions += bp.actions.len();
+                }
+            }
+
+            // A pure dry-run lists the plan and never prompts or writes. Any findings at all —
+            // auto-fixable, manual, or branch-tip — leave infections unresolved, so exit 1
+            // whenever a repo made it into `works` (which only holds repos with findings).
+            if !do_apply {
+                if total_actions > 0 {
+                    println!("\nDry run — re-run with --apply to make these changes.");
+                }
+                if works.is_empty() {
+                    return ExitCode::from(0);
+                }
+                return ExitCode::from(1);
+            }
+
+            // Which repos have something to auto-fix (working-tree actions or branch cleans)?
+            let fixable: Vec<usize> = works
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| !w.plan.actions.is_empty() || !w.branch_plans.is_empty())
+                .map(|(i, _)| i)
+                .collect();
+
+            // With >1 infected repo, let the user deselect any they want left alone.
+            // With 0 or 1, there is nothing to choose.
+            let selected: HashSet<usize> = if fixable.len() >= 2 {
+                let opts = select::SelectOpts {
+                    bypass: all,
+                    non_interactive: !select::stdio_is_tty(),
+                };
+                match select::select_repos(fixable, opts, |i| works[*i].repo.display().to_string()) {
+                    Some(sel) => sel.into_iter().collect(),
+                    // Aborted prompt (Ctrl-C / interrupt): fail closed — fix nothing.
+                    None => {
+                        eprintln!("selection aborted; no repos fixed");
+                        return ExitCode::from(0);
                     }
-                    total_actions += plan.actions.len();
-                    if do_apply {
-                        let res = apply(&repo, &plan.actions, !no_backup);
-                        for (a, e) in &res.skipped {
-                            eprintln!("  skipped {}: {}", describe_action(a), e);
-                        }
-                        total_failed += res.skipped.len();
-                        if let Some(bd) = res.backup_dir {
-                            println!("  backup: {}", bd.display());
-                        }
-                        if do_push && !res.applied.is_empty() {
-                            // Stage ONLY the files wormward changed — never the backup dir
-                            // or unrelated working-tree changes.
-                            let paths: Vec<PathBuf> =
-                                res.applied.iter().map(|a| a.target().to_path_buf()).collect();
-                            let campaigns = {
-                                let mut c: Vec<&str> =
-                                    findings.iter().map(|f| f.campaign.as_str()).collect();
-                                c.sort();
-                                c.dedup();
-                                c.join(", ")
-                            };
-                            let git_result = if rewrite {
-                                amend_head(&repo, &paths).and_then(|_| force_push_with_lease(&repo))
+                }
+            } else {
+                fixable.into_iter().collect()
+            };
+
+            // Phase 2: apply only to the selected repos. `total_unresolved` tracks infections
+            // that remain after the run (deselected repos, manual findings, un-cleaned
+            // branch tips) so the exit code is 1 whenever anything is left unfixed.
+            let mut total_failed = 0usize;
+            let mut total_unresolved = 0usize;
+            for (i, w) in works.iter().enumerate() {
+                if !selected.contains(&i) {
+                    // Left alone by the user: its findings remain unresolved.
+                    total_unresolved += 1;
+                    continue;
+                }
+                let repo = &w.repo;
+                // Working-tree findings that need manual handling are never auto-fixed.
+                if !w.plan.manual.is_empty() {
+                    total_unresolved += 1;
+                }
+                let res = apply(repo, &w.plan.actions, !no_backup);
+                for (a, e) in &res.skipped {
+                    eprintln!("  skipped {}: {}", describe_action(a), e);
+                }
+                total_failed += res.skipped.len();
+                if let Some(bd) = res.backup_dir {
+                    println!("  backup: {}", bd.display());
+                }
+                if do_push && !res.applied.is_empty() {
+                    // Stage ONLY the files wormward changed — never the backup dir
+                    // or unrelated working-tree changes.
+                    let paths: Vec<PathBuf> =
+                        res.applied.iter().map(|a| a.target().to_path_buf()).collect();
+                    let campaigns = {
+                        let mut c: Vec<&str> =
+                            w.findings.iter().map(|f| f.campaign.as_str()).collect();
+                        c.sort();
+                        c.dedup();
+                        c.join(", ")
+                    };
+                    let git_result = if rewrite {
+                        amend_head(repo, &paths).and_then(|_| force_push_with_lease(repo))
+                    } else {
+                        commit_paths(repo, &format!("wormward: remediate {campaigns}"), &paths)
+                            .and_then(|_| push(repo))
+                    };
+                    match git_result {
+                        Ok(()) => println!(
+                            "  pushed{}",
+                            if rewrite {
+                                " (rewritten HEAD, force-with-lease)"
                             } else {
-                                commit_paths(&repo, &format!("wormward: remediate {campaigns}"), &paths)
-                                    .and_then(|_| push(&repo))
-                            };
-                            match git_result {
-                                Ok(()) => println!(
-                                    "  pushed{}",
-                                    if rewrite {
-                                        " (rewritten HEAD, force-with-lease)"
-                                    } else {
-                                        ""
-                                    }
-                                ),
-                                Err(e) => {
-                                    eprintln!("  git error: {e}");
-                                    eprintln!("  note: local changes were applied; run 'wormward restore' to revert, or fix git and retry");
-                                    total_failed += 1;
-                                }
+                                ""
+                            }
+                        ),
+                        Err(e) => {
+                            eprintln!("  git error: {e}");
+                            eprintln!("  note: local changes were applied; run 'wormward restore' to revert, or fix git and retry");
+                            total_failed += 1;
+                        }
+                    }
+                }
+
+                // Cross-branch cleaning of other infected branch tips.
+                if !w.branch_plans.is_empty() {
+                    // Cleaning a branch inherently COMMITS (it rewrites a ref), so it is
+                    // destructive and gated behind --yes exactly like the working-tree
+                    // commit/push path. Without --yes it runs as a dry-run (plan only,
+                    // no commits/refs). Force-push only with BOTH --push and --yes.
+                    let outcomes = apply_branch_cleans(&w.branch_plans, !yes, do_push && yes);
+                    for o in &outcomes {
+                        match &o.status {
+                            BranchCleanStatus::Cleaned { backup_ref, pushed } => println!(
+                                "  branch {}: cleaned{} (backup {})",
+                                o.plan.branch,
+                                if *pushed {
+                                    ", pushed"
+                                } else if do_push {
+                                    ", not pushed (no upstream)"
+                                } else {
+                                    ""
+                                },
+                                backup_ref
+                            ),
+                            BranchCleanStatus::Skipped(why) => {
+                                // e.g. a remote-tracking tip that needs --push: still infected.
+                                println!("  branch {}: skipped — {why}", o.plan.branch);
+                                total_unresolved += 1;
+                            }
+                            BranchCleanStatus::Failed(why) => {
+                                eprintln!("  branch {}: failed — {why}", o.plan.branch);
+                                total_failed += 1;
+                            }
+                            BranchCleanStatus::Planned => {
+                                println!(
+                                    "  branch {}: planned (re-run with --yes to clean and commit)",
+                                    o.plan.branch
+                                );
+                                total_unresolved += 1;
                             }
                         }
                     }
                 }
             }
-            if !do_apply && total_actions > 0 {
-                println!("\nDry run — re-run with --apply to make these changes.");
-                return ExitCode::from(1);
-            }
-            if total_failed > 0 {
+            if total_failed > 0 || total_unresolved > 0 {
                 ExitCode::from(1)
             } else {
                 ExitCode::from(0)
@@ -309,5 +506,186 @@ fn main() -> ExitCode {
             }
             ExitCode::from(0)
         }
+        Command::Github { token, clone_dir, include_forks, fix, push, yes, all, format } => {
+            // --push and --fix are destructive; require explicit --yes to write.
+            if push && !yes {
+                eprintln!("refusing to force-push without --yes (destructive). Re-run with --yes to confirm.");
+                return ExitCode::from(2);
+            }
+            if fix && !yes {
+                eprintln!("note: --fix without --yes is a dry-run; re-run with --yes to write.");
+            }
+            let token = match wormward_github::resolve_token(token.as_deref()) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let host = wormward_github::GitHubHost::new(token.clone());
+            let mut opts = wormward_github::pipeline::GithubRunOpts {
+                clone_dir,
+                include_forks,
+                // Pushing implies remediating.
+                fix: fix || push,
+                push,
+                yes,
+            };
+
+            // A fix only persists if it has somewhere to land: a push target OR an explicit
+            // --clone-dir. Without either, remediation is applied+committed into a temp clone
+            // that is dropped at end of run, so nothing survives. Downgrade to a dry-run
+            // (report the plan, write nothing) so the outcome reflects reality rather than a
+            // false "applied".
+            let persistent_dest = opts.push || opts.clone_dir.is_some();
+            if opts.fix && opts.yes && !persistent_dest {
+                eprintln!(
+                    "note: --fix without --push or --clone-dir cannot persist changes (the temp clone is discarded); running as a dry-run. Re-run with --clone-dir <dir> or --push to apply."
+                );
+                opts.yes = false;
+            }
+            let packs = builtin_packs();
+            // Phase 1: enumerate → clone → scan (no fix), to learn which repos are infected.
+            let scan = match wormward_github::pipeline::scan_pass(&opts, &host, &packs, &token) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+
+            // Selection only matters when we will actually write (fix/push + yes). A
+            // dry-run never prompts. Only offer repos that `fix_pass` can actually
+            // remediate (a working-tree action on the default branch); repos infected
+            // only on other branches are still reported but not selectable. With >1 such
+            // repo, let the user deselect any to leave alone; JSON output or no TTY keeps
+            // all.
+            // Reflect the post-downgrade reality: `opts.yes` is cleared above when a fix
+            // cannot persist, so a non-persistent `--fix --yes` is treated as a dry-run here.
+            let writes = opts.yes && opts.fix;
+            let fixable = scan.fixable_full_names(&packs);
+            let selected: Option<HashSet<String>> = if writes && fixable.len() >= 2 {
+                let sel_opts = select::SelectOpts {
+                    bypass: all,
+                    non_interactive: matches!(format, OutputFormat::Json) || !select::stdio_is_tty(),
+                };
+                match select::select_repos(fixable, sel_opts, |n| n.clone()) {
+                    Some(sel) => Some(sel.into_iter().collect()),
+                    // Aborted prompt (Ctrl-C / interrupt): fail closed — fix nothing.
+                    None => {
+                        eprintln!("selection aborted; no repos fixed");
+                        return ExitCode::from(0);
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Phase 2: fix only the selected repos, reusing the phase-1 clones.
+            let outcomes = wormward_github::pipeline::fix_pass(
+                &scan,
+                &opts,
+                &packs,
+                &token,
+                selected.as_ref(),
+            );
+            match format {
+                OutputFormat::Text => print!("{}", report::render_github_text(&outcomes, writes)),
+                OutputFormat::Json => println!("{}", report::render_github_json(&outcomes)),
+            }
+            ExitCode::from(github_exit_code(&outcomes))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::github_exit_code;
+    use std::path::PathBuf;
+    use wormward_core::{Finding, FindingKind, Severity};
+    use wormward_github::pipeline::RepoOutcome;
+    use wormward_github::RepoRef;
+
+    fn repo_ref(name: &str) -> RepoRef {
+        RepoRef {
+            full_name: name.into(),
+            clone_url: "https://x/r.git".into(),
+            default_branch: "main".into(),
+            fork: false,
+        }
+    }
+
+    fn finding() -> Finding {
+        Finding {
+            campaign: "polinrider".into(),
+            severity: Severity::Critical,
+            repo: PathBuf::from("/r"),
+            file: Some(PathBuf::from("postcss.config.mjs")),
+            signature_id: "primary".into(),
+            kind: FindingKind::ContentSignature,
+            evidence: "content signature matched".into(),
+            remediable: true,
+            online: None,
+            git_ref: None,
+        }
+    }
+
+    fn outcome(findings: Vec<Finding>, error: Option<String>) -> RepoOutcome {
+        RepoOutcome {
+            repo: repo_ref("me/proj"),
+            findings,
+            actions: vec![],
+            pushed: vec![],
+            error,
+        }
+    }
+
+    #[test]
+    fn findings_take_precedence_over_errors() {
+        // One repo has a finding, another only errored → findings win (exit 1).
+        let outcomes =
+            vec![outcome(vec![finding()], None), outcome(vec![], Some("clone failed".into()))];
+        assert_eq!(github_exit_code(&outcomes), 1);
+    }
+
+    #[test]
+    fn finding_and_error_on_same_repo_exits_1() {
+        let outcomes = vec![outcome(vec![finding()], Some("push failed".into()))];
+        assert_eq!(github_exit_code(&outcomes), 1);
+    }
+
+    #[test]
+    fn error_only_exits_2() {
+        let outcomes = vec![outcome(vec![], Some("clone failed".into()))];
+        assert_eq!(github_exit_code(&outcomes), 2);
+    }
+
+    #[test]
+    fn clean_run_exits_0() {
+        let outcomes = vec![outcome(vec![], None)];
+        assert_eq!(github_exit_code(&outcomes), 0);
+    }
+
+    #[test]
+    fn dry_run_with_findings_exits_1() {
+        // Infections found but nothing was pushed (dry-run / no persistent destination):
+        // the origin is still infected, so the findings are unresolved.
+        let outcomes = vec![outcome(vec![finding()], None)];
+        assert_eq!(github_exit_code(&outcomes), 1);
+    }
+
+    #[test]
+    fn successful_fix_and_push_exits_0() {
+        // Findings fixed AND persisted to origin (force-pushed) with no error → resolved.
+        let mut o = outcome(vec![finding()], None);
+        o.pushed = vec!["main".into()];
+        assert_eq!(github_exit_code(&[o]), 0);
+    }
+
+    #[test]
+    fn per_repo_error_exits_2() {
+        // A repo failed to process (e.g. clone/auth) and left no unresolved findings.
+        let outcomes = vec![outcome(vec![], Some("clone failed".into()))];
+        assert_eq!(github_exit_code(&outcomes), 2);
     }
 }

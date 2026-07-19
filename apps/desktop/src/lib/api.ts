@@ -6,6 +6,11 @@ import type {
   RepoPlan,
   CleanSummary,
   RestoreSummary,
+  BranchCleanPreview,
+  BranchSelection,
+  BranchCleanApplySummary,
+  GithubRepoView,
+  GithubFixView,
 } from "./types";
 
 export const scan = (dirs: string[], deep: boolean, online: boolean, token?: string) =>
@@ -16,11 +21,23 @@ export const listPacks = () => invoke<PackInfo[]>("list_packs");
 export const cleanPreview = (dirs: string[]) =>
   invoke<RepoPlan[]>("clean_preview", { dirs });
 
-export const cleanApply = (dirs: string[]) =>
-  invoke<CleanSummary>("clean_apply", { dirs });
+export const cleanApply = (repos: string[]) =>
+  invoke<CleanSummary>("clean_apply", { repos });
 
 export const restore = (dirs: string[]) =>
   invoke<RestoreSummary>("restore", { dirs });
+
+export const cleanBranchesPreview = (dirs: string[]) =>
+  invoke<BranchCleanPreview[]>("clean_branches_preview", { dirs });
+
+export const cleanBranchesApply = (selected: BranchSelection[], push: boolean) =>
+  invoke<BranchCleanApplySummary>("clean_branches_apply", { selected, push });
+
+export const githubScan = (token: string | undefined, includeForks: boolean) =>
+  invoke<GithubRepoView[]>("github_scan", { token: token ?? null, includeForks });
+
+export const githubFix = (selected: string[]) =>
+  invoke<GithubFixView[]>("github_fix", { selected });
 
 export async function pickDirs(): Promise<string[]> {
   const sel = await open({ directory: true, multiple: true });

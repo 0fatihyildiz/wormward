@@ -1493,6 +1493,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignore"
+version = "0.4.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b009b6744c1445efd7244084e25e498636412effb6760b55067553baa925cc7"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4629,15 +4645,16 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "wormward-core"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "globset",
  "hex",
+ "ignore",
  "rayon",
  "regex",
  "serde",
  "serde_yaml",
  "sha2",
  "thiserror 1.0.69",
- "walkdir",
 ]
 
 [[package]]
@@ -4651,7 +4668,22 @@ dependencies = [
  "tauri-plugin-dialog",
  "tempfile",
  "wormward-core",
+ "wormward-github",
  "wormward-osm",
+ "wormward-packs",
+]
+
+[[package]]
+name = "wormward-github"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "ureq",
+ "wormward-core",
  "wormward-packs",
 ]
 

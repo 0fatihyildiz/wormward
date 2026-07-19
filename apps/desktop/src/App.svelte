@@ -3,12 +3,14 @@
   import Scan from "./routes/Scan.svelte";
   import Results from "./routes/Results.svelte";
   import Clean from "./routes/Clean.svelte";
+  import GitHub from "./routes/GitHub.svelte";
   import Settings from "./routes/Settings.svelte";
 
   const tabs = [
     ["scan", "Scan"],
     ["results", "Results"],
     ["clean", "Clean"],
+    ["github", "GitHub"],
     ["settings", "Settings"],
   ] as const;
 </script>
@@ -36,6 +38,8 @@
     <Results />
   {:else if app.screen === "clean"}
     <Clean />
+  {:else if app.screen === "github"}
+    <GitHub />
   {:else}
     <Settings />
   {/if}
