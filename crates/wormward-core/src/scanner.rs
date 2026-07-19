@@ -7,7 +7,8 @@ use crate::finding::{Finding, FindingKind, Severity};
 use crate::git::reflog_has_amend;
 use crate::matchers::signature_matches;
 use crate::pack::{Pack, ScannedFile};
-use crate::walk::{discover_repos, walk_repo_files};
+use crate::repo_files::{RepoFiles, WorkingTree};
+use crate::walk::discover_repos;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanReport {
@@ -32,15 +33,16 @@ fn build_globset(patterns: &[String]) -> GlobSet {
     builder.build().unwrap_or_else(|_| GlobSet::empty())
 }
 
-fn check_artifacts(repo: &Path, pack: &Pack) -> Vec<Finding> {
+fn check_artifacts(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Finding> {
     let mut findings = Vec::new();
     for artifact in &pack.manifest.artifacts {
-        if repo.join(&artifact.path).is_file() {
+        let ap = PathBuf::from(&artifact.path);
+        if files.paths().iter().any(|p| p == &ap) {
             findings.push(Finding {
                 campaign: pack.manifest.id.clone(),
                 severity: pack.manifest.severity.clone(),
                 repo: repo.to_path_buf(),
-                file: Some(PathBuf::from(&artifact.path)),
+                file: Some(ap),
                 signature_id: format!("artifact:{}", artifact.path),
                 kind: FindingKind::Artifact,
                 evidence: format!("{} present ({})", artifact.path, artifact.label),
@@ -53,14 +55,14 @@ fn check_artifacts(repo: &Path, pack: &Pack) -> Vec<Finding> {
     findings
 }
 
-fn check_gitignore(repo: &Path, pack: &Pack) -> Vec<Finding> {
+fn check_gitignore(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Finding> {
     let mut findings = Vec::new();
     if pack.manifest.gitignore_injections.is_empty() {
         return findings;
     }
-    let content = match std::fs::read_to_string(repo.join(".gitignore")) {
-        Ok(c) => c,
-        Err(_) => return findings,
+    let content = match files.read(Path::new(".gitignore")) {
+        Some(c) => c,
+        None => return findings,
     };
     let lines: Vec<&str> = content.lines().map(|l| l.trim()).collect();
     for injected in &pack.manifest.gitignore_injections {
@@ -82,14 +84,14 @@ fn check_gitignore(repo: &Path, pack: &Pack) -> Vec<Finding> {
     findings
 }
 
-fn check_npm(repo: &Path, pack: &Pack) -> Vec<Finding> {
+fn check_npm(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Finding> {
     let mut findings = Vec::new();
     if pack.manifest.bad_npm_packages.is_empty() {
         return findings;
     }
-    let content = match std::fs::read_to_string(repo.join("package.json")) {
-        Ok(c) => c,
-        Err(_) => return findings,
+    let content = match files.read(Path::new("package.json")) {
+        Some(c) => c,
+        None => return findings,
     };
     for bad in &pack.manifest.bad_npm_packages {
         // Match the dependency key as it appears in package.json ("name":).
@@ -112,20 +114,19 @@ fn check_npm(repo: &Path, pack: &Pack) -> Vec<Finding> {
     findings
 }
 
-pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
+/// Apply all file-based pack checks to a file source. Findings have git_ref = None;
+/// the deep-scan caller stamps the branch ref afterward.
+pub fn scan_files(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let files = walk_repo_files(repo);
-
     for pack in packs {
         let globset = build_globset(&pack.manifest.target_files);
-        for file in &files {
-            let rel = file.strip_prefix(repo).unwrap_or(file);
+        for rel in files.paths() {
             if !globset.is_match(rel) {
                 continue;
             }
-            let content = match std::fs::read_to_string(file) {
-                Ok(c) => c,
-                Err(_) => continue, // binary/unreadable: skip text scan
+            let content = match files.read(rel) {
+                Some(c) => c,
+                None => continue,
             };
             for sig in &pack.manifest.content_signatures {
                 if signature_matches(sig, &content) {
@@ -133,7 +134,7 @@ pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
                         campaign: pack.manifest.id.clone(),
                         severity: pack.manifest.severity.clone(),
                         repo: repo.to_path_buf(),
-                        file: Some(rel.to_path_buf()),
+                        file: Some(rel.clone()),
                         signature_id: sig.id.clone(),
                         kind: FindingKind::ContentSignature,
                         evidence: format!("content signature '{}' matched", sig.id),
@@ -151,7 +152,7 @@ pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
                         campaign: pack.manifest.id.clone(),
                         severity: Severity::Medium,
                         repo: repo.to_path_buf(),
-                        file: Some(rel.to_path_buf()),
+                        file: Some(rel.clone()),
                         signature_id: format!("ioc-domain:{domain}"),
                         kind: FindingKind::IocDomain,
                         evidence: format!("C2 indicator domain '{domain}' referenced"),
@@ -164,17 +165,22 @@ pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
             if let Some(analyzer) = &pack.analyzer {
                 let scanned = ScannedFile {
                     repo: repo.to_path_buf(),
-                    path: rel.to_path_buf(),
+                    path: rel.clone(),
                     content,
                 };
                 findings.extend(analyzer.analyze(&scanned));
             }
         }
-
-        findings.extend(check_artifacts(repo, pack));
-        findings.extend(check_gitignore(repo, pack));
-        findings.extend(check_npm(repo, pack));
+        findings.extend(check_artifacts(repo, files, pack));
+        findings.extend(check_gitignore(repo, files, pack));
+        findings.extend(check_npm(repo, files, pack));
     }
+    findings
+}
+
+pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
+    let working = WorkingTree::new(repo);
+    let mut findings = scan_files(repo, &working, packs);
 
     if !findings.is_empty() && reflog_has_amend(repo) {
         let campaign = findings[0].campaign.clone();
