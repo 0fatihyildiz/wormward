@@ -23,6 +23,20 @@ wormward list-packs             # show bundled campaign packs
 
 Exit codes: `0` clean, `1` infections found, `2` error.
 
+### Online verification (opt-in)
+
+Cross-check findings against the live OpenSourceMalware database. Requires a free
+API token (`OSM_API_KEY`, from your opensourcemalware.com profile):
+
+```bash
+export OSM_API_KEY=osm_...
+wormward scan ~ --online                            # enrich npm/domain findings with live OSM data
+wormward check --type package --ecosystem npm left-pad
+```
+
+Online mode is opt-in; without `--online` nothing leaves your machine — only the
+npm-package names and domains already flagged locally are sent.
+
 ## How detection works
 
 For every git repo under the scan root, each active pack checks:

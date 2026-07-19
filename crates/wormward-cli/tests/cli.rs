@@ -121,3 +121,30 @@ fn scan_online_without_token_exits_2() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn check_subcommand_reports_malicious() {
+    use httpmock::prelude::*;
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/check-malicious")
+            .query_param("report_type", "package");
+        then.status(200).json_body(serde_json::json!({
+            "malicious": true, "osm_url": "https://osm/y", "threat_count": 1
+        }));
+    });
+    let out = bin()
+        .env("OSM_BASE_URL", server.base_url())
+        .env("OSM_API_KEY", "osm_test")
+        .arg("check")
+        .arg("--type")
+        .arg("package")
+        .arg("--ecosystem")
+        .arg("npm")
+        .arg("evilpkg")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("malicious: true"));
+}

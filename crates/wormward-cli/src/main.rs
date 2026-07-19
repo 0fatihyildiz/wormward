@@ -34,6 +34,20 @@ enum Command {
     },
     /// List the campaign packs compiled into this build.
     ListPacks,
+    /// Check a single asset against the live OSM database.
+    Check {
+        /// report_type: package | repository | url | domain | ip | wallet | container
+        #[arg(long = "type")]
+        report_type: String,
+        #[arg(long)]
+        ecosystem: Option<String>,
+        #[arg(long)]
+        version: Option<String>,
+        /// OSM API token (else OSM_API_KEY env).
+        #[arg(long)]
+        osm_token: Option<String>,
+        identifier: String,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -89,6 +103,44 @@ fn main() -> ExitCode {
                 println!("{} — {}", pack.manifest.id, pack.manifest.name);
             }
             ExitCode::from(0)
+        }
+        Command::Check { report_type, ecosystem, version, osm_token, identifier } => {
+            let token = osm_token
+                .or_else(|| std::env::var("OSM_API_KEY").ok())
+                .filter(|t| !t.is_empty());
+            let token = match token {
+                Some(t) => t,
+                None => {
+                    eprintln!("error: check requires an OSM token (--osm-token or OSM_API_KEY)");
+                    return ExitCode::from(2);
+                }
+            };
+            let client = OsmClient::new(osm_base_url(), token);
+            match client.check(&wormward_osm::CheckQuery {
+                report_type,
+                resource_identifier: identifier,
+                ecosystem,
+                version,
+            }) {
+                Ok(r) => {
+                    println!("malicious: {}", r.malicious);
+                    if !r.osm_url.is_empty() {
+                        println!("osm_url: {}", r.osm_url);
+                    }
+                    if let Some(d) = r.details {
+                        println!("threat: {} ({})", d.description, d.severity_level);
+                    }
+                    if r.malicious {
+                        ExitCode::from(1)
+                    } else {
+                        ExitCode::from(0)
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(2)
+                }
+            }
         }
     }
 }
