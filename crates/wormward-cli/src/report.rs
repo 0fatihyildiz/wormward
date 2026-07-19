@@ -71,6 +71,28 @@ pub fn render_github_text(outcomes: &[wormward_github::pipeline::RepoOutcome], a
             o.findings.len(),
             o.error.as_ref().map(|e| format!(" [error: {e}]")).unwrap_or_default(),
         ));
+        // Enumerate each finding (with its branch for deep-scan hits) so cross-branch
+        // detections are actionable in text mode, not just a count.
+        for f in &o.findings {
+            let file = f
+                .file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let branch = f
+                .git_ref
+                .as_deref()
+                .map(|r| format!(" (branch: {r})"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  [{}] {} :: {}{} — {}\n",
+                severity_tag(&f.severity),
+                f.campaign,
+                file,
+                branch,
+                f.evidence,
+            ));
+        }
         for a in &o.actions {
             out.push_str(&format!("  action: {a}\n"));
         }
@@ -158,5 +180,41 @@ mod tests {
         let mut r = report_with_finding();
         r.findings[0].git_ref = Some("origin/evil".into());
         assert!(render_text(&r).contains("(branch: origin/evil)"));
+    }
+
+    #[test]
+    fn github_text_enumerates_findings_with_branch() {
+        use wormward_github::pipeline::RepoOutcome;
+        use wormward_github::RepoRef;
+        let f = Finding {
+            campaign: "polinrider".into(),
+            severity: Severity::Critical,
+            repo: PathBuf::from("/tmp/me__proj"),
+            file: Some(PathBuf::from("postcss.config.mjs")),
+            signature_id: "primary".into(),
+            kind: FindingKind::ContentSignature,
+            evidence: "content signature 'primary' matched".into(),
+            remediable: true,
+            online: None,
+            git_ref: Some("origin/evil".into()),
+        };
+        let outcomes = vec![RepoOutcome {
+            repo: RepoRef {
+                full_name: "me/proj".into(),
+                clone_url: "https://x/r.git".into(),
+                default_branch: "main".into(),
+                fork: false,
+            },
+            findings: vec![f],
+            actions: vec![],
+            pushed: vec![],
+            error: None,
+        }];
+        let text = render_github_text(&outcomes, false);
+        // The individual finding is enumerated, not just counted, and carries its branch.
+        assert!(text.contains("[CRITICAL]"));
+        assert!(text.contains("postcss.config.mjs"));
+        assert!(text.contains("(branch: origin/evil)"));
+        assert!(text.contains("content signature 'primary' matched"));
     }
 }

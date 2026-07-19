@@ -124,6 +124,22 @@ fn describe_action(a: &wormward_core::RemediationAction) -> String {
     }
 }
 
+/// Exit code for the `github` command. Findings take precedence over per-repo errors:
+/// a detected infection must surface as exit 1 even if another repo failed to process.
+/// Only a clean-but-errored run exits 2. (Auth/enumeration failures before `run` are
+/// handled separately and also exit 2.)
+fn github_exit_code(outcomes: &[wormward_github::pipeline::RepoOutcome]) -> u8 {
+    let any_findings = outcomes.iter().any(|o| !o.findings.is_empty());
+    let any_error = outcomes.iter().any(|o| o.error.is_some());
+    if any_findings {
+        1
+    } else if any_error {
+        2
+    } else {
+        0
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -349,7 +365,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let host = wormward_github::GitHubHost::new(token);
+            let host = wormward_github::GitHubHost::new(token.clone());
             let opts = wormward_github::pipeline::GithubRunOpts {
                 clone_dir,
                 include_forks,
@@ -358,7 +374,8 @@ fn main() -> ExitCode {
                 push,
                 yes,
             };
-            let outcomes = match wormward_github::pipeline::run(&opts, &host, &builtin_packs()) {
+            let outcomes = match wormward_github::pipeline::run(&opts, &host, &builtin_packs(), &token)
+            {
                 Ok(o) => o,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -370,15 +387,76 @@ fn main() -> ExitCode {
                 OutputFormat::Text => print!("{}", report::render_github_text(&outcomes, writes)),
                 OutputFormat::Json => println!("{}", report::render_github_json(&outcomes)),
             }
-            let any_findings = outcomes.iter().any(|o| !o.findings.is_empty());
-            let any_error = outcomes.iter().any(|o| o.error.is_some());
-            if any_error {
-                ExitCode::from(2)
-            } else if any_findings {
-                ExitCode::from(1)
-            } else {
-                ExitCode::from(0)
-            }
+            ExitCode::from(github_exit_code(&outcomes))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::github_exit_code;
+    use std::path::PathBuf;
+    use wormward_core::{Finding, FindingKind, Severity};
+    use wormward_github::pipeline::RepoOutcome;
+    use wormward_github::RepoRef;
+
+    fn repo_ref(name: &str) -> RepoRef {
+        RepoRef {
+            full_name: name.into(),
+            clone_url: "https://x/r.git".into(),
+            default_branch: "main".into(),
+            fork: false,
+        }
+    }
+
+    fn finding() -> Finding {
+        Finding {
+            campaign: "polinrider".into(),
+            severity: Severity::Critical,
+            repo: PathBuf::from("/r"),
+            file: Some(PathBuf::from("postcss.config.mjs")),
+            signature_id: "primary".into(),
+            kind: FindingKind::ContentSignature,
+            evidence: "content signature matched".into(),
+            remediable: true,
+            online: None,
+            git_ref: None,
+        }
+    }
+
+    fn outcome(findings: Vec<Finding>, error: Option<String>) -> RepoOutcome {
+        RepoOutcome {
+            repo: repo_ref("me/proj"),
+            findings,
+            actions: vec![],
+            pushed: vec![],
+            error,
+        }
+    }
+
+    #[test]
+    fn findings_take_precedence_over_errors() {
+        // One repo has a finding, another only errored → findings win (exit 1).
+        let outcomes =
+            vec![outcome(vec![finding()], None), outcome(vec![], Some("clone failed".into()))];
+        assert_eq!(github_exit_code(&outcomes), 1);
+    }
+
+    #[test]
+    fn finding_and_error_on_same_repo_exits_1() {
+        let outcomes = vec![outcome(vec![finding()], Some("push failed".into()))];
+        assert_eq!(github_exit_code(&outcomes), 1);
+    }
+
+    #[test]
+    fn error_only_exits_2() {
+        let outcomes = vec![outcome(vec![], Some("clone failed".into()))];
+        assert_eq!(github_exit_code(&outcomes), 2);
+    }
+
+    #[test]
+    fn clean_run_exits_0() {
+        let outcomes = vec![outcome(vec![], None)];
+        assert_eq!(github_exit_code(&outcomes), 0);
     }
 }
