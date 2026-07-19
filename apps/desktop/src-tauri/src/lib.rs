@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use wormward_core::{
     apply, apply_branch_cleans, deep_scan_repo, discover_repos, now_secs, plan_branch_cleans,
-    plan_remediation, restore as core_restore, scan as core_scan, scan_deep, scan_repo,
-    BranchCleanStatus, Finding, RemediationAction, ScanReport,
+    plan_remediation, restore as core_restore, scan_repo, scan_streaming, BranchCleanStatus,
+    Finding, RemediationAction, ScanReport,
 };
 use wormward_github::pipeline::{fix_pass, scan_pass_with_progress, GithubRunOpts, ScanPass};
 use wormward_github::{resolve_token, GitHubHost, RepoHost};
@@ -85,7 +86,21 @@ pub struct ScanResult {
     report: ScanReport,
     /// OSM enrichment warnings (auth / rate-limit / network). Empty on an offline scan.
     warnings: Vec<String>,
+    /// True when the run was stopped early via `cancel_scan` (the report is partial).
+    cancelled: bool,
 }
+
+/// Per-repo progress emitted on the `local-scan-progress` event as a scan runs.
+#[derive(Serialize, Clone)]
+pub struct ScanProgress {
+    done: usize,
+    total: usize,
+    repo: String,
+}
+
+/// Cross-command cancel flag for the running local scan. `cancel_scan` sets it; the `scan`
+/// command clears it at the start of each run and checks it between repos.
+type ScanCancel = Arc<AtomicBool>;
 
 #[tauri::command]
 async fn scan(
@@ -93,14 +108,22 @@ async fn scan(
     deep: bool,
     online: bool,
     token: Option<String>,
+    window: tauri::Window,
+    cancel: tauri::State<'_, ScanCancel>,
 ) -> Result<ScanResult, String> {
     let paths = to_paths(dirs);
     let packs = builtin_packs();
-    let mut report = if deep {
-        scan_deep(&paths, &packs)
-    } else {
-        core_scan(&paths, &packs)
-    };
+    // Fresh run: clear any stale cancel request from a previous scan.
+    cancel.store(false, Ordering::Relaxed);
+    let flag: &AtomicBool = &cancel;
+    // Sequential, cancellable scan: emit one progress event per repo for the live log.
+    let mut report = scan_streaming(&paths, &packs, deep, flag, &|done, total, repo| {
+        let _ = window.emit(
+            "local-scan-progress",
+            ScanProgress { done, total, repo: repo.display().to_string() },
+        );
+    });
+    let cancelled = flag.load(Ordering::Relaxed);
     let mut warnings = Vec::new();
     if online {
         // Mirror the CLI: an online scan with no resolvable token is a hard error, not a
@@ -118,7 +141,14 @@ async fn scan(
         // Surface enrichment warnings rather than discarding them (the CLI prints each).
         warnings = enrich(&mut report.findings, &client);
     }
-    Ok(ScanResult { report, warnings })
+    Ok(ScanResult { report, warnings, cancelled })
+}
+
+/// Request cancellation of the running local scan. Cooperative: the `scan` loop stops at the
+/// next repo boundary and returns a partial report with `cancelled = true`.
+#[tauri::command]
+fn cancel_scan(cancel: tauri::State<'_, ScanCancel>) {
+    cancel.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -473,8 +503,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(GithubScanState::new(None))
+        .manage(ScanCancel::new(AtomicBool::new(false)))
         .invoke_handler(tauri::generate_handler![
             scan,
+            cancel_scan,
             list_packs,
             clean_preview,
             clean_apply,

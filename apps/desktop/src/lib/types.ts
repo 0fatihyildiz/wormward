@@ -26,6 +26,8 @@ export interface ScanReport {
   repos_scanned: number;
   /** Non-fatal OSM online-lookup warnings (auth / rate-limit / network). */
   warnings?: string[];
+  /** True when the scan was stopped early via cancel_scan (report is partial). */
+  cancelled?: boolean;
 }
 
 export interface PackInfo {
