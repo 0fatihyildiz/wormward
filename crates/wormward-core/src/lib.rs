@@ -1,3 +1,4 @@
+pub mod capability;
 pub mod finding;
 pub mod git;
 pub mod matchers;
@@ -5,6 +6,7 @@ pub mod pack;
 pub mod remediate;
 pub mod repo_files;
 pub mod scanner;
+pub mod surface;
 pub mod walk;
 
 pub use finding::{Finding, FindingKind, OnlineVerdict, Severity};
