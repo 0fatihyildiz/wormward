@@ -105,6 +105,7 @@ fn sanitize_full_name(full_name: &str) -> String {
 
 /// A repo scanned via the API in phase one. No clone exists; the fix phase clones
 /// on demand for the repos actually selected.
+#[derive(Debug)]
 pub struct ScannedRepo {
     pub repo: RepoRef,
     pub findings: Vec<Finding>,
@@ -121,6 +122,7 @@ impl ScannedRepo {
 }
 
 /// Result of phase one: every repo scanned via the API. No clones exist on disk.
+#[derive(Debug)]
 pub struct ScanPass {
     repos: Vec<ScannedRepo>,
 }
@@ -442,9 +444,9 @@ pub fn fix_pass(
         .collect()
 }
 
-/// Enumerate the account's repos and process each one: clone + scan, then fix all
-/// infected repos (no interactive selection). Per-repo failures are captured in
-/// `RepoOutcome.error`; the run never aborts.
+/// Enumerate the account's repos and process each one: API-scan, then fix (cloned on
+/// demand) all infected repos (no interactive selection). Per-repo failures are captured
+/// in `RepoOutcome.error`; the run never aborts.
 pub fn run(
     opts: &GithubRunOpts,
     host: &dyn RepoHost,
@@ -898,5 +900,110 @@ mod tests {
             !clone_dir.join("me__clean").exists(),
             "clean repo must never be cloned"
         );
+    }
+
+    /// Wraps GitFakeHost but reports every tree as truncated, forcing the
+    /// clone-and-scan fallback.
+    struct TruncatedHost(GitFakeHost);
+    impl RepoHost for TruncatedHost {
+        fn list_repos(&self, f: bool) -> Result<Vec<RepoRef>, GithubError> {
+            self.0.list_repos(f)
+        }
+        fn list_branches(&self, n: &str) -> Result<Vec<Branch>, GithubError> {
+            self.0.list_branches(n)
+        }
+        fn get_tree(&self, n: &str, s: &str) -> Result<Tree, GithubError> {
+            self.0.get_tree(n, s).map(|t| Tree { truncated: true, ..t })
+        }
+        fn get_blob(&self, n: &str, s: &str) -> Result<Option<String>, GithubError> {
+            self.0.get_blob(n, s)
+        }
+    }
+
+    /// Wraps GitFakeHost but fails every blob fetch.
+    struct BrokenBlobHost(GitFakeHost);
+    impl RepoHost for BrokenBlobHost {
+        fn list_repos(&self, f: bool) -> Result<Vec<RepoRef>, GithubError> {
+            self.0.list_repos(f)
+        }
+        fn list_branches(&self, n: &str) -> Result<Vec<Branch>, GithubError> {
+            self.0.list_branches(n)
+        }
+        fn get_tree(&self, n: &str, s: &str) -> Result<Tree, GithubError> {
+            self.0.get_tree(n, s)
+        }
+        fn get_blob(&self, _: &str, _: &str) -> Result<Option<String>, GithubError> {
+            Err(GithubError::Http("connection reset".into()))
+        }
+    }
+
+    /// Rate-limited from the very first per-repo call.
+    struct RateLimitedHost(GitFakeHost);
+    impl RepoHost for RateLimitedHost {
+        fn list_repos(&self, f: bool) -> Result<Vec<RepoRef>, GithubError> {
+            self.0.list_repos(f)
+        }
+        fn list_branches(&self, _: &str) -> Result<Vec<Branch>, GithubError> {
+            Err(GithubError::RateLimited("HTTP 429".into()))
+        }
+        fn get_tree(&self, n: &str, s: &str) -> Result<Tree, GithubError> {
+            self.0.get_tree(n, s)
+        }
+        fn get_blob(&self, n: &str, s: &str) -> Result<Option<String>, GithubError> {
+            self.0.get_blob(n, s)
+        }
+    }
+
+    fn one_repo_host(tmp: &TempDir, name: &str) -> GitFakeHost {
+        let bare = make_infected_origin_named(tmp, name);
+        GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: format!("me/{name}"),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        }
+    }
+
+    fn scan_only_opts() -> GithubRunOpts {
+        GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+        }
+    }
+
+    #[test]
+    fn truncated_tree_falls_back_to_clone_scan() {
+        let tmp = TempDir::new().unwrap();
+        let host = TruncatedHost(one_repo_host(&tmp, "big"));
+        let scan = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "").unwrap();
+        let sr = &scan.repos()[0];
+        assert!(sr.error.is_none(), "fallback should succeed: {:?}", sr.error);
+        assert!(sr.is_infected(), "fallback clone-scan must still find the payload");
+        // Findings are labeled with the virtual repo name, not a dangling temp path.
+        assert_eq!(sr.findings[0].repo, PathBuf::from("me/big"));
+    }
+
+    #[test]
+    fn blob_fetch_failure_marks_scan_incomplete_not_clean() {
+        let tmp = TempDir::new().unwrap();
+        let host = BrokenBlobHost(one_repo_host(&tmp, "flaky"));
+        let scan = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "").unwrap();
+        let sr = &scan.repos()[0];
+        assert!(sr.error.as_deref().unwrap_or("").contains("scan incomplete"));
+        assert!(!sr.is_infected(), "errored repo is not 'infected'");
+        assert!(sr.findings.is_empty(), "incomplete findings must not be reported");
+    }
+
+    #[test]
+    fn rate_limit_aborts_the_scan() {
+        let tmp = TempDir::new().unwrap();
+        let host = RateLimitedHost(one_repo_host(&tmp, "limited"));
+        let result = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "");
+        assert!(matches!(result, Err(GithubError::RateLimited(_))), "got {result:?}");
     }
 }
