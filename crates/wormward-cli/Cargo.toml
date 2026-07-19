@@ -1,0 +1,19 @@
+[package]
+name = "wormward-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wormward"
+path = "src/main.rs"
+
+[dependencies]
+wormward-core = { path = "../wormward-core" }
+wormward-packs = { path = "../wormward-packs" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
