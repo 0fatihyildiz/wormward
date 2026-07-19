@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 wormward-core = { path = "../wormward-core" }
+regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

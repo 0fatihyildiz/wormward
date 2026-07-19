@@ -4,7 +4,7 @@ use aho_corasick::AhoCorasick;
 use regex::{RegexSet, RegexSetBuilder};
 
 use crate::finding::Severity;
-use crate::matchers::{sha256_hex, SignatureKind};
+use crate::matchers::{sha256_hex, shannon_entropy, SignatureKind};
 use crate::pack::Pack;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +28,9 @@ pub struct SignatureEngine {
     // lowercase digest -> every signature carrying that digest. Multiple packs can
     // share a digest, so we keep a Vec instead of collapsing to a single meta.
     sha256: HashMap<String, Vec<SigMeta>>,
+    // (threshold bits/byte, meta) — fires when the content's last-512-byte tail
+    // entropy exceeds the threshold. Mirrors matchers::signature_matches.
+    entropy: Vec<(f64, SigMeta)>,
 }
 
 impl SignatureEngine {
@@ -37,6 +40,7 @@ impl SignatureEngine {
         let mut regex_patterns: Vec<String> = Vec::new();
         let mut regex_meta: Vec<SigMeta> = Vec::new();
         let mut sha256: HashMap<String, Vec<SigMeta>> = HashMap::new();
+        let mut entropy: Vec<(f64, SigMeta)> = Vec::new();
 
         for pack in packs {
             let m = &pack.manifest;
@@ -61,6 +65,12 @@ impl SignatureEngine {
                     SignatureKind::Sha256 => {
                         sha256.entry(sig.value.to_ascii_lowercase()).or_default().push(meta);
                     }
+                    SignatureKind::EntropyOver => {
+                        // Unparseable threshold -> f64::MAX (never fires), matching
+                        // the old signature_matches behavior.
+                        let threshold = sig.value.parse().unwrap_or(f64::MAX);
+                        entropy.push((threshold, meta));
+                    }
                 }
             }
         }
@@ -83,7 +93,7 @@ impl SignatureEngine {
             RegexSetBuilder::new(&regex_patterns).size_limit(1 << 24).build().ok()
         };
 
-        SignatureEngine { literal, literal_meta, regex_set, regex_meta, sha256 }
+        SignatureEngine { literal, literal_meta, regex_set, regex_meta, sha256, entropy }
     }
 
     pub fn scan_content(&self, content: &str) -> Vec<SigHit> {
@@ -121,6 +131,22 @@ impl SignatureEngine {
             if let Some(metas) = self.sha256.get(&digest) {
                 // Multiple signatures can share a digest; emit a hit for every one.
                 for meta in metas {
+                    hits.push(SigHit {
+                        pack_id: meta.pack_id.clone(),
+                        signature_id: meta.signature_id.clone(),
+                        severity: meta.severity.clone(),
+                    });
+                }
+            }
+        }
+
+        if !self.entropy.is_empty() {
+            // Payloads are appended, so measure the tail's randomness (last 512 bytes).
+            let bytes = content.as_bytes();
+            let tail = &bytes[bytes.len().saturating_sub(512)..];
+            let ent = shannon_entropy(tail);
+            for (threshold, meta) in &self.entropy {
+                if ent > *threshold {
                     hits.push(SigHit {
                         pack_id: meta.pack_id.clone(),
                         signature_id: meta.signature_id.clone(),
@@ -214,6 +240,17 @@ mod tests {
         let engine = SignatureEngine::build(&[pack]);
         assert_eq!(engine.scan_content("payload").len(), 1);
         assert!(engine.scan_content("other").is_empty());
+    }
+
+    #[test]
+    fn entropy_over_signature_fires_on_high_entropy_tail() {
+        let pack = pack_with(vec![sig(SignatureKind::EntropyOver, "ent", "5.0")]);
+        let engine = SignatureEngine::build(&[pack]);
+        const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let blob: String = (0..600).map(|i| B64[(i * 37) % B64.len()] as char).collect();
+        assert_eq!(engine.scan_content(&blob).len(), 1);
+        // Plain config stays below threshold.
+        assert!(engine.scan_content("export default { plugins: {} };\n").is_empty());
     }
 
     #[test]

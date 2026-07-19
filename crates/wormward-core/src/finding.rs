@@ -21,6 +21,7 @@ pub enum FindingKind {
     IocDomain,
     GitReflog,
     Analyzer,
+    Capability,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,6 +63,12 @@ mod tests {
     fn finding_kind_serializes_snake_case() {
         let json = serde_json::to_string(&FindingKind::ContentSignature).unwrap();
         assert_eq!(json, "\"content_signature\"");
+    }
+
+    #[test]
+    fn capability_kind_serializes() {
+        let json = serde_json::to_string(&FindingKind::Capability).unwrap();
+        assert_eq!(json, "\"capability\"");
     }
 
     fn sample_finding(online: Option<OnlineVerdict>) -> Finding {

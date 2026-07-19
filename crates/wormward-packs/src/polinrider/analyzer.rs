@@ -1,26 +1,45 @@
+use std::sync::OnceLock;
+
+use regex::Regex;
 use wormward_core::{CampaignAnalyzer, Finding, FindingKind, ScannedFile, Severity};
 
-const INJECTION_MARKERS: &[&str] = &["global['!']=", "global['_V']="];
-const DECODER_NAMES: &[&str] = &["_$_1e42", "MDy"];
-const V1_SEEDS: &[&str] = &["2857687", "2667686"];
-const V2_SEEDS: &[&str] = &["1111436", "3896884"];
+fn marker_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Version-tag marker (`global.o='5-3-235-du'` / `global['!']='8-270-2'`) OR the
+    // ESM re-entry shim (`global['r']=require` / `global.m=module`) — the shim is the
+    // strongest marker-independent tell, present in both variants.
+    RE.get_or_init(|| {
+        Regex::new(r"global(\.\w+|\['[^']+'\])\s*=\s*(?:require\b|module\b|'[\w-]+')").unwrap()
+    })
+}
+
+fn decoder_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Family decoder-name pattern: `_$_1e42`, `_$_8e2c`, …
+    RE.get_or_init(|| Regex::new(r"_\$_[0-9a-f]{4,}").unwrap())
+}
+
+fn seed_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b\d{6,7}\b").unwrap())
+}
 
 pub struct PolinriderAnalyzer;
 
 impl PolinriderAnalyzer {
-    /// The strongest confirmation reason, or None if the file is not confirmed.
+    /// Confirm the obfuscation fingerprint regardless of dot/bracket notation or the
+    /// specific decoder name / seed — so new variants are caught, not just known literals.
     fn confirm(content: &str) -> Option<String> {
-        let has_marker = INJECTION_MARKERS.iter().any(|m| content.contains(m));
-        if has_marker {
-            if let Some(d) = DECODER_NAMES.iter().find(|d| content.contains(**d)) {
-                return Some(format!("injection marker + decoder '{d}'"));
-            }
+        let has_marker = marker_re().is_match(content);
+        let has_decoder = decoder_re().is_match(content)
+            || content.contains("MDy")
+            || content.contains("createRequire(import.meta.url");
+        let has_seed = seed_re().is_match(content);
+        if has_marker && has_decoder {
+            return Some("obfuscation: injection marker + decoder".to_string());
         }
-        if content.contains("_$_1e42") && V1_SEEDS.iter().any(|s| content.contains(s)) {
-            return Some("decoder '_$_1e42' + v1 seed".to_string());
-        }
-        if content.contains("MDy") && V2_SEEDS.iter().any(|s| content.contains(s)) {
-            return Some("decoder 'MDy' + v2 seed".to_string());
+        if has_decoder && has_seed {
+            return Some("obfuscation: decoder + shuffle seed".to_string());
         }
         None
     }
@@ -40,7 +59,7 @@ impl CampaignAnalyzer for PolinriderAnalyzer {
                 file: Some(file.path.clone()),
                 signature_id: "analyzer-confirmed".into(),
                 kind: FindingKind::Analyzer,
-                evidence: format!("confirmed obfuscation: {reason}"),
+                evidence: format!("confirmed {reason}"),
                 remediable: true,
                 online: None,
                 git_ref: None,
@@ -64,32 +83,43 @@ mod tests {
     }
 
     #[test]
-    fn confirms_when_marker_and_decoder_present() {
-        let f = scanned("export default {};\nglobal['!']='8-270-2';var _$_1e42=[];");
-        let out = PolinriderAnalyzer.analyze(&f);
+    fn confirms_bracket_variant() {
+        let out = PolinriderAnalyzer
+            .analyze(&scanned("export default {};\nglobal['!']='8-270-2';var _$_1e42=[];"));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, FindingKind::Analyzer);
-        assert!(out[0].evidence.contains("_$_1e42"));
     }
 
     #[test]
-    fn confirms_decoder_plus_seed_without_marker() {
-        // No global['...'] marker, but decoder + a v1 seed => confirmed.
-        let f = scanned("var _$_1e42 = shuffle(2667686);");
-        let out = PolinriderAnalyzer.analyze(&f);
+    fn confirms_dot_notation_variant() {
+        // The modus.builders variant: dot marker + _$_8e2c decoder.
+        let out = PolinriderAnalyzer
+            .analyze(&scanned("export default {};\nglobal.o='5-3-235-du';var _$_8e2c=[];"));
         assert_eq!(out.len(), 1);
-        assert!(out[0].evidence.contains("v1 seed"));
+    }
+
+    #[test]
+    fn confirms_esm_shim_variant() {
+        // require/module ESM shim + decoder → confirm structurally.
+        let out = PolinriderAnalyzer.analyze(&scanned(
+            "export default {};\nglobal['r']=require;global['m']=module;var _$_8e2c=[];",
+        ));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn confirms_decoder_plus_seed() {
+        let out = PolinriderAnalyzer.analyze(&scanned("var _$_8e2c = shuffle(3899501);"));
+        assert_eq!(out.len(), 1);
     }
 
     #[test]
     fn no_finding_when_only_marker() {
-        let f = scanned("global['!']='8-270-2';");
-        assert!(PolinriderAnalyzer.analyze(&f).is_empty());
+        assert!(PolinriderAnalyzer.analyze(&scanned("global['!']='8-270-2';")).is_empty());
     }
 
     #[test]
     fn no_finding_on_clean_file() {
-        let f = scanned("export default { plugins: {} };");
-        assert!(PolinriderAnalyzer.analyze(&f).is_empty());
+        assert!(PolinriderAnalyzer.analyze(&scanned("export default { plugins: {} };")).is_empty());
     }
 }

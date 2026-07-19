@@ -241,4 +241,44 @@ mod tests {
         fs::write(repo.join("data.json"), "{}").unwrap();
         assert!(scan_repo(&repo, &builtin_packs()).is_empty());
     }
+
+    #[test]
+    fn detects_dot_notation_variant() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default {};\nglobal.o='5-3-235-du';var _$_8e2c=[];",
+        )
+        .unwrap();
+        let f = scan_repo(&repo, &builtin_packs());
+        // Caught by the generalized analyzer AND the decoder-pattern signature.
+        assert!(f.iter().any(|x| x.campaign == "polinrider" && x.kind == FindingKind::Analyzer));
+        assert!(f.iter().any(|x| x.signature_id == "decoder-pattern"));
+    }
+
+    #[test]
+    fn detects_ethereum_c2_ip() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("next.config.mjs"), "fetch('http://23.27.20.187/c2')").unwrap();
+        assert!(scan_repo(&repo, &builtin_packs())
+            .iter()
+            .any(|x| x.signature_id == "c2-ethereum-ip"));
+    }
+
+    #[test]
+    fn clean_config_not_flagged_by_structural_sigs() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("clean");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default { plugins: { tailwindcss: {}, autoprefixer: {} } };\n",
+        )
+        .unwrap();
+        assert!(scan_repo(&repo, &builtin_packs()).is_empty());
+    }
 }
