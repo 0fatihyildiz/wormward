@@ -111,6 +111,36 @@ pub fn update_ref(repo: &Path, name: &str, value: &str) -> Result<(), String> {
     run_git(repo, &["update-ref", name, value])
 }
 
+/// The all-zero oid: `git update-ref <name> <new> <old>` with this as `<old>` means
+/// "only create; fail if the ref already exists".
+const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+
+/// Create a ref *only if it does not already exist* (`git update-ref <name> <value> <zero>`).
+/// Fails (non-zero) if the ref is already present, so a same-second rerun cannot clobber an
+/// existing backup ref and destroy its rollback target.
+pub fn create_ref(repo: &Path, name: &str, value: &str) -> Result<(), String> {
+    run_git(repo, &["update-ref", name, value, ZERO_OID])
+}
+
+/// The configured remote for a local branch (`git config --get branch.<branch>.remote`),
+/// e.g. `origin`. `None` when the branch has no upstream remote configured.
+pub fn branch_remote(repo: &Path, branch: &str) -> Option<String> {
+    run_git_stdout(repo, &["config", "--get", &format!("branch.{branch}.remote")])
+        .filter(|s| !s.is_empty())
+}
+
+/// `git worktree prune` — drop stale administrative worktree entries under
+/// `.git/worktrees/` (used as a fallback when a worktree dir vanished without a clean remove).
+pub fn worktree_prune(repo: &Path) -> Result<(), String> {
+    run_git(repo, &["worktree", "prune"])
+}
+
+/// `git branch -D <name>` — force-delete a local branch. Used to remove the throwaway branch
+/// created for a remote-tracking clean so no real-named local branch is left behind.
+pub fn delete_branch(repo: &Path, name: &str) -> Result<(), String> {
+    run_git(repo, &["branch", "-D", name])
+}
+
 /// `git worktree add <path> <branch>` — check out an existing local branch into an isolated
 /// worktree so its tip can be cleaned without disturbing the user's checkout.
 pub fn worktree_add(repo: &Path, path: &Path, branch: &str) -> Result<(), String> {
@@ -244,6 +274,23 @@ mod tests {
         let out = String::from_utf8_lossy(&files.stdout);
         assert!(out.contains("cleaned.txt"));
         assert!(!out.contains("unrelated-secret.txt"));
+    }
+
+    #[test]
+    fn create_ref_is_create_only() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f.txt"), "a").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "c"]);
+        let oid = rev_parse(repo, "HEAD").unwrap();
+
+        let name = "refs/wormward-backup/x-1";
+        create_ref(repo, name, &oid).unwrap();
+        // A second create-only attempt must FAIL rather than clobber the existing ref.
+        assert!(create_ref(repo, name, &oid).is_err());
+        assert_eq!(rev_parse(repo, name).unwrap(), oid);
     }
 
     #[test]
