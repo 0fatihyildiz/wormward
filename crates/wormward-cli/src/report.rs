@@ -24,12 +24,18 @@ pub fn render_text(report: &ScanReport) -> String {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "-".to_string());
+        let branch = f
+            .git_ref
+            .as_deref()
+            .map(|r| format!(" (branch: {r})"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "  [{}] {} :: {} :: {} — {}\n",
+            "  [{}] {} :: {} :: {}{} — {}\n",
             severity_tag(&f.severity),
             f.campaign,
             f.repo.display(),
             file,
+            branch,
             f.evidence,
         ));
         if let Some(v) = &f.online {
@@ -118,5 +124,12 @@ mod tests {
         let text = render_text(&r);
         assert!(text.contains("OSM: MALICIOUS"));
         assert!(text.contains("https://osm/x"));
+    }
+
+    #[test]
+    fn renders_branch_when_git_ref_set() {
+        let mut r = report_with_finding();
+        r.findings[0].git_ref = Some("origin/evil".into());
+        assert!(render_text(&r).contains("(branch: origin/evil)"));
     }
 }

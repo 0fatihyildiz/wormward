@@ -19,6 +19,7 @@ cargo install --path crates/wormward-cli
 wormward scan ~                 # scan your home directory (read-only)
 wormward scan . --format json   # machine-readable output for CI
 wormward list-packs             # show bundled campaign packs
+wormward scan ~ --deep          # also scan every branch tip (worms hide on non-default branches)
 ```
 
 Exit codes: `0` clean, `1` infections found, `2` error.

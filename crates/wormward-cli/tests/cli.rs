@@ -148,3 +148,33 @@ fn check_subcommand_reports_malicious() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stdout).contains("malicious: true"));
 }
+
+#[test]
+fn scan_deep_flags_payload_on_other_branch() {
+    use std::process::Command as Cmd;
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        Cmd::new("git").arg("-C").arg(repo).args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+            .status().unwrap();
+    }
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("proj");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("postcss.config.mjs"), "export default {};").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "clean"]);
+    git(&repo, &["checkout", "-q", "-b", "evil"]);
+    fs::write(repo.join("postcss.config.mjs"), "var q=(\"rmcej%otb%\",2857687);").unwrap();
+    git(&repo, &["commit", "-q", "-am", "payload"]);
+    git(&repo, &["checkout", "-q", "main"]);
+
+    // Plain scan of the working tree (main) is clean.
+    let plain = bin().arg("scan").arg(tmp.path()).output().unwrap();
+    assert_eq!(plain.status.code(), Some(0));
+    // Deep scan finds it on 'evil'.
+    let deep = bin().arg("scan").arg("--deep").arg(tmp.path()).output().unwrap();
+    assert_eq!(deep.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&deep.stdout).contains("branch: evil"));
+}

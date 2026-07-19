@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use wormward_core::scan;
+use wormward_core::{scan, scan_deep};
 use wormward_osm::OsmClient;
 use wormward_packs::builtin_packs;
 
@@ -31,6 +31,9 @@ enum Command {
         /// OSM API token (else OSM_API_KEY env).
         #[arg(long)]
         osm_token: Option<String>,
+        /// Also scan the tip of every local/remote branch (read-only, no checkout).
+        #[arg(long)]
+        deep: bool,
     },
     /// List the campaign packs compiled into this build.
     ListPacks,
@@ -64,14 +67,18 @@ fn osm_base_url() -> String {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan { dirs, format, online, osm_token } => {
+        Command::Scan { dirs, format, online, osm_token, deep } => {
             for dir in &dirs {
                 if !dir.exists() {
                     eprintln!("error: path does not exist: {}", dir.display());
                     return ExitCode::from(2);
                 }
             }
-            let mut report = scan(&dirs, &builtin_packs());
+            let mut report = if deep {
+                scan_deep(&dirs, &builtin_packs())
+            } else {
+                scan(&dirs, &builtin_packs())
+            };
             if online {
                 let token = osm_token
                     .or_else(|| std::env::var("OSM_API_KEY").ok())
