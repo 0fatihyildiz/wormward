@@ -3,6 +3,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 pub mod pipeline;
+pub mod api_tree;
 
 // Serialize is required because RepoOutcome (pipeline) serializes an embedded RepoRef.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
