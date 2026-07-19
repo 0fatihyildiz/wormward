@@ -470,7 +470,9 @@ mod tests {
         let repo = tmp.path().join("v");
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::write(repo.join("temp_auto_push.bat"), "@echo off").unwrap();
-        let plans = clean_preview(vec![tmp.path().display().to_string()]).unwrap();
+        let plans =
+            tauri::async_runtime::block_on(clean_preview(vec![tmp.path().display().to_string()]))
+                .unwrap();
         assert_eq!(plans.len(), 1);
         assert!(!plans[0].actions.is_empty());
     }
@@ -487,7 +489,8 @@ mod tests {
         let a = mk("a");
         let b = mk("b");
         // Apply to `a` only; `b`'s dropped artifact must remain.
-        let summary = clean_apply(vec![a.display().to_string()]).unwrap();
+        let summary =
+            tauri::async_runtime::block_on(clean_apply(vec![a.display().to_string()])).unwrap();
         assert_eq!(summary.repos, 1);
         assert!(!a.join("temp_auto_push.bat").exists());
         assert!(b.join("temp_auto_push.bat").exists());
@@ -532,7 +535,10 @@ mod tests {
     fn clean_branches_preview_finds_infected_non_default_branch() {
         let tmp = TempDir::new().unwrap();
         let repo = repo_with_infected_branch(&tmp);
-        let previews = clean_branches_preview(vec![repo.display().to_string()]).unwrap();
+        let previews = tauri::async_runtime::block_on(clean_branches_preview(vec![repo
+            .display()
+            .to_string()]))
+        .unwrap();
         let evil = previews
             .iter()
             .find(|p| p.branch == "evil")
@@ -545,13 +551,13 @@ mod tests {
     fn clean_branches_apply_cleans_selected_branch_tip() {
         let tmp = TempDir::new().unwrap();
         let repo = repo_with_infected_branch(&tmp);
-        let summary = clean_branches_apply(
+        let summary = tauri::async_runtime::block_on(clean_branches_apply(
             vec![BranchSelection {
                 repo: repo.display().to_string(),
                 branch: "evil".into(),
             }],
             false,
-        )
+        ))
         .unwrap();
         assert_eq!(summary.cleaned, 1, "results: {:?}", summary.results.len());
         assert_eq!(summary.results[0].status, "cleaned");
