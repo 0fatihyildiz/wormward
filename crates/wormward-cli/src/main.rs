@@ -111,6 +111,10 @@ enum Command {
         /// Fix every infected repo without the interactive selection prompt.
         #[arg(long)]
         all: bool,
+        /// Restrict org scanning to these orgs (repeatable). Your own repos are always scanned.
+        /// Omit to scan every org you belong to.
+        #[arg(long = "org")]
+        org: Vec<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -536,7 +540,7 @@ fn main() -> ExitCode {
             }
             ExitCode::from(0)
         }
-        Command::Github { token, clone_dir, include_forks, fix, push, yes, all, format } => {
+        Command::Github { token, clone_dir, include_forks, fix, push, yes, all, org, format } => {
             // --push and --fix are destructive; require explicit --yes to write.
             if push && !yes {
                 eprintln!("refusing to force-push without --yes (destructive). Re-run with --yes to confirm.");
@@ -560,6 +564,7 @@ fn main() -> ExitCode {
                 fix: fix || push,
                 push,
                 yes,
+                orgs: org,
             };
 
             // A fix only persists if it has somewhere to land: a push target OR an explicit

@@ -21,6 +21,9 @@ pub struct GithubRunOpts {
     pub fix: bool,
     pub push: bool,
     pub yes: bool,
+    /// Restrict org scanning to these orgs; empty scans every org you belong to. Your
+    /// personal repos are always scanned regardless.
+    pub orgs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -366,7 +369,7 @@ pub fn scan_pass_with_progress(
     token: &str,
     on_progress: &(dyn Fn(ScanProgress) + Sync),
 ) -> Result<ScanPass, GithubError> {
-    let repos = host.list_repos(opts.include_forks)?;
+    let repos = host.list_repos(opts.include_forks, &opts.orgs)?;
     let total = repos.len();
     let cache = BlobCache::new();
     let done_counter = AtomicUsize::new(0);
@@ -626,8 +629,24 @@ mod tests {
     }
 
     impl RepoHost for GitFakeHost {
-        fn list_repos(&self, include_forks: bool) -> Result<Vec<RepoRef>, GithubError> {
-            Ok(self.repos.iter().filter(|r| include_forks || !r.fork).cloned().collect())
+        fn list_repos(&self, include_forks: bool, orgs: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            Ok(self
+                .repos
+                .iter()
+                .filter(|r| include_forks || !r.fork)
+                // Empty orgs: return everything (current behavior). Otherwise keep only repos
+                // whose owner segment is in `orgs` — only exercised by tests that pass orgs.
+                .filter(|r| {
+                    orgs.is_empty()
+                        || r.full_name
+                            .split_once('/')
+                            .is_some_and(|(owner, _)| orgs.iter().any(|o| o == owner))
+                })
+                .cloned()
+                .collect())
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+            Ok(vec![])
         }
         fn list_branches(&self, full_name: &str) -> Result<Vec<Branch>, GithubError> {
             let out = self.git(
@@ -801,6 +820,7 @@ mod tests {
             fix: true,
             push: false,
             yes: true,
+            orgs: vec![],
         };
 
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
@@ -836,6 +856,7 @@ mod tests {
             fix: true,
             push: false,
             yes: false,
+            orgs: vec![],
         };
 
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
@@ -871,6 +892,7 @@ mod tests {
             fix: true,
             push: true,
             yes: true,
+            orgs: vec![],
         };
 
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
@@ -928,6 +950,7 @@ mod tests {
             fix: true,
             push: false,
             yes: true,
+            orgs: vec![],
         };
 
         let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
@@ -1011,6 +1034,7 @@ mod tests {
             fix: true,
             push: true,
             yes: true,
+            orgs: vec![],
         };
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
         let o = &outcomes[0];
@@ -1082,6 +1106,7 @@ mod tests {
             fix: true,
             push: true,
             yes: true,
+            orgs: vec![],
         };
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
         let o = &outcomes[0];
@@ -1153,6 +1178,7 @@ mod tests {
             fix: true,
             push: true,
             yes: true,
+            orgs: vec![],
         };
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
         let o = &outcomes[0];
@@ -1243,6 +1269,7 @@ mod tests {
             fix: true,
             push: false,
             yes: true,
+            orgs: vec![],
         };
 
         let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
@@ -1310,6 +1337,7 @@ mod tests {
             fix: true,
             push: false,
             yes: true,
+            orgs: vec![],
         };
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
         assert!(outcomes[0].findings.is_empty());
@@ -1324,8 +1352,11 @@ mod tests {
     /// clone-and-scan fallback.
     struct TruncatedHost(GitFakeHost);
     impl RepoHost for TruncatedHost {
-        fn list_repos(&self, f: bool) -> Result<Vec<RepoRef>, GithubError> {
-            self.0.list_repos(f)
+        fn list_repos(&self, f: bool, orgs: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            self.0.list_repos(f, orgs)
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+            self.0.list_orgs()
         }
         fn list_branches(&self, n: &str) -> Result<Vec<Branch>, GithubError> {
             self.0.list_branches(n)
@@ -1341,8 +1372,11 @@ mod tests {
     /// Wraps GitFakeHost but fails every blob fetch.
     struct BrokenBlobHost(GitFakeHost);
     impl RepoHost for BrokenBlobHost {
-        fn list_repos(&self, f: bool) -> Result<Vec<RepoRef>, GithubError> {
-            self.0.list_repos(f)
+        fn list_repos(&self, f: bool, orgs: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            self.0.list_repos(f, orgs)
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+            self.0.list_orgs()
         }
         fn list_branches(&self, n: &str) -> Result<Vec<Branch>, GithubError> {
             self.0.list_branches(n)
@@ -1358,8 +1392,11 @@ mod tests {
     /// Rate-limited from the very first per-repo call.
     struct RateLimitedHost(GitFakeHost);
     impl RepoHost for RateLimitedHost {
-        fn list_repos(&self, f: bool) -> Result<Vec<RepoRef>, GithubError> {
-            self.0.list_repos(f)
+        fn list_repos(&self, f: bool, orgs: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            self.0.list_repos(f, orgs)
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+            self.0.list_orgs()
         }
         fn list_branches(&self, _: &str) -> Result<Vec<Branch>, GithubError> {
             Err(GithubError::RateLimited("HTTP 429".into()))
@@ -1391,6 +1428,7 @@ mod tests {
             fix: false,
             push: false,
             yes: false,
+            orgs: vec![],
         }
     }
 

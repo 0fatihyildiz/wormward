@@ -10,7 +10,7 @@ use wormward_core::{
     BranchCleanStatus, Finding, RemediationAction, ScanReport,
 };
 use wormward_github::pipeline::{fix_pass, scan_pass_with_progress, GithubRunOpts, ScanPass};
-use wormward_github::{resolve_token, GitHubHost};
+use wormward_github::{resolve_token, GitHubHost, RepoHost};
 use wormward_osm::{enrich, OsmClient};
 use wormward_packs::builtin_packs;
 
@@ -343,10 +343,19 @@ pub struct GithubFixView {
 /// (read-only), stash the
 /// findings in managed state for a later fix, and return a view of the infected repos. Token:
 /// explicit (non-empty) or resolved from `gh auth token`/`GITHUB_TOKEN`/`GH_TOKEN` when blank.
+/// List the orgs the token owner belongs to (for the GUI org picker). Errors are returned
+/// so the frontend can fall back to "scan all orgs".
+#[tauri::command]
+async fn github_orgs(token: Option<String>) -> Result<Vec<String>, String> {
+    let token = resolve_token(token.as_deref()).map_err(|e| e.to_string())?;
+    GitHubHost::new(token).list_orgs().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn github_scan(
     token: Option<String>,
     include_forks: bool,
+    orgs: Vec<String>,
     window: tauri::Window,
     state: tauri::State<'_, GithubScanState>,
 ) -> Result<Vec<GithubRepoView>, String> {
@@ -359,6 +368,7 @@ async fn github_scan(
         fix: false,
         push: false,
         yes: false,
+        orgs,
     };
     let scan = scan_pass_with_progress(&opts, &host, &packs, &token, &|p| {
         // Best-effort: a failed emit must never fail the scan.
@@ -405,6 +415,8 @@ async fn github_fix(
         fix: true,
         push: true,
         yes: true,
+        // Fix reuses the cached scan; no re-listing, so orgs are irrelevant here.
+        orgs: vec![],
     };
     let sel: HashSet<String> = selected.into_iter().collect();
 
@@ -447,6 +459,7 @@ pub fn run() {
             restore,
             clean_branches_preview,
             clean_branches_apply,
+            github_orgs,
             github_scan,
             github_fix
         ])
