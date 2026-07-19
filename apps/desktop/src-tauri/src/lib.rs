@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use wormward_core::{
     apply, apply_branch_cleans, deep_scan_repo, discover_repos, now_secs, plan_branch_cleans,
     plan_remediation, restore as core_restore, scan as core_scan, scan_deep, scan_repo,
     BranchCleanStatus, Finding, RemediationAction, ScanReport,
 };
-use wormward_github::pipeline::{fix_pass, scan_pass, GithubRunOpts, ScanPass};
-use wormward_github::{resolve_token, GitHubHost};
+use wormward_github::pipeline::{fix_pass, scan_pass_with_progress, GithubRunOpts, ScanPass};
+use wormward_github::{resolve_token, GitHubHost, RepoHost};
 use wormward_osm::{enrich, OsmClient};
 use wormward_packs::builtin_packs;
 
@@ -87,7 +88,7 @@ pub struct ScanResult {
 }
 
 #[tauri::command]
-fn scan(
+async fn scan(
     dirs: Vec<String>,
     deep: bool,
     online: bool,
@@ -133,7 +134,7 @@ fn list_packs() -> Vec<PackInfo> {
 }
 
 #[tauri::command]
-fn clean_preview(dirs: Vec<String>) -> Result<Vec<RepoPlan>, String> {
+async fn clean_preview(dirs: Vec<String>) -> Result<Vec<RepoPlan>, String> {
     let packs = builtin_packs();
     let mut out = Vec::new();
     for dir in to_paths(dirs) {
@@ -157,7 +158,7 @@ fn clean_preview(dirs: Vec<String>) -> Result<Vec<RepoPlan>, String> {
 /// re-discovering everything under the scanned dirs. Repos with no applicable action are a
 /// no-op.
 #[tauri::command]
-fn clean_apply(repos: Vec<String>) -> Result<CleanSummary, String> {
+async fn clean_apply(repos: Vec<String>) -> Result<CleanSummary, String> {
     let packs = builtin_packs();
     let mut summary = CleanSummary {
         repos: 0,
@@ -188,7 +189,7 @@ fn clean_apply(repos: Vec<String>) -> Result<CleanSummary, String> {
 }
 
 #[tauri::command]
-fn restore(dirs: Vec<String>) -> Result<RestoreSummary, String> {
+async fn restore(dirs: Vec<String>) -> Result<RestoreSummary, String> {
     let mut summary = RestoreSummary { repos: 0, restored: 0 };
     for dir in to_paths(dirs) {
         for repo in discover_repos(&dir) {
@@ -244,7 +245,7 @@ pub struct BranchCleanApplySummary {
 /// Deep-scan the given dirs and return a dry-run branch-clean plan per infected branch tip.
 /// Never mutates anything.
 #[tauri::command]
-fn clean_branches_preview(dirs: Vec<String>) -> Result<Vec<BranchCleanPreview>, String> {
+async fn clean_branches_preview(dirs: Vec<String>) -> Result<Vec<BranchCleanPreview>, String> {
     let packs = builtin_packs();
     let ts = now_secs();
     let mut out = Vec::new();
@@ -269,7 +270,7 @@ fn clean_branches_preview(dirs: Vec<String>) -> Result<Vec<BranchCleanPreview>, 
 /// the selected branches. `push` force-pushes cleaned tips to their remotes; remote-tracking
 /// branches without `push` are reported as skipped (expected).
 #[tauri::command]
-fn clean_branches_apply(
+async fn clean_branches_apply(
     selected: Vec<BranchSelection>,
     push: bool,
 ) -> Result<BranchCleanApplySummary, String> {
@@ -349,15 +350,29 @@ pub struct GithubFixView {
     pushed: Vec<String>,
     actions: Vec<String>,
     error: Option<String>,
+    /// Infected but not auto-remediated (no strip marker, or an incomplete strip was
+    /// reverted). Surfaced so the UI reports "manual review needed", never a silent no-op.
+    manual_review: bool,
 }
 
-/// Enumerate + API-scan (no clones) the token owner's GitHub repos (read-only), stash the
+/// Enumerate + API-scan (no clones) the token owner's GitHub repos and repos in their orgs
+/// (read-only), stash the
 /// findings in managed state for a later fix, and return a view of the infected repos. Token:
 /// explicit (non-empty) or resolved from `gh auth token`/`GITHUB_TOKEN`/`GH_TOKEN` when blank.
+/// List the orgs the token owner belongs to (for the GUI org picker). Errors are returned
+/// so the frontend can fall back to "scan all orgs".
 #[tauri::command]
-fn github_scan(
+async fn github_orgs(token: Option<String>) -> Result<Vec<String>, String> {
+    let token = resolve_token(token.as_deref()).map_err(|e| e.to_string())?;
+    GitHubHost::new(token).list_orgs().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn github_scan(
     token: Option<String>,
     include_forks: bool,
+    orgs: Vec<String>,
+    window: tauri::Window,
     state: tauri::State<'_, GithubScanState>,
 ) -> Result<Vec<GithubRepoView>, String> {
     let token = resolve_token(token.as_deref()).map_err(|e| e.to_string())?;
@@ -369,8 +384,13 @@ fn github_scan(
         fix: false,
         push: false,
         yes: false,
+        orgs,
     };
-    let scan = scan_pass(&opts, &host, &packs, &token).map_err(|e| e.to_string())?;
+    let scan = scan_pass_with_progress(&opts, &host, &packs, &token, &|p| {
+        // Best-effort: a failed emit must never fail the scan.
+        let _ = window.emit("github-scan-progress", &p);
+    })
+    .map_err(|e| e.to_string())?;
     let fixable: HashSet<String> = scan.fixable_full_names(&packs).into_iter().collect();
 
     let mut views = Vec::new();
@@ -400,7 +420,7 @@ fn github_scan(
 /// managed state) — not a freshly resolved one — so the redacted secret matches the one used
 /// for the on-demand clones and pushes.
 #[tauri::command]
-fn github_fix(
+async fn github_fix(
     selected: Vec<String>,
     state: tauri::State<'_, GithubScanState>,
 ) -> Result<Vec<GithubFixView>, String> {
@@ -411,6 +431,8 @@ fn github_fix(
         fix: true,
         push: true,
         yes: true,
+        // Fix reuses the cached scan; no re-listing, so orgs are irrelevant here.
+        orgs: vec![],
     };
     let sel: HashSet<String> = selected.into_iter().collect();
 
@@ -435,6 +457,7 @@ fn github_fix(
             pushed: o.pushed,
             actions: o.actions,
             error: o.error,
+            manual_review: o.manual_review,
         })
         .collect();
 
@@ -458,6 +481,7 @@ pub fn run() {
             restore,
             clean_branches_preview,
             clean_branches_apply,
+            github_orgs,
             github_scan,
             github_fix
         ])
@@ -486,7 +510,9 @@ mod tests {
         let repo = tmp.path().join("v");
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::write(repo.join("temp_auto_push.bat"), "@echo off").unwrap();
-        let plans = clean_preview(vec![tmp.path().display().to_string()]).unwrap();
+        let plans =
+            tauri::async_runtime::block_on(clean_preview(vec![tmp.path().display().to_string()]))
+                .unwrap();
         assert_eq!(plans.len(), 1);
         assert!(!plans[0].actions.is_empty());
     }
@@ -503,7 +529,8 @@ mod tests {
         let a = mk("a");
         let b = mk("b");
         // Apply to `a` only; `b`'s dropped artifact must remain.
-        let summary = clean_apply(vec![a.display().to_string()]).unwrap();
+        let summary =
+            tauri::async_runtime::block_on(clean_apply(vec![a.display().to_string()])).unwrap();
         assert_eq!(summary.repos, 1);
         assert!(!a.join("temp_auto_push.bat").exists());
         assert!(b.join("temp_auto_push.bat").exists());
@@ -548,7 +575,10 @@ mod tests {
     fn clean_branches_preview_finds_infected_non_default_branch() {
         let tmp = TempDir::new().unwrap();
         let repo = repo_with_infected_branch(&tmp);
-        let previews = clean_branches_preview(vec![repo.display().to_string()]).unwrap();
+        let previews = tauri::async_runtime::block_on(clean_branches_preview(vec![repo
+            .display()
+            .to_string()]))
+        .unwrap();
         let evil = previews
             .iter()
             .find(|p| p.branch == "evil")
@@ -561,13 +591,13 @@ mod tests {
     fn clean_branches_apply_cleans_selected_branch_tip() {
         let tmp = TempDir::new().unwrap();
         let repo = repo_with_infected_branch(&tmp);
-        let summary = clean_branches_apply(
+        let summary = tauri::async_runtime::block_on(clean_branches_apply(
             vec![BranchSelection {
                 repo: repo.display().to_string(),
                 branch: "evil".into(),
             }],
             false,
-        )
+        ))
         .unwrap();
         assert_eq!(summary.cleaned, 1, "results: {:?}", summary.results.len());
         assert_eq!(summary.results[0].status, "cleaned");

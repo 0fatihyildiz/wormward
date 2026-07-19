@@ -33,8 +33,11 @@ export const cleanBranchesPreview = (dirs: string[]) =>
 export const cleanBranchesApply = (selected: BranchSelection[], push: boolean) =>
   invoke<BranchCleanApplySummary>("clean_branches_apply", { selected, push });
 
-export const githubScan = (token: string | undefined, includeForks: boolean) =>
-  invoke<GithubRepoView[]>("github_scan", { token: token ?? null, includeForks });
+export const githubOrgs = (token: string | undefined) =>
+  invoke<string[]>("github_orgs", { token: token ?? null });
+
+export const githubScan = (token: string | undefined, includeForks: boolean, orgs: string[]) =>
+  invoke<GithubRepoView[]>("github_scan", { token: token ?? null, includeForks, orgs });
 
 export const githubFix = (selected: string[]) =>
   invoke<GithubFixView[]>("github_fix", { selected });

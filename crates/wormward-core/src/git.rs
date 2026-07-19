@@ -192,6 +192,7 @@ mod tests {
             .arg("-C")
             .arg(repo)
             .args(args)
+            .env("GIT_TEMPLATE_DIR", "")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@e.x")
             .env("GIT_COMMITTER_NAME", "t")
@@ -246,7 +247,7 @@ mod tests {
         let remote = tmp.path().join("remote.git");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
-        Command::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+        Command::new("git").args(["init", "--bare", "-q"]).env("GIT_TEMPLATE_DIR", "").arg(&remote).status().unwrap();
         std::fs::write(repo.join("a.txt"), "one").unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "init"]);
@@ -268,7 +269,7 @@ mod tests {
         let remote = tmp.path().join("remote.git");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
-        Command::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+        Command::new("git").args(["init", "--bare", "-q"]).env("GIT_TEMPLATE_DIR", "").arg(&remote).status().unwrap();
         std::fs::write(repo.join("a.txt"), "payload").unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "c"]);
@@ -327,7 +328,8 @@ mod tests {
         let remote = tmp.path().join("remote.git");
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
-        Command::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+        // -b main so the bare HEAD tracks main even when init.defaultBranch=master.
+        Command::new("git").args(["init", "--bare", "-q", "-b", "main"]).env("GIT_TEMPLATE_DIR", "").arg(&remote).status().unwrap();
         std::fs::create_dir_all(&a).unwrap();
         git(&a, &["init", "-q", "-b", "main"]);
         std::fs::write(a.join("f.txt"), "1").unwrap();
@@ -336,7 +338,7 @@ mod tests {
         git(&a, &["remote", "add", "origin", remote.to_str().unwrap()]);
         git(&a, &["push", "-q", "-u", "origin", "main"]);
         // Clone B advances the remote underneath A.
-        Command::new("git").args(["clone", "-q"]).arg(&remote).arg(&b).status().unwrap();
+        Command::new("git").args(["clone", "-q"]).env("GIT_TEMPLATE_DIR", "").arg(&remote).arg(&b).status().unwrap();
         std::fs::write(b.join("f.txt"), "2").unwrap();
         git(&b, &["add", "."]);
         git(&b, &["commit", "-q", "-m", "c2"]);

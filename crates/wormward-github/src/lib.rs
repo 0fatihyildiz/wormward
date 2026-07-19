@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -78,7 +79,12 @@ pub fn resolve_token(explicit: Option<&str>) -> Result<String, GithubError> {
 /// A source of repos + their trees/blobs. `Sync` because the scan fans out over
 /// repos with rayon while sharing one host.
 pub trait RepoHost: Sync {
-    fn list_repos(&self, include_forks: bool) -> Result<Vec<RepoRef>, GithubError>;
+    /// List repos to scan. Personal repos (yours) are always included. When `orgs` is
+    /// empty, org-member repos across ALL your orgs are included too (single call); when
+    /// `orgs` is non-empty, only those named orgs' repos are added to your personal repos.
+    fn list_repos(&self, include_forks: bool, orgs: &[String]) -> Result<Vec<RepoRef>, GithubError>;
+    /// The login names of the orgs the token owner belongs to (for the GUI org picker).
+    fn list_orgs(&self) -> Result<Vec<String>, GithubError>;
     fn list_branches(&self, full_name: &str) -> Result<Vec<Branch>, GithubError>;
     fn get_tree(&self, full_name: &str, commit_sha: &str) -> Result<Tree, GithubError>;
     /// `Ok(None)` for binary / non-UTF-8 blobs (mirrors `GitTree::read`).
@@ -115,6 +121,10 @@ struct ApiTreeEntry {
 #[derive(serde::Deserialize)]
 struct ApiBlob {
     content: String,
+}
+#[derive(serde::Deserialize)]
+struct ApiOrg {
+    login: String,
 }
 
 impl GitHubHost {
@@ -213,9 +223,45 @@ fn url_scheme(url: &str) -> Option<&str> {
 const MAX_PAGES: usize = 1000;
 
 impl RepoHost for GitHubHost {
-    fn list_repos(&self, include_forks: bool) -> Result<Vec<RepoRef>, GithubError> {
-        let url = format!("{}/user/repos?affiliation=owner&per_page=100&page=1", self.base_url);
-        let mut all: Vec<RepoRef> = self.get_paginated(url)?;
+    fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+        let url = format!("{}/user/orgs?per_page=100&page=1", self.base_url);
+        let orgs: Vec<ApiOrg> = self.get_paginated(url)?;
+        Ok(orgs.into_iter().map(|o| o.login).collect())
+    }
+
+    fn list_repos(&self, include_forks: bool, orgs: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+        let mut all: Vec<RepoRef> = if orgs.is_empty() {
+            // No org selection: include repos in ALL orgs the user belongs to, not just
+            // owned repos, so an org's infected repos are scanned too. `organization_member`
+            // covers "org repos I'm a part of"; `owner` keeps personal repos.
+            // Outside-collaborator repos are intentionally excluded (narrower).
+            let url = format!(
+                "{}/user/repos?affiliation=owner,organization_member&per_page=100&page=1",
+                self.base_url
+            );
+            self.get_paginated(url)?
+        } else {
+            // Org selection narrows only the org set: your personal repos are ALWAYS
+            // scanned (affiliation=owner), plus each named org's repos. Merge and dedup by
+            // `full_name` (an org repo you also own would otherwise appear twice).
+            let url =
+                format!("{}/user/repos?affiliation=owner&per_page=100&page=1", self.base_url);
+            let mut repos: Vec<RepoRef> = self.get_paginated(url)?;
+            for login in orgs {
+                let url = format!("{}/orgs/{login}/repos?per_page=100&page=1", self.base_url);
+                match self.get_paginated::<RepoRef>(url) {
+                    Ok(mut org_repos) => repos.append(&mut org_repos),
+                    // Rate limiting is fatal for the run; propagate to abort.
+                    Err(e @ GithubError::RateLimited(_)) => return Err(e),
+                    // Any other per-org failure fails fast WITH the org named — never
+                    // silently skip an org the user asked to scan.
+                    Err(e) => return Err(GithubError::Http(format!("org '{login}': {e}"))),
+                }
+            }
+            let mut seen = HashSet::new();
+            repos.retain(|r| seen.insert(r.full_name.clone()));
+            repos
+        };
         if !include_forks {
             all.retain(|r| !r.fork);
         }
@@ -285,11 +331,16 @@ mod tests {
         let server = MockServer::start();
         let next = format!("<{}/user/repos?page=2>; rel=\"next\"", server.base_url());
         server.mock(|when, then| {
-            when.method(GET).path("/user/repos").query_param("page", "1");
+            // Assert the first request asks for owned AND org-member repos, not owner-only.
+            when.method(GET)
+                .path("/user/repos")
+                .query_param("page", "1")
+                .query_param("affiliation", "owner,organization_member");
             then.status(200)
                 .header("Link", next.as_str())
                 .json_body(serde_json::json!([
                     {"full_name":"me/a","clone_url":"https://x/a.git","default_branch":"main","fork":false},
+                    {"full_name":"org/repo","clone_url":"https://x/o.git","default_branch":"main","fork":false},
                     {"full_name":"me/forked","clone_url":"https://x/f.git","default_branch":"main","fork":true}
                 ]));
         });
@@ -301,9 +352,74 @@ mod tests {
         });
 
         let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
-        let repos = host.list_repos(false).unwrap();
+        let repos = host.list_repos(false, &[]).unwrap();
         let names: Vec<&str> = repos.iter().map(|r| r.full_name.as_str()).collect();
-        assert_eq!(names, vec!["me/a", "me/b"]); // fork filtered out, both pages merged
+        // owned + org-member repos across both pages; the fork is filtered out.
+        assert_eq!(names, vec!["me/a", "org/repo", "me/b"]);
+    }
+
+    #[test]
+    fn list_orgs_parses_logins() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/user/orgs");
+            then.status(200).json_body(serde_json::json!([
+                {"login":"acme"},
+                {"login":"foo"}
+            ]));
+        });
+        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        assert_eq!(host.list_orgs().unwrap(), vec!["acme".to_string(), "foo".to_string()]);
+    }
+
+    #[test]
+    fn list_repos_with_orgs_fetches_owner_plus_each_org() {
+        let server = MockServer::start();
+        // Personal repos: affiliation=owner (NOT organization_member).
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/user/repos")
+                .query_param("affiliation", "owner");
+            then.status(200).json_body(serde_json::json!([
+                {"full_name":"me/a","clone_url":"https://x/a.git","default_branch":"main","fork":false},
+                {"full_name":"me/forked","clone_url":"https://x/f.git","default_branch":"main","fork":true}
+            ]));
+        });
+        // Selected org's repos.
+        server.mock(|when, then| {
+            when.method(GET).path("/orgs/acme/repos");
+            then.status(200).json_body(serde_json::json!([
+                {"full_name":"acme/x","clone_url":"https://x/x.git","default_branch":"main","fork":false}
+            ]));
+        });
+        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let repos = host.list_repos(false, &["acme".into()]).unwrap();
+        let names: Vec<&str> = repos.iter().map(|r| r.full_name.as_str()).collect();
+        // personal (owner) + the org's repos; the personal fork is filtered out.
+        assert_eq!(names, vec!["me/a", "acme/x"]);
+    }
+
+    #[test]
+    fn list_repos_with_bad_org_errors_named() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/user/repos")
+                .query_param("affiliation", "owner");
+            then.status(200).json_body(serde_json::json!([
+                {"full_name":"me/a","clone_url":"https://x/a.git","default_branch":"main","fork":false}
+            ]));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/orgs/bad/repos");
+            then.status(404).body("{}");
+        });
+        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let result = host.list_repos(false, &["bad".into()]);
+        match result {
+            Err(e) => assert!(e.to_string().contains("bad"), "error should name the org: {e}"),
+            Ok(_) => panic!("expected an error for the bad org"),
+        }
     }
 
     #[test]
@@ -326,7 +442,7 @@ mod tests {
         });
 
         let host = GitHubHost { token: "secret".into(), base_url: api.base_url() };
-        let result = host.list_repos(false);
+        let result = host.list_repos(false, &[]);
         assert!(result.is_err(), "expected an error, got {result:?}");
         attacker_mock.assert_hits(0); // token never sent to the foreign host
     }
@@ -349,7 +465,7 @@ mod tests {
             ]));
         });
         let host = GitHubHost { token: "secret".into(), base_url: api.base_url() };
-        let result = host.list_repos(false);
+        let result = host.list_repos(false, &[]);
         assert!(result.is_err(), "expected an error, got {result:?}");
     }
 

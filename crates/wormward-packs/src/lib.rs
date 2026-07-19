@@ -25,6 +25,33 @@ mod tests {
     }
 
     #[test]
+    fn polinrider_bracket_global_marker_round_trips_to_working_regex() {
+        // The generalized bracket-global marker is written as an escape-prone YAML regex.
+        // Verify the LOADED string matches the exact regex proven in the remediate tests,
+        // and that it actually matches bracket-notation (any key) while sparing dot-notation.
+        use wormward_core::remediate::strip_marker_matches;
+        let packs = builtin_packs();
+        let pol = packs.iter().find(|p| p.manifest.id == "polinrider").unwrap();
+        let markers = &pol
+            .manifest
+            .remediation
+            .as_ref()
+            .unwrap()
+            .config_payload
+            .as_ref()
+            .unwrap()
+            .markers;
+        // Loads verbatim as the regex the remediate crate is tested against.
+        assert!(markers.contains(&r"re:global\[('|\x22)[^'\x22]+('|\x22)\]\s*=".to_string()));
+        // Canonical literal markers are preserved (canonical payload must still fix+push).
+        assert!(markers.contains(&"global['!']=".to_string()));
+        // Bracket-global of an arbitrary key matches; dot-notation deliberately does not.
+        assert!(strip_marker_matches("global['xyz']=1;PAYLOAD", markers));
+        assert!(strip_marker_matches("global[\"foo\"] = 2;PAYLOAD", markers));
+        assert!(!strip_marker_matches("const a = global.foo;", markers));
+    }
+
+    #[test]
     fn detects_infected_fixture_repo() {
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("victim");

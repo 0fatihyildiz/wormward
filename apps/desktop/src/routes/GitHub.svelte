@@ -1,7 +1,8 @@
 <script lang="ts">
   import { app } from "../lib/state.svelte";
-  import { githubScan, githubFix } from "../lib/api";
-  import type { GithubRepoView, GithubFixView } from "../lib/types";
+  import { githubScan, githubFix, githubOrgs } from "../lib/api";
+  import { listen } from "@tauri-apps/api/event";
+  import type { GithubRepoView, GithubFixView, ScanProgress } from "../lib/types";
 
   let token = $state(localStorage.getItem("github_token") ?? "");
   let includeForks = $state(false);
@@ -9,14 +10,42 @@
   let fixing = $state(false);
   let confirming = $state(false);
   let scanned = $state(false);
+  let progress = $state<ScanProgress | null>(null);
 
   let repos = $state<GithubRepoView[]>([]);
   let sel = $state<Record<string, boolean>>({});
   let results = $state<GithubFixView[]>([]);
 
+  // Orgs the token owner belongs to, loaded for the org picker. `orgsError` records a
+  // discovery failure so the UI can note we're falling back to scanning every org.
+  let orgs = $state<string[]>([]);
+  let selectedOrgs = $state<Record<string, boolean>>({});
+  let loadingOrgs = $state(false);
+  let orgsError = $state(false);
+
   function saveToken() {
     if (token) localStorage.setItem("github_token", token);
     else localStorage.removeItem("github_token");
+  }
+
+  // Discover the orgs the token can see, defaulting every one to checked. On failure,
+  // leave `orgs` empty and flag the error — scanning still proceeds (all orgs).
+  async function loadOrgs() {
+    loadingOrgs = true;
+    orgsError = false;
+    try {
+      const found = await githubOrgs(token || undefined);
+      orgs = found;
+      const s: Record<string, boolean> = {};
+      for (const o of found) s[o] = true;
+      selectedOrgs = s;
+    } catch {
+      orgs = [];
+      selectedOrgs = {};
+      orgsError = true;
+    } finally {
+      loadingOrgs = false;
+    }
   }
 
   const selectedNames = $derived(
@@ -27,8 +56,18 @@
     scanning = true;
     app.error = "";
     results = [];
+    progress = null;
+    // Register BEFORE invoking so no early event is missed.
+    const unlisten = await listen<ScanProgress>("github-scan-progress", (e) => {
+      // Events arrive in completion order; never roll the counter backwards.
+      if (!progress || e.payload.done > progress.done) progress = e.payload;
+    });
     try {
-      repos = await githubScan(token || undefined, includeForks);
+      // If we discovered orgs, pass the checked subset; if discovery failed or found none,
+      // pass [] so the backend scans every org (today's behavior). Your own repos are
+      // always scanned regardless.
+      const chosen = orgs.filter((o) => selectedOrgs[o]);
+      repos = await githubScan(token || undefined, includeForks, chosen);
       const s: Record<string, boolean> = {};
       for (const r of repos) if (r.fixable) s[r.full_name] = true;
       sel = s;
@@ -36,7 +75,9 @@
     } catch (e) {
       app.error = String(e);
     } finally {
+      unlisten();
       scanning = false;
+      progress = null;
     }
   }
 
@@ -57,8 +98,9 @@
 <section class="card">
   <h2>GitHub account</h2>
   <p class="muted">
-    Scan the token owner's repositories: each is scanned read-only via the GitHub API, with
-    no clones. Fixing a repo <strong>force-pushes</strong> the cleaned history back to GitHub.
+    Scan repositories you own and repositories in your organizations: each is scanned
+    read-only via the GitHub API, with no clones. Fixing a repo
+    <strong>force-pushes</strong> the cleaned history back to GitHub.
   </p>
   <div class="row">
     <input
@@ -68,8 +110,24 @@
       oninput={saveToken}
       style="flex:1"
     />
+    <button onclick={loadOrgs} disabled={loadingOrgs || scanning || fixing}>
+      {loadingOrgs ? "Loading orgs…" : "Load orgs"}
+    </button>
   </div>
   <label><input type="checkbox" bind:checked={includeForks} /> Include forks</label>
+
+  {#if orgs.length}
+    <div class="orgs">
+      <p class="muted small">
+        Choose which organizations to scan. <strong>Your own repos are always scanned.</strong>
+      </p>
+      {#each orgs as o}
+        <label><input type="checkbox" bind:checked={selectedOrgs[o]} /> {o}</label>
+      {/each}
+    </div>
+  {:else if orgsError}
+    <p class="muted small">Couldn't list orgs — scanning all.</p>
+  {/if}
   <div class="row">
     <button class="primary" onclick={scan} disabled={scanning || fixing}>
       {scanning ? "Scanning account…" : "Scan account"}
@@ -85,7 +143,13 @@
 </section>
 
 {#if scanning}
-  <p class="muted">Scanning repositories via the GitHub API…</p>
+  <p class="muted">
+    {#if progress}
+      Scanning {progress.done} of {progress.total} — {progress.repo}
+    {:else}
+      Scanning repositories via the GitHub API…
+    {/if}
+  </p>
 {:else if scanned && repos.length === 0}
   <section class="card ok">
     <h2>No infected repositories</h2>
@@ -112,10 +176,12 @@
   <section class="card">
     <h3>Fix results</h3>
     {#each results as r}
-      <div class="small {r.error ? 'crit' : r.fixed ? 'ok-text' : 'muted'}">
+      <div class="small {r.error ? 'crit' : r.manual_review ? 'crit' : r.fixed ? 'ok-text' : 'muted'}">
         {r.full_name}:
         {#if r.error}
           error — {r.error}
+        {:else if r.manual_review}
+          detected — manual review needed (payload not auto-strippable)
         {:else if r.fixed}
           fixed{r.pushed.length ? ` — pushed ${r.pushed.join(", ")}` : ""}
         {:else}

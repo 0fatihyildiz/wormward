@@ -1,12 +1,14 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use serde::Serialize;
+use wormward_core::remediate::strip_marker_matches;
 use wormward_core::{
-    apply, commit_paths, deep_scan_repo, force_push_with_lease_to, now_secs, plan_remediation,
-    scan_repo, scan_tree, Finding, Pack, RemediationAction,
+    action_for, apply, commit_paths, deep_scan_repo, force_push_with_lease_to, now_secs,
+    plan_remediation, scan_repo, scan_tree, Finding, Pack, RemediationAction, RepoFiles,
 };
 
 use crate::api_tree::{ApiTree, BlobCache};
@@ -19,6 +21,9 @@ pub struct GithubRunOpts {
     pub fix: bool,
     pub push: bool,
     pub yes: bool,
+    /// Restrict org scanning to these orgs; empty scans every org you belong to. Your
+    /// personal repos are always scanned regardless.
+    pub orgs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +36,11 @@ pub struct RepoOutcome {
     /// Branches force-pushed back to origin.
     pub pushed: Vec<String>,
     pub error: Option<String>,
+    /// The repo is infected but was NOT auto-remediated: either no strip marker is present
+    /// (nothing to strip), or a strip left detectable payload and was reverted. Reported
+    /// honestly as "manual review needed" instead of a silent "no changes". A cleanly fixed
+    /// or a clean repo leaves this false.
+    pub manual_review: bool,
 }
 
 fn describe_action(a: &RemediationAction) -> String {
@@ -112,6 +122,12 @@ pub struct ScannedRepo {
     /// Scan failure, if any. An errored repo carries no findings and must never be
     /// treated as clean.
     pub error: Option<String>,
+    /// True when the default working tree has at least one remediation action `apply`
+    /// would actually perform — computed WITH the tip's file content, so a `StripPayload`
+    /// only counts when a strip marker is genuinely present in the flagged file. Detection
+    /// alone (`is_infected`) does NOT imply this: a repo flagged by a non-marker signature
+    /// (a bare C2 address, a dot-notation variant) is infected but not auto-strippable.
+    pub auto_fixable: bool,
 }
 
 impl ScannedRepo {
@@ -119,6 +135,24 @@ impl ScannedRepo {
     pub fn is_infected(&self) -> bool {
         self.error.is_none() && !self.findings.is_empty()
     }
+}
+
+/// Whether the default working-tree findings include at least one action `apply` would
+/// actually perform, given the file content available via `read`. A `StripPayload` only
+/// counts when a strip marker is genuinely present in the flagged file; `DeleteFile` and
+/// `RemoveGitignoreLine` always count — their target's presence was already detected. This
+/// mirrors what `fix_scanned` does at apply time, so `fixable` never over-promises a no-op.
+fn is_auto_fixable(findings: &[Finding], packs: &[Pack], read: impl Fn(&Path) -> Option<String>) -> bool {
+    findings
+        .iter()
+        .filter(|f| f.git_ref.is_none())
+        .any(|f| match action_for(f, packs) {
+            Some(RemediationAction::StripPayload { file, markers }) => {
+                read(&file).is_some_and(|c| strip_marker_matches(&c, &markers))
+            }
+            Some(_) => true,
+            None => false,
+        })
 }
 
 /// Result of phase one: every repo scanned via the API. No clones exist on disk.
@@ -150,14 +184,23 @@ impl ScanPass {
     /// A repo infected solely on a non-default branch has findings but no working-tree
     /// action (`plan_remediation` routes branch-tip findings, which carry a `git_ref`, to
     /// `manual`), so it is excluded here even though it remains in the scan results/output.
-    pub fn fixable_full_names(&self, packs: &[Pack]) -> Vec<String> {
+    pub fn fixable_full_names(&self, _packs: &[Pack]) -> Vec<String> {
         self.repos
             .iter()
-            .filter(|r| r.is_infected())
-            .filter(|r| !plan_remediation(&r.findings, packs).actions.is_empty())
+            .filter(|r| r.is_infected() && r.auto_fixable)
             .map(|r| r.repo.full_name.clone())
             .collect()
     }
+}
+
+/// A repo that just finished scanning. Events arrive in COMPLETION order, not
+/// input order (rayon) — consumers should render the latest done/total only.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanProgress {
+    pub done: usize,
+    pub total: usize,
+    /// `full_name` of the repo that just finished.
+    pub repo: String,
 }
 
 /// Clone all branches of `repo` into `dest`, authenticated via the token so private
@@ -166,7 +209,10 @@ impl ScanPass {
 fn clone_repo(repo: &RepoRef, dest: &Path, token: &str) -> Result<(), String> {
     let out = Command::new("git")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .args(["clone", "--no-single-branch", "-q"])
+        // --template= (empty): machine-level git templates would otherwise copy their
+        // hooks into OUR temp clone, and the local re-scan would flag those hooks as
+        // findings about the repo. Hooks are local artifacts, never repo content.
+        .args(["clone", "--no-single-branch", "--template=", "-q"])
         .arg(authed_url(&repo.clone_url, token))
         .arg(dest)
         .output();
@@ -184,7 +230,8 @@ fn clone_repo(repo: &RepoRef, dest: &Path, token: &str) -> Result<(), String> {
 /// (`truncated`, ~100k+ entries) — coverage must never silently degrade. The temp
 /// clone is deleted on return; a later fix re-clones like any other repo.
 fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRepo {
-    let mut out = ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None };
+    let mut out =
+        ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None, auto_fixable: false };
     let tmp = match tempfile::TempDir::new() {
         Ok(t) => t,
         Err(e) => {
@@ -199,6 +246,10 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
     }
     let mut findings = scan_repo(&dest, packs);
     findings.extend(deep_scan_repo(&dest, packs));
+    // Fixability from the cloned working tree, while `dest` still exists (tmp is dropped
+    // on return). Reads the flagged file's on-disk content, same as `fix_scanned` will.
+    out.auto_fixable =
+        is_auto_fixable(&findings, packs, |rel| std::fs::read_to_string(dest.join(rel)).ok());
     // Re-label onto the virtual repo path: the temp clone path would dangle.
     let label = PathBuf::from(&repo.full_name);
     for f in &mut findings {
@@ -223,7 +274,8 @@ fn api_scan_repo(
     cache: &BlobCache,
     token: &str,
 ) -> Result<ScannedRepo, GithubError> {
-    let mut out = ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None };
+    let mut out =
+        ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None, auto_fixable: false };
 
     let branches = match host.list_branches(&repo.full_name) {
         Ok(b) => b,
@@ -275,6 +327,11 @@ fn api_scan_repo(
             for f in &mut findings {
                 f.git_ref = Some(name.clone());
             }
+        } else {
+            // Default tip = the working tree we could remediate. Compute fixability with
+            // its actual file content (blobs are already cached from the scan above), so a
+            // StripPayload only counts when a marker is genuinely present.
+            out.auto_fixable = is_auto_fixable(&findings, packs, |rel| files.read(rel));
         }
         let mut errors = files.take_errors();
         if let Some(pos) = errors.iter().position(|e| matches!(e, GithubError::RateLimited(_))) {
@@ -301,13 +358,33 @@ pub fn scan_pass(
     packs: &[Pack],
     token: &str,
 ) -> Result<ScanPass, GithubError> {
-    let repos = host.list_repos(opts.include_forks)?;
+    scan_pass_with_progress(opts, host, packs, token, &|_| {})
+}
+
+/// `scan_pass` with a progress callback, invoked once per repo as it finishes
+/// (success or per-repo error alike — the repo is done either way). The callback
+/// is infallible by design: progress must never be able to fail a scan.
+pub fn scan_pass_with_progress(
+    opts: &GithubRunOpts,
+    host: &dyn RepoHost,
+    packs: &[Pack],
+    token: &str,
+    on_progress: &(dyn Fn(ScanProgress) + Sync),
+) -> Result<ScanPass, GithubError> {
+    let repos = host.list_repos(opts.include_forks, &opts.orgs)?;
+    let total = repos.len();
     let cache = BlobCache::new();
+    let done_counter = AtomicUsize::new(0);
     // `collect::<Result<Vec<_>, _>>()` lets rayon short-circuit cooperatively on the
     // first Err (a rate limit) instead of scanning every repo before propagating it.
     let scanned = repos
         .par_iter()
-        .map(|repo| api_scan_repo(repo, host, packs, &cache, token))
+        .map(|repo| {
+            let result = api_scan_repo(repo, host, packs, &cache, token);
+            let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            on_progress(ScanProgress { done, total, repo: repo.full_name.clone() });
+            result
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ScanPass { repos: scanned })
 }
@@ -331,15 +408,18 @@ fn fix_scanned(
         actions: Vec::new(),
         pushed: Vec::new(),
         error: sr.error.clone(),
+        manual_review: false,
     };
 
     if !do_fix || sr.error.is_some() || sr.findings.is_empty() {
         return outcome;
     }
 
-    // Branch-only infections have no working-tree action; nothing to do here.
+    // Branch-only infections have no working-tree action; nothing to do here. An infected
+    // repo with no applicable action is reported as manual review, not a silent no-op.
     let preview = plan_remediation(&sr.findings, packs);
     if preview.actions.is_empty() {
+        outcome.manual_review = true;
         return outcome;
     }
 
@@ -362,13 +442,39 @@ fn fix_scanned(
     let local = scan_repo(&dest, packs);
     let plan = plan_remediation(&local, packs);
     if plan.actions.is_empty() {
-        return outcome; // repo changed since the scan; nothing fixable remains
+        // Repo changed since the scan, or its findings have no auto-action: infected but
+        // not auto-strippable -> manual review, never a silent "no changes".
+        outcome.manual_review = !local.is_empty();
+        return outcome;
     }
 
     // Apply to the working tree (backups land in <repo>/.wormward-backup/<ts>/).
     let res = apply(&dest, &plan.actions, true);
     outcome.actions = res.applied.iter().map(describe_action).collect();
     if res.applied.is_empty() {
+        // A planned action that stripped nothing (no marker) is not a fix.
+        outcome.manual_review = true;
+        return outcome;
+    }
+
+    // SECURITY: verify the strip actually removed the payload before committing anything.
+    // `strip_after_marker` cuts from the marker onward, but a signature (e.g. a C2 address)
+    // sitting BEFORE the marker survives — committing/pushing that would flag a still-infected
+    // file as "fixed". Re-scan the working tree; if any auto-strip finding remains on the
+    // default tree, revert everything (restoring the committed file) and report manual review.
+    // `.wormward-backup` holds the pristine original but the walker skips it, so it cannot
+    // cause a false residual. This is the critical safety property of the whole pipeline.
+    // After a strip, the working tree must be clean of ALL default-branch findings — not
+    // just strippable ones. A surviving IocDomain/NpmPackage/Capability indicator (e.g. a C2
+    // domain above the strip marker, or a malicious package.json) means the file is still
+    // infected; revert and report manual rather than commit/push a still-flagged file.
+    let residual = scan_repo(&dest, packs).iter().any(|f| f.git_ref.is_none());
+    if residual {
+        // Restore the working tree to the committed (infected) file; do NOT commit or push.
+        let _ = git(&dest, &["checkout", "--", "."]);
+        outcome.actions.clear();
+        outcome.error = None;
+        outcome.manual_review = true;
         return outcome;
     }
 
@@ -485,6 +591,7 @@ mod tests {
             .arg("-C")
             .arg(dir)
             .args(args)
+            .env("GIT_TEMPLATE_DIR", "")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@e.x")
             .env("GIT_COMMITTER_NAME", "t")
@@ -524,8 +631,24 @@ mod tests {
     }
 
     impl RepoHost for GitFakeHost {
-        fn list_repos(&self, include_forks: bool) -> Result<Vec<RepoRef>, GithubError> {
-            Ok(self.repos.iter().filter(|r| include_forks || !r.fork).cloned().collect())
+        fn list_repos(&self, include_forks: bool, orgs: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            Ok(self
+                .repos
+                .iter()
+                .filter(|r| include_forks || !r.fork)
+                // Empty orgs: return everything (current behavior). Otherwise keep only repos
+                // whose owner segment is in `orgs` — only exercised by tests that pass orgs.
+                .filter(|r| {
+                    orgs.is_empty()
+                        || r.full_name
+                            .split_once('/')
+                            .is_some_and(|(owner, _)| orgs.iter().any(|o| o == owner))
+                })
+                .cloned()
+                .collect())
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+            Ok(vec![])
         }
         fn list_branches(&self, full_name: &str) -> Result<Vec<Branch>, GithubError> {
             let out = self.git(
@@ -581,6 +704,34 @@ mod tests {
         let bare = tmp.path().join(format!("{name}.git"));
         Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+        bare
+    }
+
+    /// Build an infected bare origin whose default-branch config is flagged by a
+    /// NON-marker signature (a bare C2 address, no `global[...]=`). It is detected as
+    /// infected, but `apply` would strip nothing — so it must NOT be offered as fixable.
+    fn make_nonstrippable_infected_origin(tmp: &TempDir, name: &str) -> PathBuf {
+        let src = tmp.path().join(format!("{name}-src"));
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        // Flagged by the c2-tron-primary literal, but NO strip marker present.
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nfetch('TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP')\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "c2-only"]);
+        let bare = tmp.path().join(format!("{name}.git"));
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
             .arg(&bare)
             .status()
             .unwrap();
@@ -612,6 +763,7 @@ mod tests {
         let bare = tmp.path().join(format!("{name}.git"));
         Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
             .arg(&bare)
             .status()
             .unwrap();
@@ -642,6 +794,7 @@ mod tests {
         // unborn default branch and lands an empty working tree.
         Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
             .arg(&bare)
             .status()
             .unwrap();
@@ -669,6 +822,7 @@ mod tests {
             fix: true,
             push: false,
             yes: true,
+            orgs: vec![],
         };
 
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
@@ -678,6 +832,11 @@ mod tests {
         assert!(!outcomes[0].actions.is_empty());
         // The fix cloned on demand into clone_dir.
         assert!(tmp.path().join("work").join("me__proj").exists());
+        // --template= keeps machine git templates from injecting hooks into our clone.
+        assert!(
+            !tmp.path().join("work").join("me__proj").join(".git/hooks/pre-commit").exists(),
+            "template hooks must not be copied into wormward's own clones"
+        );
     }
 
     #[test]
@@ -699,6 +858,7 @@ mod tests {
             fix: true,
             push: false,
             yes: false,
+            orgs: vec![],
         };
 
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
@@ -734,6 +894,7 @@ mod tests {
             fix: true,
             push: true,
             yes: true,
+            orgs: vec![],
         };
 
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
@@ -791,6 +952,7 @@ mod tests {
             fix: true,
             push: false,
             yes: true,
+            orgs: vec![],
         };
 
         let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
@@ -813,8 +975,8 @@ mod tests {
     fn api_scan_flags_capability_only_infection() {
         // A repo whose only malware is an obfuscated auto-run config with NO pack content
         // signature must still be flagged over the API: api_scan_repo must run the capability
-        // engine (scan_capabilities), not only scan_files. Otherwise clone-free scanning is a
-        // second-class scanner that misses every capability-class payload.
+        // engine (scan_capabilities via scan_tree), not only scan_files. Otherwise clone-free
+        // scanning is a second-class scanner that misses every capability-class payload.
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("cap-src");
         std::fs::create_dir_all(&src).unwrap();
@@ -831,6 +993,7 @@ mod tests {
         let bare = tmp.path().join("caponly.git");
         Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
             .arg(&bare)
             .status()
             .unwrap();
@@ -851,6 +1014,242 @@ mod tests {
         assert!(
             sr.findings.iter().any(|f| f.kind == wormward_core::FindingKind::Capability),
             "capability-only infection must be detected over the API scan"
+        );
+    }
+
+    #[test]
+    fn nonstrippable_infection_is_not_offered_as_fixable() {
+        let tmp = TempDir::new().unwrap();
+        let bare = make_nonstrippable_infected_origin(&tmp, "c2only");
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/c2only".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let scan = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "").unwrap();
+        assert!(
+            scan.infected_full_names().contains(&"me/c2only".to_string()),
+            "still detected as infected"
+        );
+        assert!(
+            !scan.fixable_full_names(&builtin_packs()).contains(&"me/c2only".to_string()),
+            "must NOT be offered as auto-fixable: no strip marker in the file"
+        );
+    }
+
+    #[test]
+    fn incomplete_strip_reverts_and_reports_manual_not_pushed() {
+        // A file with a strip marker BUT residual worm content BEFORE the marker, so
+        // stripping at the marker leaves a signature match. The fix must NOT push;
+        // it must revert and report the repo as not-fixed (manual).
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("m-src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        // c2 address (signature) appears BEFORE the strip marker; cutting at the marker
+        // leaves the c2 line -> still infected after strip.
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nvar c='TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP';\nglobal['!']='x';TAIL\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "mixed"]);
+        let bare = tmp.path().join("m.git");
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/m".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: Some(tmp.path().join("work")),
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: true,
+            orgs: vec![],
+        };
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
+        let o = &outcomes[0];
+        assert!(o.pushed.is_empty(), "must not push a still-infected file");
+        assert!(
+            !(o.error.is_none() && !o.actions.is_empty()),
+            "must not report as cleanly fixed"
+        );
+        assert!(o.manual_review, "must flag the repo for manual review");
+        // The bare origin's main tip still has the original (reverted, not half-stripped).
+        let show = Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["show", "main:postcss.config.mjs"])
+            .output()
+            .unwrap();
+        // Check text that ONLY survives a full revert: `global['!']=` and the `TAIL`
+        // after it are both removed by a strip, so their presence proves the tree was
+        // reverted rather than half-stripped-and-pushed (the C2 line above the marker
+        // would survive either way, so asserting on it would not distinguish the two).
+        let origin = String::from_utf8_lossy(&show.stdout);
+        assert!(
+            origin.contains("global['!']") && origin.contains("TAIL"),
+            "origin must be the original file (reverted), not a half-stripped push"
+        );
+    }
+
+    #[test]
+    fn ioc_domain_above_marker_is_not_pushed() {
+        // A config file that IS offered fixable (strippable ContentSignature below a
+        // `global['!']=` marker) but carries an IocDomain C2 reference ABOVE the marker.
+        // Stripping at the marker removes the signature but leaves the domain -> the file
+        // is still infected. `action_for` returns None for IocDomain, so a residual gate
+        // that only re-checks strippable findings would wrongly push it. Must revert+manual.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("d-src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        // Domain (non-strippable IOC) above the marker survives the cut; the strippable
+        // signature sits after the marker so the strip has real work to do (fixable).
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nvar d='260120.vercel.app';\nglobal['!']='x';(\"rmcej%otb%\",2857687)\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "domain-above-marker"]);
+        let bare = tmp.path().join("d.git");
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/d".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: Some(tmp.path().join("work")),
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: true,
+            orgs: vec![],
+        };
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
+        let o = &outcomes[0];
+        assert!(o.pushed.is_empty(), "must not push a file with a surviving C2 domain");
+        assert!(
+            !(o.error.is_none() && !o.actions.is_empty()),
+            "must not report as cleanly fixed"
+        );
+        assert!(o.manual_review, "must flag the repo for manual review");
+        // A real revert restores the WHOLE file, including the marker and the signature
+        // after it (both removed by a strip) as well as the domain -> proves no push.
+        let show = Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["show", "main:postcss.config.mjs"])
+            .output()
+            .unwrap();
+        let origin = String::from_utf8_lossy(&show.stdout);
+        assert!(
+            origin.contains("260120.vercel.app") && origin.contains("global['!']"),
+            "origin must be the original file (reverted), not a stripped push"
+        );
+    }
+
+    #[test]
+    fn malicious_package_json_alongside_strippable_config_is_not_pushed() {
+        // A fully strippable config (canonical `global['!']=` + `rmcej%otb%` signature that a
+        // strip cleanly removes) sits next to a package.json carrying a malicious npm
+        // dependency. The config strip succeeds, but the NpmPackage finding survives ->
+        // the repo is still infected. `action_for` returns None for NpmPackage, so the
+        // narrow gate would push a repo that still ships a malicious package.json.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("p-src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='x';(\"rmcej%otb%\",2857687)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            "{\"name\":\"x\",\"dependencies\":{\"tailwindcss-style-animate\":\"1.0.0\"}}\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "config+bad-pkg"]);
+        let bare = tmp.path().join("p.git");
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/p".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: Some(tmp.path().join("work")),
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: true,
+            orgs: vec![],
+        };
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
+        let o = &outcomes[0];
+        assert!(
+            o.pushed.is_empty(),
+            "must not push while a malicious package.json survives the strip"
+        );
+        assert!(
+            !(o.error.is_none() && !o.actions.is_empty()),
+            "must not report as cleanly fixed"
+        );
+        assert!(o.manual_review, "must flag the repo for manual review");
+        // Revert restores the working tree; the bad dependency remains in origin untouched.
+        let show = Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["show", "main:package.json"])
+            .output()
+            .unwrap();
+        let origin = String::from_utf8_lossy(&show.stdout);
+        assert!(
+            origin.contains("tailwindcss-style-animate"),
+            "origin package.json must still carry the malicious dependency (not modified)"
         );
     }
 
@@ -918,6 +1317,7 @@ mod tests {
             fix: true,
             push: false,
             yes: true,
+            orgs: vec![],
         };
 
         let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
@@ -963,6 +1363,7 @@ mod tests {
         let bare = tmp.path().join("clean.git");
         Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
             .arg(&bare)
             .status()
             .unwrap();
@@ -984,6 +1385,7 @@ mod tests {
             fix: true,
             push: false,
             yes: true,
+            orgs: vec![],
         };
         let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
         assert!(outcomes[0].findings.is_empty());
@@ -998,8 +1400,11 @@ mod tests {
     /// clone-and-scan fallback.
     struct TruncatedHost(GitFakeHost);
     impl RepoHost for TruncatedHost {
-        fn list_repos(&self, f: bool) -> Result<Vec<RepoRef>, GithubError> {
-            self.0.list_repos(f)
+        fn list_repos(&self, f: bool, orgs: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            self.0.list_repos(f, orgs)
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+            self.0.list_orgs()
         }
         fn list_branches(&self, n: &str) -> Result<Vec<Branch>, GithubError> {
             self.0.list_branches(n)
@@ -1015,8 +1420,11 @@ mod tests {
     /// Wraps GitFakeHost but fails every blob fetch.
     struct BrokenBlobHost(GitFakeHost);
     impl RepoHost for BrokenBlobHost {
-        fn list_repos(&self, f: bool) -> Result<Vec<RepoRef>, GithubError> {
-            self.0.list_repos(f)
+        fn list_repos(&self, f: bool, orgs: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            self.0.list_repos(f, orgs)
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+            self.0.list_orgs()
         }
         fn list_branches(&self, n: &str) -> Result<Vec<Branch>, GithubError> {
             self.0.list_branches(n)
@@ -1032,8 +1440,11 @@ mod tests {
     /// Rate-limited from the very first per-repo call.
     struct RateLimitedHost(GitFakeHost);
     impl RepoHost for RateLimitedHost {
-        fn list_repos(&self, f: bool) -> Result<Vec<RepoRef>, GithubError> {
-            self.0.list_repos(f)
+        fn list_repos(&self, f: bool, orgs: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            self.0.list_repos(f, orgs)
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+            self.0.list_orgs()
         }
         fn list_branches(&self, _: &str) -> Result<Vec<Branch>, GithubError> {
             Err(GithubError::RateLimited("HTTP 429".into()))
@@ -1065,6 +1476,7 @@ mod tests {
             fix: false,
             push: false,
             yes: false,
+            orgs: vec![],
         }
     }
 
@@ -1097,5 +1509,44 @@ mod tests {
         let host = RateLimitedHost(one_repo_host(&tmp, "limited"));
         let result = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "");
         assert!(matches!(result, Err(GithubError::RateLimited(_))), "got {result:?}");
+    }
+
+    #[test]
+    fn scan_progress_reports_each_repo_once() {
+        use std::sync::Mutex;
+        let tmp = TempDir::new().unwrap();
+        let mut repos = Vec::new();
+        for name in ["a", "b", "c"] {
+            let bare = make_infected_origin_named(&tmp, name);
+            repos.push(RepoRef {
+                full_name: format!("me/{name}"),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            });
+        }
+        let host = GitFakeHost { repos };
+        let events: Mutex<Vec<ScanProgress>> = Mutex::new(Vec::new());
+
+        let scan = scan_pass_with_progress(
+            &scan_only_opts(),
+            &host,
+            &builtin_packs(),
+            "",
+            &|p| events.lock().unwrap().push(p),
+        )
+        .unwrap();
+
+        assert_eq!(scan.repos().len(), 3);
+        let ev = events.into_inner().unwrap();
+        assert_eq!(ev.len(), 3, "exactly one event per repo");
+        assert!(ev.iter().all(|p| p.total == 3));
+        // Completion order is nondeterministic; done values must be 1..=3 in some order.
+        let mut dones: Vec<usize> = ev.iter().map(|p| p.done).collect();
+        dones.sort();
+        assert_eq!(dones, vec![1, 2, 3]);
+        let mut names: Vec<&str> = ev.iter().map(|p| p.repo.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["me/a", "me/b", "me/c"]);
     }
 }

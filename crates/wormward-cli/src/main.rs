@@ -89,7 +89,7 @@ enum Command {
         #[arg(default_value = ".")]
         dirs: Vec<PathBuf>,
     },
-    /// Scan (and optionally remediate) every repo on the logged-in GitHub account.
+    /// Scan (and optionally remediate) every repo you own or belong to via an organization.
     Github {
         /// GitHub token (else GITHUB_TOKEN/GH_TOKEN, else `gh auth token`).
         #[arg(long)]
@@ -112,6 +112,10 @@ enum Command {
         /// Fix every infected repo without the interactive selection prompt.
         #[arg(long)]
         all: bool,
+        /// Restrict org scanning to these orgs (repeatable). Your own repos are always scanned.
+        /// Omit to scan every org you belong to.
+        #[arg(long = "org")]
+        org: Vec<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -555,7 +559,7 @@ fn main() -> ExitCode {
             }
             ExitCode::from(0)
         }
-        Command::Github { token, clone_dir, include_forks, fix, push, yes, all, format } => {
+        Command::Github { token, clone_dir, include_forks, fix, push, yes, all, org, format } => {
             // --push and --fix are destructive; require explicit --yes to write.
             if push && !yes {
                 eprintln!("refusing to force-push without --yes (destructive). Re-run with --yes to confirm.");
@@ -579,6 +583,7 @@ fn main() -> ExitCode {
                 fix: fix || push,
                 push,
                 yes,
+                orgs: org,
             };
 
             // A fix only persists if it has somewhere to land: a push target OR an explicit
@@ -594,9 +599,29 @@ fn main() -> ExitCode {
                 opts.yes = false;
             }
             let packs = builtin_packs();
+            // Progress only when a human is watching: text mode with stderr on a TTY.
+            // JSON mode, pipes and CI logs stay byte-identical.
+            let show_progress = matches!(format, OutputFormat::Text)
+                && std::io::IsTerminal::is_terminal(&std::io::stderr());
             // Phase 1: enumerate → API-scan every branch tip (no clones), to learn
             // which repos are infected.
-            let scan = match wormward_github::pipeline::scan_pass(&opts, &host, &packs, &token) {
+            let scan_result = wormward_github::pipeline::scan_pass_with_progress(
+                &opts,
+                &host,
+                &packs,
+                &token,
+                &|p: wormward_github::pipeline::ScanProgress| {
+                    if show_progress {
+                        // \r + width-clamped pad so a shorter repo name leaves no
+                        // residue from the previous, longer line.
+                        eprint!("\r  scanning {}/{} {:<60.60}", p.done, p.total, p.repo);
+                    }
+                },
+            );
+            if show_progress {
+                eprintln!(); // finish the progress line before any other output
+            }
+            let scan = match scan_result {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -689,6 +714,7 @@ mod tests {
             actions: vec![],
             pushed: vec![],
             error,
+            manual_review: false,
         }
     }
 

@@ -115,7 +115,10 @@ mod tests {
         }
     }
     impl RepoHost for MapHost {
-        fn list_repos(&self, _: bool) -> Result<Vec<RepoRef>, GithubError> {
+        fn list_repos(&self, _: bool, _: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            unimplemented!()
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
             unimplemented!()
         }
         fn list_branches(&self, _: &str) -> Result<Vec<Branch>, GithubError> {
