@@ -43,6 +43,7 @@ impl CampaignAnalyzer for PolinriderAnalyzer {
                 evidence: format!("confirmed obfuscation: {reason}"),
                 remediable: true,
                 online: None,
+                git_ref: None,
             }],
             None => vec![],
         }

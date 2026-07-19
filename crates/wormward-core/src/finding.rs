@@ -44,6 +44,8 @@ pub struct Finding {
     pub remediable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub online: Option<OnlineVerdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
 }
 
 #[cfg(test)]
@@ -73,6 +75,7 @@ mod tests {
             evidence: "e".into(),
             remediable: false,
             online,
+            git_ref: None,
         }
     }
 
@@ -93,5 +96,19 @@ mod tests {
         }));
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(v["online"]["malicious"], true);
+    }
+
+    #[test]
+    fn git_ref_omitted_when_none() {
+        let json = serde_json::to_string(&sample_finding(None)).unwrap();
+        assert!(!json.contains("git_ref"));
+    }
+
+    #[test]
+    fn git_ref_present_when_set() {
+        let mut f = sample_finding(None);
+        f.git_ref = Some("origin/evil".into());
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(v["git_ref"], "origin/evil");
     }
 }

@@ -94,6 +94,7 @@ mod tests {
             evidence: "e".into(),
             remediable: false,
             online: None,
+            git_ref: None,
         }
     }
 
@@ -143,6 +144,7 @@ mod tests {
             evidence: "e".into(),
             remediable: false,
             online: None,
+            git_ref: None,
         }
     }
 

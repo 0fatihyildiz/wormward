@@ -46,6 +46,7 @@ fn check_artifacts(repo: &Path, pack: &Pack) -> Vec<Finding> {
                 evidence: format!("{} present ({})", artifact.path, artifact.label),
                 remediable: true,
                 online: None,
+                git_ref: None,
             });
         }
     }
@@ -74,6 +75,7 @@ fn check_gitignore(repo: &Path, pack: &Pack) -> Vec<Finding> {
                 evidence: format!("'{injected}' injected into .gitignore"),
                 remediable: true,
                 online: None,
+                git_ref: None,
             });
         }
     }
@@ -103,6 +105,7 @@ fn check_npm(repo: &Path, pack: &Pack) -> Vec<Finding> {
                 evidence: format!("malicious dependency '{bad}' in package.json"),
                 remediable: false,
                 online: None,
+                git_ref: None,
             });
         }
     }
@@ -136,6 +139,7 @@ pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
                         evidence: format!("content signature '{}' matched", sig.id),
                         remediable: true,
                         online: None,
+                        git_ref: None,
                     });
                 }
             }
@@ -153,6 +157,7 @@ pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
                         evidence: format!("C2 indicator domain '{domain}' referenced"),
                         remediable: false,
                         online: None,
+                        git_ref: None,
                     });
                 }
             }
@@ -183,6 +188,7 @@ pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
             evidence: "amended commits found in reflog (consistent with worm propagation)".into(),
             remediable: false,
             online: None,
+            git_ref: None,
         });
     }
     findings
@@ -305,6 +311,7 @@ mod tests {
                         evidence: "stub".into(),
                         remediable: true,
                         online: None,
+                        git_ref: None,
                     }]
                 } else {
                     vec![]

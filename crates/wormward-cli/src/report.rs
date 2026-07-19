@@ -74,6 +74,7 @@ mod tests {
                 evidence: "content signature 'primary' matched".into(),
                 remediable: true,
                 online: None,
+                git_ref: None,
             }],
         }
     }
