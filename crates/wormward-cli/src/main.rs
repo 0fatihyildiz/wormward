@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use wormward_core::{scan, scan_deep};
+use wormward_core::{apply, discover_repos, plan_remediation, restore, scan, scan_deep, scan_repo};
 use wormward_osm::OsmClient;
 use wormward_packs::builtin_packs;
 
@@ -51,6 +51,22 @@ enum Command {
         osm_token: Option<String>,
         identifier: String,
     },
+    /// Remove detected infections from the working tree (dry-run unless --apply).
+    Clean {
+        #[arg(default_value = ".")]
+        dirs: Vec<PathBuf>,
+        /// Apply changes (default is a dry-run that only prints the plan).
+        #[arg(long)]
+        apply: bool,
+        /// Disable the automatic backup taken before changes.
+        #[arg(long)]
+        no_backup: bool,
+    },
+    /// Restore files from the latest wormward backup.
+    Restore {
+        #[arg(default_value = ".")]
+        dirs: Vec<PathBuf>,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -62,6 +78,15 @@ enum OutputFormat {
 fn osm_base_url() -> String {
     std::env::var("OSM_BASE_URL")
         .unwrap_or_else(|_| "https://api.opensourcemalware.com/functions/v1".to_string())
+}
+
+fn describe_action(a: &wormward_core::RemediationAction) -> String {
+    use wormward_core::RemediationAction::*;
+    match a {
+        StripPayload { file, .. } => format!("strip payload from {}", file.display()),
+        DeleteFile { file } => format!("delete {}", file.display()),
+        RemoveGitignoreLine { file, line } => format!("remove '{line}' from {}", file.display()),
+    }
 }
 
 fn main() -> ExitCode {
@@ -148,6 +173,79 @@ fn main() -> ExitCode {
                     ExitCode::from(2)
                 }
             }
+        }
+        Command::Clean { dirs, apply: do_apply, no_backup } => {
+            for dir in &dirs {
+                if !dir.exists() {
+                    eprintln!("error: path does not exist: {}", dir.display());
+                    return ExitCode::from(2);
+                }
+            }
+            let packs = builtin_packs();
+            let mut total_actions = 0usize;
+            let mut total_failed = 0usize;
+            for dir in &dirs {
+                for repo in discover_repos(dir) {
+                    let findings = scan_repo(&repo, &packs);
+                    let plan = plan_remediation(&findings, &packs);
+                    if plan.actions.is_empty() && plan.manual.is_empty() {
+                        continue;
+                    }
+                    println!("{}", repo.display());
+                    for a in &plan.actions {
+                        println!("  would {}", describe_action(a));
+                    }
+                    for m in &plan.manual {
+                        let file = m
+                            .file
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
+                        let branch = m
+                            .git_ref
+                            .as_deref()
+                            .map(|r| format!(" (branch: {r})"))
+                            .unwrap_or_default();
+                        println!("  manual: {} {}{} — {}", m.campaign, file, branch, m.evidence);
+                    }
+                    total_actions += plan.actions.len();
+                    if do_apply {
+                        let res = apply(&repo, &plan.actions, !no_backup);
+                        for (a, e) in &res.skipped {
+                            eprintln!("  skipped {}: {}", describe_action(a), e);
+                        }
+                        total_failed += res.skipped.len();
+                        if let Some(bd) = res.backup_dir {
+                            println!("  backup: {}", bd.display());
+                        }
+                    }
+                }
+            }
+            if !do_apply && total_actions > 0 {
+                println!("\nDry run — re-run with --apply to make these changes.");
+                return ExitCode::from(1);
+            }
+            if total_failed > 0 {
+                ExitCode::from(1)
+            } else {
+                ExitCode::from(0)
+            }
+        }
+        Command::Restore { dirs } => {
+            for dir in &dirs {
+                for repo in discover_repos(dir) {
+                    let r = restore(&repo);
+                    if let Some(bd) = r.backup_dir {
+                        println!(
+                            "{}: restored {} file(s) from {}",
+                            repo.display(),
+                            r.restored.len(),
+                            bd.display()
+                        );
+                    }
+                }
+            }
+            ExitCode::from(0)
         }
     }
 }

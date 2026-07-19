@@ -178,3 +178,33 @@ fn scan_deep_flags_payload_on_other_branch() {
     assert_eq!(deep.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&deep.stdout).contains("branch: evil"));
 }
+
+#[test]
+fn clean_dry_run_reports_without_changing() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("v");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::write(repo.join("temp_auto_push.bat"), "@echo off").unwrap();
+
+    let out = bin().arg("clean").arg(tmp.path()).output().unwrap();
+    assert_eq!(out.status.code(), Some(1)); // dry-run with actions
+    assert!(String::from_utf8_lossy(&out.stdout).contains("would delete"));
+    assert!(repo.join("temp_auto_push.bat").exists()); // untouched
+}
+
+#[test]
+fn clean_apply_deletes_and_backs_up_then_restore() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("v");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::write(repo.join("temp_auto_push.bat"), "@echo off").unwrap();
+
+    let out = bin().arg("clean").arg("--apply").arg(tmp.path()).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!repo.join("temp_auto_push.bat").exists());
+    assert!(repo.join(".wormward-backup").exists());
+
+    let out2 = bin().arg("restore").arg(tmp.path()).output().unwrap();
+    assert_eq!(out2.status.code(), Some(0));
+    assert!(repo.join("temp_auto_push.bat").exists());
+}
