@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::finding::{Finding, FindingKind};
 use crate::pack::Pack;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum RemediationAction {
     StripPayload { file: PathBuf, markers: Vec<String> },
     DeleteFile { file: PathBuf },
