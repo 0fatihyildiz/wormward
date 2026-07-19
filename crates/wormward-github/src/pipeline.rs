@@ -49,6 +49,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<(), String> {
         .arg("-C")
         .arg(dir)
         .args(args)
+        // Fail fast instead of blocking a rayon worker on an interactive auth prompt.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| format!("spawn git: {e}"))?;
     if out.status.success() {
@@ -58,11 +60,52 @@ fn git(dir: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Inject the token into an https GitHub clone URL so private repos clone/push. The
+/// resulting `origin` carries auth for later backup/force-push too. Non-https URLs
+/// (e.g. local paths used in tests) and empty tokens are returned unchanged.
+fn authed_url(clone_url: &str, token: &str) -> String {
+    match clone_url.strip_prefix("https://") {
+        Some(rest) if !token.is_empty() => format!("https://x-access-token:{token}@{rest}"),
+        _ => clone_url.to_string(),
+    }
+}
+
+/// Redact the token from any captured git output before it lands in an error string
+/// (git can echo the credentialed remote URL on failure). Never log the raw token.
+fn redact(msg: String, token: &str) -> String {
+    if token.is_empty() {
+        msg
+    } else {
+        msg.replace(token, "x-access-token:***")
+    }
+}
+
+/// True when there are staged changes to commit. Used to avoid a "nothing to commit"
+/// failure when an applied remediation left the file byte-identical.
+fn has_staged_changes(dir: &Path) -> bool {
+    // `git diff --cached --quiet` exits 0 when nothing is staged, 1 when staged changes
+    // exist. Treat a spawn failure as "no changes" so we skip the commit rather than error.
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["diff", "--cached", "--quiet"])
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(false)
+}
+
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn process_repo(repo: &RepoRef, opts: &GithubRunOpts, packs: &[Pack], base: &Path) -> RepoOutcome {
+fn process_repo(
+    repo: &RepoRef,
+    opts: &GithubRunOpts,
+    packs: &[Pack],
+    base: &Path,
+    token: &str,
+) -> RepoOutcome {
     let mut outcome = RepoOutcome {
         repo: repo.clone(),
         findings: Vec::new(),
@@ -72,21 +115,27 @@ fn process_repo(repo: &RepoRef, opts: &GithubRunOpts, packs: &[Pack], base: &Pat
     };
     let dest = base.join(repo.full_name.replace('/', "__"));
 
-    // Clone all branches so the deep scan can inspect every branch tip.
+    // Clone all branches so the deep scan can inspect every branch tip. Authenticate via
+    // the token so private repos clone (and the resulting origin can be pushed to), and
+    // disable the terminal prompt so an auth failure fails fast rather than hanging a
+    // rayon worker on an interactive prompt.
     let clone = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .args(["clone", "--no-single-branch", "-q"])
-        .arg(&repo.clone_url)
+        .arg(authed_url(&repo.clone_url, token))
         .arg(&dest)
         .output();
     match clone {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
-            outcome.error =
-                Some(format!("clone: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            outcome.error = Some(redact(
+                format!("clone: {}", String::from_utf8_lossy(&out.stderr).trim()),
+                token,
+            ));
             return outcome;
         }
         Err(e) => {
-            outcome.error = Some(format!("clone: {e}"));
+            outcome.error = Some(redact(format!("clone: {e}"), token));
             return outcome;
         }
     }
@@ -125,10 +174,22 @@ fn process_repo(repo: &RepoRef, opts: &GithubRunOpts, packs: &[Pack], base: &Pat
         c.dedup();
         c.join(", ")
     };
-    if let Err(e) =
-        commit_paths(&dest, &format!("wormward: remediate {campaigns}"), &paths)
-    {
-        outcome.error = Some(format!("commit: {e}"));
+    // Stage the applied paths first, then only commit if something is actually staged.
+    // A remediation that leaves a file byte-identical stages nothing, and `git commit`
+    // would fail with "nothing to commit" — treat that as a no-op success, not an error.
+    for p in &paths {
+        let s = p.to_string_lossy();
+        let _ = git(&dest, &["add", "-A", "--", s.as_ref()]);
+    }
+    if has_staged_changes(&dest) {
+        if let Err(e) =
+            commit_paths(&dest, &format!("wormward: remediate {campaigns}"), &paths)
+        {
+            outcome.error = Some(redact(format!("commit: {e}"), token));
+            return outcome;
+        }
+    } else {
+        // Nothing changed on disk; skip the commit (and the push below has nothing to do).
         return outcome;
     }
 
@@ -140,12 +201,12 @@ fn process_repo(repo: &RepoRef, opts: &GithubRunOpts, packs: &[Pack], base: &Pat
             b = repo.default_branch
         );
         if let Err(e) = git(&dest, &["push", "origin", &backup]) {
-            outcome.error = Some(format!("backup push: {e}"));
+            outcome.error = Some(redact(format!("backup push: {e}"), token));
             return outcome;
         }
         match force_push_with_lease(&dest) {
             Ok(()) => outcome.pushed.push(repo.default_branch.clone()),
-            Err(e) => outcome.error = Some(format!("force-push: {e}")),
+            Err(e) => outcome.error = Some(redact(format!("force-push: {e}"), token)),
         }
     }
 
@@ -158,6 +219,7 @@ pub fn run(
     opts: &GithubRunOpts,
     host: &dyn RepoHost,
     packs: &[Pack],
+    token: &str,
 ) -> Result<Vec<RepoOutcome>, GithubError> {
     let repos = host.list_repos(opts.include_forks)?;
 
@@ -176,7 +238,7 @@ pub fn run(
 
     let outcomes: Vec<RepoOutcome> = repos
         .par_iter()
-        .map(|repo| process_repo(repo, opts, packs, &base))
+        .map(|repo| process_repo(repo, opts, packs, &base, token))
         .collect();
     Ok(outcomes)
 }
@@ -262,7 +324,7 @@ mod tests {
             yes: true,
         };
 
-        let outcomes = run(&opts, &host, &builtin_packs()).unwrap();
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].error.is_none(), "unexpected error: {:?}", outcomes[0].error);
         assert!(!outcomes[0].findings.is_empty());
@@ -290,7 +352,7 @@ mod tests {
             yes: false,
         };
 
-        let outcomes = run(&opts, &host, &builtin_packs()).unwrap();
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
         assert!(!outcomes[0].actions.is_empty());
         assert!(outcomes[0].pushed.is_empty());
         // The infected file in the working tree must be untouched by a dry run.
@@ -319,7 +381,7 @@ mod tests {
             yes: true,
         };
 
-        let outcomes = run(&opts, &host, &builtin_packs()).unwrap();
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
         assert!(outcomes[0].error.is_none(), "unexpected error: {:?}", outcomes[0].error);
         assert_eq!(outcomes[0].pushed, vec!["main".to_string()]);
 

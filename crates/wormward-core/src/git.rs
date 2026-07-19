@@ -22,6 +22,9 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
         .arg("-C")
         .arg(repo)
         .args(args)
+        // Never block on an interactive credential prompt (e.g. force-push to a private
+        // remote without cached auth); fail fast with an error instead.
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_AUTHOR_NAME", "wormward")
         .env("GIT_AUTHOR_EMAIL", "wormward@localhost")
         .env("GIT_COMMITTER_NAME", "wormward")

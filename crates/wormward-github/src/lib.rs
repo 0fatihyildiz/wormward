@@ -82,12 +82,33 @@ fn next_link(link_header: &str) -> Option<String> {
     None
 }
 
+/// The authority (host[:port]) of an absolute URL, for comparing whether two URLs
+/// address the same host before we send a bearer token to a paginated `next` link.
+fn url_authority(url: &str) -> Option<&str> {
+    let (_scheme, rest) = url.split_once("://")?;
+    Some(rest.split(['/', '?', '#']).next().unwrap_or(rest))
+}
+
+/// Cap on paginated requests to bound the loop even if a host keeps advertising a next link.
+const MAX_PAGES: usize = 1000;
+
 impl RepoHost for GitHubHost {
     fn list_repos(&self, include_forks: bool) -> Result<Vec<RepoRef>, GithubError> {
         let mut url =
             format!("{}/user/repos?affiliation=owner&per_page=100&page=1", self.base_url);
+        // Only ever send the bearer token to the configured API host. A malicious or
+        // buggy `next` link pointing elsewhere must not receive our credentials.
+        let base_authority = url_authority(&self.base_url)
+            .ok_or_else(|| GithubError::Http(format!("invalid base_url: {}", self.base_url)))?
+            .to_string();
         let mut all: Vec<RepoRef> = Vec::new();
-        loop {
+        for _ in 0..MAX_PAGES {
+            // Guard before every request (including the first) so we never leak the token.
+            if url_authority(&url) != Some(base_authority.as_str()) {
+                return Err(GithubError::Http(format!(
+                    "refusing to send token to unexpected host in pagination link: {url}"
+                )));
+            }
             let resp = ureq::get(&url)
                 .set("Authorization", &format!("Bearer {}", self.token))
                 .set("User-Agent", "wormward")
@@ -155,5 +176,37 @@ mod tests {
         let repos = host.list_repos(false).unwrap();
         let names: Vec<&str> = repos.iter().map(|r| r.full_name.as_str()).collect();
         assert_eq!(names, vec!["me/a", "me/b"]); // fork filtered out, both pages merged
+    }
+
+    #[test]
+    fn refuses_to_follow_next_link_to_foreign_host() {
+        // The API host returns a `next` link pointing at an attacker-controlled host.
+        // We must NOT send the bearer token there: the run errors and the foreign host
+        // receives zero requests.
+        let api = MockServer::start();
+        let attacker = MockServer::start();
+        let evil_next = format!("<{}/user/repos?page=2>; rel=\"next\"", attacker.base_url());
+        api.mock(|when, then| {
+            when.method(GET).path("/user/repos").query_param("page", "1");
+            then.status(200).header("Link", evil_next.as_str()).json_body(serde_json::json!([
+                {"full_name":"me/a","clone_url":"https://x/a.git","default_branch":"main","fork":false}
+            ]));
+        });
+        let attacker_mock = attacker.mock(|when, then| {
+            when.method(GET).path("/user/repos");
+            then.status(200).json_body(serde_json::json!([]));
+        });
+
+        let host = GitHubHost { token: "secret".into(), base_url: api.base_url() };
+        let result = host.list_repos(false);
+        assert!(result.is_err(), "expected an error, got {result:?}");
+        attacker_mock.assert_hits(0); // token never sent to the foreign host
+    }
+
+    #[test]
+    fn url_authority_extracts_host_and_port() {
+        assert_eq!(url_authority("https://api.github.com/user/repos?x=1"), Some("api.github.com"));
+        assert_eq!(url_authority("http://127.0.0.1:8080/p"), Some("127.0.0.1:8080"));
+        assert_eq!(url_authority("not-a-url"), None);
     }
 }
