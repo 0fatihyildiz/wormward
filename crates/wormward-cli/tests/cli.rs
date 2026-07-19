@@ -210,6 +210,26 @@ fn clean_apply_deletes_and_backs_up_then_restore() {
 }
 
 #[test]
+fn clean_apply_all_cleans_every_infected_repo() {
+    // Two infected repos under one dir. `--all` bypasses the selection prompt and fixes
+    // both, exactly as before the interactive-selection feature existed.
+    let tmp = TempDir::new().unwrap();
+    for name in ["one", "two"] {
+        let repo = tmp.path().join(name);
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("temp_auto_push.bat"), "@echo off").unwrap();
+    }
+
+    let out = bin().arg("clean").arg("--apply").arg("--all").arg(tmp.path()).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    for name in ["one", "two"] {
+        let repo = tmp.path().join(name);
+        assert!(!repo.join("temp_auto_push.bat").exists(), "{name} should be cleaned");
+        assert!(repo.join(".wormward-backup").exists(), "{name} should be backed up");
+    }
+}
+
+#[test]
 fn clean_push_without_yes_exits_2() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().join("v");
