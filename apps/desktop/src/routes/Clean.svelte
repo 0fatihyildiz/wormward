@@ -46,7 +46,6 @@
 
   async function preview() {
     loading = true;
-    result = "";
     app.error = "";
     try {
       plans = await cleanPreview(dirs);
@@ -99,8 +98,6 @@
 
   async function previewBranches() {
     branchLoading = true;
-    branchSummary = "";
-    branchResults = [];
     app.error = "";
     try {
       branchPlans = await cleanBranchesPreview(dirs);
