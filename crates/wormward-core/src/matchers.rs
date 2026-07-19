@@ -2,11 +2,12 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum SignatureKind {
     Literal,
     Regex,
     Sha256,
+    EntropyOver,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -22,6 +23,26 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Shannon entropy (bits/byte) of a byte slice.
+pub fn shannon_entropy(bytes: &[u8]) -> f64 {
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0usize; 256];
+    for &b in bytes {
+        counts[b as usize] += 1;
+    }
+    let len = bytes.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
 pub fn signature_matches(sig: &ContentSignature, content: &str) -> bool {
     match sig.kind {
         SignatureKind::Literal => content.contains(&sig.value),
@@ -29,6 +50,13 @@ pub fn signature_matches(sig: &ContentSignature, content: &str) -> bool {
             .map(|re| re.is_match(content))
             .unwrap_or(false),
         SignatureKind::Sha256 => sha256_hex(content.as_bytes()).eq_ignore_ascii_case(&sig.value),
+        SignatureKind::EntropyOver => {
+            // Payloads are appended, so measure the tail's randomness.
+            let bytes = content.as_bytes();
+            let tail = &bytes[bytes.len().saturating_sub(512)..];
+            let threshold: f64 = sig.value.parse().unwrap_or(f64::MAX);
+            shannon_entropy(tail) > threshold
+        }
     }
 }
 
@@ -66,5 +94,19 @@ mod tests {
         let s = sig(SignatureKind::Sha256, &digest);
         assert!(signature_matches(&s, "payload"));
         assert!(!signature_matches(&s, "other"));
+    }
+
+    #[test]
+    fn entropy_over_flags_high_entropy_tail() {
+        const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let blob: String = (0..600).map(|i| B64[(i * 37) % B64.len()] as char).collect();
+        let s = sig(SignatureKind::EntropyOver, "5.0");
+        assert!(signature_matches(&s, &blob));
+    }
+
+    #[test]
+    fn entropy_over_ignores_plain_config() {
+        let s = sig(SignatureKind::EntropyOver, "5.0");
+        assert!(!signature_matches(&s, "export default { plugins: { tailwindcss: {} } };\n"));
     }
 }
