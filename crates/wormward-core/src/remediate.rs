@@ -105,8 +105,24 @@ fn backup_file(repo: &Path, rel: &Path, backup_dir: &Path) {
     let _ = std::fs::copy(&src, &dst);
 }
 
+/// Position of the earliest marker match in `content`. A marker written `re:<pattern>`
+/// is matched as a regex; any other marker is matched as a literal substring. An
+/// invalid regex is ignored (never matches) rather than panicking.
 fn earliest_marker(content: &str, markers: &[String]) -> Option<usize> {
-    markers.iter().filter_map(|m| content.find(m)).min()
+    markers
+        .iter()
+        .filter_map(|m| match m.strip_prefix("re:") {
+            Some(pat) => regex::Regex::new(pat).ok()?.find(content).map(|mat| mat.start()),
+            None => content.find(m),
+        })
+        .min()
+}
+
+/// True if any strip marker matches `content`. Same literal/`re:` semantics as
+/// `earliest_marker`. Callers use it to decide whether a StripPayload will actually do
+/// anything (fixability) before offering or attempting it.
+pub fn strip_marker_matches(content: &str, markers: &[String]) -> bool {
+    earliest_marker(content, markers).is_some()
 }
 
 /// Apply actions in the working tree, backing up each target first (unless disabled).
@@ -277,6 +293,31 @@ mod tests {
             online: None,
             git_ref: None,
         }
+    }
+
+    #[test]
+    fn regex_marker_matches_bracket_global_of_any_key() {
+        // Bracket-notation global assignment with an arbitrary key — the generalized
+        // payload-start form. `re:` prefix = regex marker.
+        let markers = vec![r"re:global\[('|\x22)[^'\x22]+('|\x22)\]\s*=".to_string()];
+        let content = "export default {};\nglobal['xyz']=1;PAYLOAD";
+        assert!(strip_marker_matches(content, &markers));
+        assert_eq!(earliest_marker(content, &markers), Some(content.find("global[").unwrap()));
+        // Dot-notation must NOT match (legit `global.x` collision risk).
+        assert!(!strip_marker_matches("const a = global.foo;", &markers));
+    }
+
+    #[test]
+    fn literal_and_regex_markers_take_earliest() {
+        let markers = vec!["global['!']=".to_string(), r"re:_\$_[0-9a-f]{4,}".to_string()];
+        // decoder pattern appears BEFORE the literal here → earliest wins.
+        let content = "ok\n_$_1a2b=1;global['!']=2;";
+        assert_eq!(earliest_marker(content, &markers), Some(content.find("_$_1a2b").unwrap()));
+    }
+
+    #[test]
+    fn strip_marker_matches_false_when_absent() {
+        assert!(!strip_marker_matches("clean config", &["global['!']=".to_string()]));
     }
 
     #[test]
