@@ -208,3 +208,45 @@ fn clean_apply_deletes_and_backs_up_then_restore() {
     assert_eq!(out2.status.code(), Some(0));
     assert!(repo.join("temp_auto_push.bat").exists());
 }
+
+#[test]
+fn clean_push_without_yes_exits_2() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("v");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::write(repo.join("temp_auto_push.bat"), "@echo off").unwrap();
+    let out = bin().arg("clean").arg("--apply").arg("--push").arg(tmp.path()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--yes"));
+    assert!(repo.join("temp_auto_push.bat").exists()); // aborted before any change
+}
+
+#[test]
+fn clean_apply_push_yes_updates_bare_remote() {
+    use std::process::Command as Cmd;
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        Cmd::new("git").arg("-C").arg(repo).args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+            .status().unwrap();
+    }
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    let remote = tmp.path().join("remote.git");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    Cmd::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+    fs::write(repo.join("temp_auto_push.bat"), "@echo off").unwrap();
+    fs::write(repo.join("keep.txt"), "x").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+    let out = bin().arg("clean").arg("--apply").arg("--push").arg("--yes").arg(&repo).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let ls = Cmd::new("git").arg("-C").arg(&remote).args(["ls-tree", "--name-only", "main"]).output().unwrap();
+    let names = String::from_utf8_lossy(&ls.stdout);
+    assert!(!names.contains("temp_auto_push.bat"));
+    assert!(names.contains("keep.txt"));
+}

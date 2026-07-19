@@ -20,9 +20,11 @@ wormward scan ~                 # scan your home directory (read-only)
 wormward scan . --format json   # machine-readable output for CI
 wormward list-packs             # show bundled campaign packs
 wormward scan ~ --deep          # also scan every branch tip (worms hide on non-default branches)
-wormward clean ~                # preview removals (dry-run)
-wormward clean ~ --apply        # strip payloads, delete artifacts, fix .gitignore (backup on)
-wormward restore ~              # revert the last clean from backup
+wormward clean ~                          # preview removals (dry-run)
+wormward clean ~ --apply                  # strip payloads, delete artifacts, fix .gitignore (backup on)
+wormward clean ~ --apply --push --yes     # + commit and push the cleaned state
+wormward clean ~ --apply --push --rewrite --yes   # + amend HEAD and push --force-with-lease (DANGEROUS)
+wormward restore ~                        # revert the last clean from backup
 ```
 
 Exit codes: `0` clean, `1` infections found, `2` error.

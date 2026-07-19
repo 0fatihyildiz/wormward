@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use wormward_core::{apply, discover_repos, plan_remediation, restore, scan, scan_deep, scan_repo};
+use wormward_core::{
+    amend_head, apply, commit_all, discover_repos, force_push_with_lease, plan_remediation, push,
+    restore, scan, scan_deep, scan_repo,
+};
 use wormward_osm::OsmClient;
 use wormward_packs::builtin_packs;
 
@@ -61,6 +64,15 @@ enum Command {
         /// Disable the automatic backup taken before changes.
         #[arg(long)]
         no_backup: bool,
+        /// After --apply, commit the cleaned files and push to the current branch.
+        #[arg(long)]
+        push: bool,
+        /// With --push, amend HEAD instead of adding a commit, then push --force-with-lease.
+        #[arg(long)]
+        rewrite: bool,
+        /// Required confirmation for the destructive --push / --rewrite git operations.
+        #[arg(long)]
+        yes: bool,
     },
     /// Restore files from the latest wormward backup.
     Restore {
@@ -174,12 +186,29 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Clean { dirs, apply: do_apply, no_backup } => {
+        Command::Clean { dirs, apply: do_apply, no_backup, push: do_push, rewrite, yes } => {
             for dir in &dirs {
                 if !dir.exists() {
                     eprintln!("error: path does not exist: {}", dir.display());
                     return ExitCode::from(2);
                 }
+            }
+            if do_push && !do_apply {
+                eprintln!("error: --push requires --apply");
+                return ExitCode::from(2);
+            }
+            if rewrite && !do_push {
+                eprintln!("error: --rewrite requires --push");
+                return ExitCode::from(2);
+            }
+            if (do_push || rewrite) && !yes {
+                let op = if rewrite {
+                    "amend HEAD and push --force-with-lease"
+                } else {
+                    "commit and push"
+                };
+                eprintln!("refusing to {op} without --yes (destructive). Re-run with --yes to confirm.");
+                return ExitCode::from(2);
             }
             let packs = builtin_packs();
             let mut total_actions = 0usize;
@@ -217,6 +246,27 @@ fn main() -> ExitCode {
                         total_failed += res.skipped.len();
                         if let Some(bd) = res.backup_dir {
                             println!("  backup: {}", bd.display());
+                        }
+                        if do_push && !res.applied.is_empty() {
+                            let git_result = if rewrite {
+                                amend_head(&repo).and_then(|_| force_push_with_lease(&repo))
+                            } else {
+                                commit_all(&repo, "wormward: remediate").and_then(|_| push(&repo))
+                            };
+                            match git_result {
+                                Ok(()) => println!(
+                                    "  pushed{}",
+                                    if rewrite {
+                                        " (rewritten HEAD, force-with-lease)"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                                Err(e) => {
+                                    eprintln!("  git error: {e}");
+                                    total_failed += 1;
+                                }
+                            }
                         }
                     }
                 }
