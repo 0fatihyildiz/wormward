@@ -172,6 +172,62 @@ pub fn apply(repo: &Path, actions: &[RemediationAction], backup: bool) -> Remedi
     RemediationResult { applied, skipped, backup_dir }
 }
 
+pub struct RestoreResult {
+    pub restored: Vec<PathBuf>,
+    pub backup_dir: Option<PathBuf>,
+}
+
+fn latest_backup_dir(repo: &Path) -> Option<PathBuf> {
+    let root = repo.join(".wormward-backup");
+    let mut best: Option<(u128, PathBuf)> = None;
+    for entry in std::fs::read_dir(&root).ok()?.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        if let Ok(ts) = entry.file_name().to_string_lossy().parse::<u128>() {
+            if best.as_ref().map(|(b, _)| ts > *b).unwrap_or(true) {
+                best = Some((ts, entry.path()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn collect_files(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files(&path, base, out);
+            } else if let Ok(rel) = path.strip_prefix(base) {
+                out.push(rel.to_path_buf());
+            }
+        }
+    }
+}
+
+/// Restore every file from the latest backup back into the repo (recreating deletions
+/// and reverting modifications).
+pub fn restore(repo: &Path) -> RestoreResult {
+    let backup_dir = match latest_backup_dir(repo) {
+        Some(d) => d,
+        None => return RestoreResult { restored: Vec::new(), backup_dir: None },
+    };
+    let mut rels = Vec::new();
+    collect_files(&backup_dir, &backup_dir, &mut rels);
+    let mut restored = Vec::new();
+    for rel in rels {
+        let dst = repo.join(&rel);
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::copy(backup_dir.join(&rel), &dst).is_ok() {
+            restored.push(rel);
+        }
+    }
+    RestoreResult { restored, backup_dir: Some(backup_dir) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +397,27 @@ mod tests {
         let out = fs::read_to_string(repo.join(".gitignore")).unwrap();
         assert!(!out.contains("config.bat"));
         assert!(out.contains("node_modules") && out.contains("dist"));
+    }
+
+    #[test]
+    fn restore_reverts_delete_and_modify() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        fs::write(repo.join("temp_auto_push.bat"), "@echo off").unwrap();
+        fs::write(repo.join("postcss.config.mjs"), "export default {};\nglobal['!']='8';payload").unwrap();
+        let actions = vec![
+            RemediationAction::DeleteFile { file: PathBuf::from("temp_auto_push.bat") },
+            RemediationAction::StripPayload {
+                file: PathBuf::from("postcss.config.mjs"),
+                markers: vec!["global['!']=".into()],
+            },
+        ];
+        apply(repo, &actions, true);
+        assert!(!repo.join("temp_auto_push.bat").exists());
+
+        let r = restore(repo);
+        assert_eq!(r.restored.len(), 2);
+        assert_eq!(fs::read_to_string(repo.join("temp_auto_push.bat")).unwrap(), "@echo off");
+        assert!(fs::read_to_string(repo.join("postcss.config.mjs")).unwrap().contains("payload"));
     }
 }
