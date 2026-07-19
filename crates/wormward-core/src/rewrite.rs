@@ -178,15 +178,11 @@ fn clean_branch(plan: &BranchCleanPlan, push: bool) -> BranchCleanStatus {
     let repo = &plan.repo;
     let branch = &plan.branch;
 
-    // Snapshot the current tip so the rewrite is reversible. Create-only + unique so a rerun
-    // can never overwrite an existing backup and destroy its rollback target.
+    // Resolve the current tip up front (needed for the backup ref and to detect a missing
+    // branch) but do not create the backup ref yet — we may bail out below without writing.
     let old_oid = match crate::git::rev_parse(repo, branch) {
         Some(o) => o,
         None => return BranchCleanStatus::Failed(format!("cannot resolve branch '{branch}'")),
-    };
-    let backup_ref = match create_unique_backup_ref(repo, &plan.backup_ref, &old_oid) {
-        Ok(r) => r,
-        Err(e) => return BranchCleanStatus::Failed(format!("could not create backup ref: {e}")),
     };
 
     // Classify the ref. A local branch (refs/heads/<branch>) is checked out directly and its
@@ -219,6 +215,25 @@ fn clean_branch(plan: &BranchCleanPlan, push: bool) -> BranchCleanStatus {
         return BranchCleanStatus::Failed(format!(
             "branch '{branch}' is neither a local nor a remote-tracking ref"
         ));
+    };
+
+    // A remote-tracking tip can only be fixed by pushing back to its remote: the clean is
+    // committed onto a throwaway local branch that teardown deletes, so without `--push` the
+    // commit is discarded and NOTHING is fixed. Report that honestly (Skipped) and make no
+    // changes at all — no backup ref, no worktree — instead of a false `Cleaned` all-clear.
+    if !push {
+        if let CleanMode::RemoteTracking { .. } = mode {
+            return BranchCleanStatus::Skipped(format!(
+                "remote-tracking branch {branch} requires --push to clean"
+            ));
+        }
+    }
+
+    // Snapshot the current tip so the rewrite is reversible. Create-only + unique so a rerun
+    // can never overwrite an existing backup and destroy its rollback target.
+    let backup_ref = match create_unique_backup_ref(repo, &plan.backup_ref, &old_oid) {
+        Ok(r) => r,
+        Err(e) => return BranchCleanStatus::Failed(format!("could not create backup ref: {e}")),
     };
 
     let wt = unique_worktree_path();
@@ -274,7 +289,9 @@ fn clean_in_worktree(
 
     let cleaned = |pushed| BranchCleanStatus::Cleaned { backup_ref: backup_ref.to_string(), pushed };
     if !push {
-        // Push not requested: clean + commit locally only.
+        // Push not requested. Only a LOCAL branch reaches here (a remote-tracking tip without
+        // --push is Skipped upstream, since its throwaway commit would be discarded): the
+        // local ref advances in place, so the clean persists locally even without a push.
         return cleaned(false);
     }
 
@@ -618,5 +635,58 @@ mod tests {
         assert!(!remote_content.contains("rmcej%otb%"), "remote still infected: {remote_content}");
         // Backup ref preserved locally for rollback.
         assert!(crate::git::verify_ref(&work, "refs/wormward-backup/origin/evil-1"));
+    }
+
+    #[test]
+    fn remote_tracking_without_push_is_skipped_and_leaves_no_backup_ref() {
+        // A remote-tracking tip can only be fixed by pushing (the clean lives on a throwaway
+        // branch teardown deletes). With push=false the fix cannot persist, so the outcome
+        // must be Skipped — NOT a false Cleaned — and NOTHING is written: no backup ref, no
+        // throwaway branch, and the remote-tracking tip stays infected.
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("origin.git");
+        let work = tmp.path().join("work");
+        Command::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("postcss.config.mjs"), "export default {};\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "clean"]);
+        git(&work, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&work, &["push", "-q", "-u", "origin", "main"]);
+        git(&work, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(
+            work.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='8';var x='rmcej%otb%';",
+        )
+        .unwrap();
+        git(&work, &["commit", "-q", "-am", "payload"]);
+        git(&work, &["push", "-q", "-u", "origin", "evil"]);
+        let infected_oid = git_stdout(&work, &["rev-parse", "origin/evil"]);
+        git(&work, &["checkout", "-q", "main"]);
+        git(&work, &["branch", "-D", "evil"]);
+
+        let plans = vec![BranchCleanPlan {
+            repo: work.clone(),
+            branch: "origin/evil".into(),
+            backup_ref: "refs/wormward-backup/origin/evil-1".into(),
+            actions: vec![RemediationAction::StripPayload {
+                file: PathBuf::from("postcss.config.mjs"),
+                markers: vec!["global['!']=".into()],
+            }],
+        }];
+        let outcomes = apply_branch_cleans(&plans, false, false);
+        assert!(
+            matches!(outcomes[0].status, BranchCleanStatus::Skipped(_)),
+            "expected Skipped, got {:?}",
+            outcomes[0].status
+        );
+        // No dangling backup ref was created.
+        assert!(!crate::git::verify_ref(&work, "refs/wormward-backup/origin/evil-1"));
+        // The remote-tracking tip is untouched (still the infected commit).
+        assert_eq!(git_stdout(&work, &["rev-parse", "origin/evil"]), infected_oid);
+        // No throwaway branch left behind.
+        let branches = git_stdout(&work, &["branch", "--list", "wormward-clean-*"]);
+        assert!(branches.is_empty(), "throwaway branch lingered: {branches}");
     }
 }
