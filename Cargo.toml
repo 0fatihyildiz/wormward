@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/wormward-core", "crates/wormward-packs", "crates/wormward-cli"]
+members = ["crates/wormward-core", "crates/wormward-packs", "crates/wormward-cli", "crates/wormward-osm"]
 
 [workspace.package]
 edition = "2021"
@@ -22,3 +22,5 @@ thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tempfile = "3"
+ureq = "2"
+httpmock = "0.7"
