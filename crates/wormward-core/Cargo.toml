@@ -6,13 +6,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aho-corasick = { workspace = true }
+ignore = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 regex = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 globset = { workspace = true }
-walkdir = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 

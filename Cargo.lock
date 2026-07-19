@@ -974,6 +974,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignore"
+version = "0.4.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b009b6744c1445efd7244084e25e498636412effb6760b55067553baa925cc7"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2105,8 +2121,10 @@ dependencies = [
 name = "wormward-core"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "globset",
  "hex",
+ "ignore",
  "rayon",
  "regex",
  "serde",
@@ -2115,7 +2133,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
- "walkdir",
 ]
 
 [[package]]
