@@ -79,6 +79,29 @@ enum Command {
         #[arg(default_value = ".")]
         dirs: Vec<PathBuf>,
     },
+    /// Scan (and optionally remediate) every repo on the logged-in GitHub account.
+    Github {
+        /// GitHub token (else GITHUB_TOKEN/GH_TOKEN, else `gh auth token`).
+        #[arg(long)]
+        token: Option<String>,
+        /// Directory to clone into (default: a temp dir removed after the run).
+        #[arg(long)]
+        clone_dir: Option<PathBuf>,
+        /// Include forks (default: skip them).
+        #[arg(long)]
+        include_forks: bool,
+        /// Remediate infected working trees (requires --yes to write).
+        #[arg(long)]
+        fix: bool,
+        /// Force-push cleaned default branches back to origin (backs up first; requires --yes).
+        #[arg(long)]
+        push: bool,
+        /// Actually perform writes/pushes. Without this, only prints the plan.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -309,6 +332,53 @@ fn main() -> ExitCode {
                 }
             }
             ExitCode::from(0)
+        }
+        Command::Github { token, clone_dir, include_forks, fix, push, yes, format } => {
+            // --push and --fix are destructive; require explicit --yes to write.
+            if push && !yes {
+                eprintln!("refusing to force-push without --yes (destructive). Re-run with --yes to confirm.");
+                return ExitCode::from(2);
+            }
+            if fix && !yes {
+                eprintln!("note: --fix without --yes is a dry-run; re-run with --yes to write.");
+            }
+            let token = match wormward_github::resolve_token(token.as_deref()) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let host = wormward_github::GitHubHost::new(token);
+            let opts = wormward_github::pipeline::GithubRunOpts {
+                clone_dir,
+                include_forks,
+                // Pushing implies remediating.
+                fix: fix || push,
+                push,
+                yes,
+            };
+            let outcomes = match wormward_github::pipeline::run(&opts, &host, &builtin_packs()) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let writes = yes && (fix || push);
+            match format {
+                OutputFormat::Text => print!("{}", report::render_github_text(&outcomes, writes)),
+                OutputFormat::Json => println!("{}", report::render_github_json(&outcomes)),
+            }
+            let any_findings = outcomes.iter().any(|o| !o.findings.is_empty());
+            let any_error = outcomes.iter().any(|o| o.error.is_some());
+            if any_error {
+                ExitCode::from(2)
+            } else if any_findings {
+                ExitCode::from(1)
+            } else {
+                ExitCode::from(0)
+            }
         }
     }
 }

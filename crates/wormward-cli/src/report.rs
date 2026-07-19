@@ -61,6 +61,33 @@ pub fn render_json(report: &ScanReport) -> String {
     serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
 }
 
+pub fn render_github_text(outcomes: &[wormward_github::pipeline::RepoOutcome], applied: bool) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Checked {} repo(s).\n", outcomes.len()));
+    for o in outcomes {
+        out.push_str(&format!(
+            "\n{} — {} finding(s){}\n",
+            o.repo.full_name,
+            o.findings.len(),
+            o.error.as_ref().map(|e| format!(" [error: {e}]")).unwrap_or_default(),
+        ));
+        for a in &o.actions {
+            out.push_str(&format!("  action: {a}\n"));
+        }
+        if !o.pushed.is_empty() {
+            out.push_str(&format!("  pushed: {}\n", o.pushed.join(", ")));
+        }
+    }
+    if !applied {
+        out.push_str("\n(dry-run; pass --fix --yes to remediate, --push --yes to force-push)\n");
+    }
+    out
+}
+
+pub fn render_github_json(outcomes: &[wormward_github::pipeline::RepoOutcome]) -> String {
+    serde_json::to_string_pretty(outcomes).unwrap_or_else(|_| "[]".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

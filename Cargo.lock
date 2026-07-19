@@ -2096,6 +2096,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "wormward-core",
+ "wormward-github",
  "wormward-osm",
  "wormward-packs",
 ]
@@ -2115,6 +2116,21 @@ dependencies = [
  "tempfile",
  "thiserror",
  "walkdir",
+]
+
+[[package]]
+name = "wormward-github"
+version = "0.1.0"
+dependencies = [
+ "httpmock",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "ureq",
+ "wormward-core",
+ "wormward-packs",
 ]
 
 [[package]]
