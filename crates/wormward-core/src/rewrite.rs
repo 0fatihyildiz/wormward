@@ -30,8 +30,10 @@ pub struct BranchCleanPlan {
 pub enum BranchCleanStatus {
     /// Dry run — nothing was changed.
     Planned,
-    /// Branch tip rewritten; old tip preserved at `backup_ref`.
-    Cleaned { backup_ref: String },
+    /// Branch tip rewritten and committed; old tip preserved at `backup_ref`. `pushed` is
+    /// true only when a force-push was requested AND succeeded; a clean+commit that was not
+    /// pushed (push not requested, or the branch has no upstream) reports `pushed: false`.
+    Cleaned { backup_ref: String, pushed: bool },
     /// Nothing to do (e.g. no action actually applied to this branch's tree).
     Skipped(String),
     /// An error occurred; the backup ref (if created) still allows recovery.
@@ -96,15 +98,58 @@ pub fn plan_branch_cleans(findings: &[Finding], packs: &[Pack], timestamp: u64) 
 
 static WT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Nanoseconds since the epoch, best-effort (0 on clock error). Combined with a monotonic
+/// counter and the pid, this yields process-unique suffixes for temp paths, throwaway branch
+/// names, and backup refs.
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
 /// A unique temp path for an isolated worktree. Uniqueness matters because a single run may
 /// clean several branches sharing one timestamp.
 fn unique_worktree_path() -> PathBuf {
     let n = WT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("wormward-wt-{}-{ts}-{n}", std::process::id()))
+    std::env::temp_dir().join(format!("wormward-wt-{}-{}-{n}", std::process::id(), now_nanos()))
+}
+
+/// A unique, throwaway local-branch name for materializing a remote-tracking tip in a temp
+/// worktree. Never a real branch name, so it cannot pollute the namespace or collide with an
+/// existing `<leaf>` local branch, and is deleted during teardown.
+fn unique_throwaway_branch() -> String {
+    let n = WT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("wormward-clean-{}-{}-{n}", std::process::id(), now_nanos())
+}
+
+/// How a branch tip is checked out for cleaning.
+enum CleanMode {
+    /// An existing local branch (`refs/heads/<branch>`), checked out in place.
+    Local,
+    /// A remote-tracking tip (`refs/remotes/<remote>/<leaf>`), materialized via a throwaway
+    /// local branch whose commit is pushed back to `<remote>`'s real `<leaf>` branch.
+    RemoteTracking { remote: String, leaf: String, throwaway: String },
+}
+
+/// Create a create-only, unique backup ref pointing at `old_oid`. Tries `base` first; if it
+/// already exists (e.g. a same-second rerun on a still-infected branch), falls back to unique
+/// `<base>-<nanos>-<n>` names. A create-only update (`git update-ref <ref> <new> <zero>`) can
+/// never clobber an existing ref, so an earlier rollback target is always preserved.
+fn create_unique_backup_ref(repo: &std::path::Path, base: &str, old_oid: &str) -> Result<String, String> {
+    if crate::git::create_ref(repo, base, old_oid).is_ok() {
+        return Ok(base.to_string());
+    }
+    let mut last_err = format!("backup ref '{base}' already exists");
+    for _ in 0..64 {
+        let n = WT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!("{base}-{}-{n}", now_nanos());
+        match crate::git::create_ref(repo, &candidate, old_oid) {
+            Ok(()) => return Ok(candidate),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 /// Apply branch-clean plans. When `dry_run`, every plan reports `Planned` and nothing is
@@ -133,32 +178,37 @@ fn clean_branch(plan: &BranchCleanPlan, push: bool) -> BranchCleanStatus {
     let repo = &plan.repo;
     let branch = &plan.branch;
 
-    // Snapshot the current tip so the rewrite is reversible.
+    // Snapshot the current tip so the rewrite is reversible. Create-only + unique so a rerun
+    // can never overwrite an existing backup and destroy its rollback target.
     let old_oid = match crate::git::rev_parse(repo, branch) {
         Some(o) => o,
         None => return BranchCleanStatus::Failed(format!("cannot resolve branch '{branch}'")),
     };
-    if let Err(e) = crate::git::update_ref(repo, &plan.backup_ref, &old_oid) {
-        return BranchCleanStatus::Failed(format!("could not create backup ref: {e}"));
-    }
+    let backup_ref = match create_unique_backup_ref(repo, &plan.backup_ref, &old_oid) {
+        Ok(r) => r,
+        Err(e) => return BranchCleanStatus::Failed(format!("could not create backup ref: {e}")),
+    };
 
     // Classify the ref. A local branch (refs/heads/<branch>) is checked out directly and its
     // ref advances in place. A remote-tracking ref (e.g. `origin/evil`) has no local branch,
-    // so we materialize a local branch from it, clean that, and force-push the specific
-    // remote branch. Local branches are checked first so a local branch named like a remote
-    // one is never misclassified.
+    // so we materialize a THROWAWAY local branch from it, clean that, force-push the real
+    // remote branch, then delete the throwaway during teardown. Local branches are checked
+    // first so a local branch named like a remote one is never misclassified.
     let is_local = crate::git::verify_ref(repo, &format!("refs/heads/{branch}"));
     let is_remote_tracking =
         !is_local && crate::git::verify_ref(repo, &format!("refs/remotes/{branch}"));
 
-    // (local branch name to check out, Some(remote) if this is a remote-tracking clean)
-    let (local_name, remote): (String, Option<String>) = if is_local {
-        (branch.clone(), None)
+    let mode = if is_local {
+        CleanMode::Local
     } else if is_remote_tracking {
         match branch.split_once('/') {
-            // refs/remotes/<remote>/<name>: first component is the remote, rest is the branch
+            // refs/remotes/<remote>/<leaf>: first component is the remote, rest is the branch
             // (which may itself contain slashes, e.g. origin/feature/x).
-            Some((r, n)) => (n.to_string(), Some(r.to_string())),
+            Some((r, leaf)) => CleanMode::RemoteTracking {
+                remote: r.to_string(),
+                leaf: leaf.to_string(),
+                throwaway: unique_throwaway_branch(),
+            },
             None => {
                 return BranchCleanStatus::Failed(format!(
                     "remote-tracking ref '{branch}' has no '/' separator"
@@ -172,30 +222,44 @@ fn clean_branch(plan: &BranchCleanPlan, push: bool) -> BranchCleanStatus {
     };
 
     let wt = unique_worktree_path();
-    let add = if is_local {
-        crate::git::worktree_add(repo, &wt, branch)
-    } else {
-        crate::git::worktree_add_new_branch(repo, &wt, &local_name, branch)
+    let add = match &mode {
+        CleanMode::Local => crate::git::worktree_add(repo, &wt, branch),
+        CleanMode::RemoteTracking { throwaway, .. } => {
+            crate::git::worktree_add_new_branch(repo, &wt, throwaway, branch)
+        }
     };
-    if let Err(e) = add {
-        return BranchCleanStatus::Failed(format!("worktree add failed: {e}"));
-    }
 
-    let status = clean_in_worktree(&wt, plan, push, remote.as_deref(), &local_name);
-
-    // Always tear the worktree down, even on error.
-    let _ = crate::git::worktree_remove(repo, &wt);
-    let _ = std::fs::remove_dir_all(&wt);
-
+    // Run the clean only if the worktree was added, but ALWAYS tear down — including on add
+    // failure, which can still leave a dir and/or a `.git/worktrees/<name>` admin entry.
+    let status = match add {
+        Ok(()) => clean_in_worktree(&wt, plan, &backup_ref, push, &mode),
+        Err(e) => BranchCleanStatus::Failed(format!("worktree add failed: {e}")),
+    };
+    teardown(repo, &wt, &mode);
     status
+}
+
+/// Undo everything `clean_branch` created, best-effort, on every path: remove the worktree,
+/// delete its directory, prune stale admin entries if the remove did not take, and delete the
+/// throwaway branch so no real-named or leftover local branch remains.
+fn teardown(repo: &std::path::Path, wt: &std::path::Path, mode: &CleanMode) {
+    let removed = crate::git::worktree_remove(repo, wt).is_ok();
+    let _ = std::fs::remove_dir_all(wt);
+    if !removed {
+        // `add` may have failed, or the dir vanished — drop any lingering admin entry.
+        let _ = crate::git::worktree_prune(repo);
+    }
+    if let CleanMode::RemoteTracking { throwaway, .. } = mode {
+        let _ = crate::git::delete_branch(repo, throwaway);
+    }
 }
 
 fn clean_in_worktree(
     wt: &std::path::Path,
     plan: &BranchCleanPlan,
+    backup_ref: &str,
     push: bool,
-    remote: Option<&str>,
-    local_name: &str,
+    mode: &CleanMode,
 ) -> BranchCleanStatus {
     // The backup ref already covers rollback, so skip the on-disk backup dir.
     let res = remediate::apply(wt, &plan.actions, false);
@@ -207,18 +271,36 @@ fn clean_in_worktree(
     if let Err(e) = crate::git::commit_paths(wt, &msg, &paths) {
         return BranchCleanStatus::Failed(format!("commit failed: {e}"));
     }
-    if push {
-        let pushed = match remote {
-            // Remote-tracking clean: push exactly this branch to its remote.
-            Some(r) => crate::git::force_push_with_lease_to(wt, r, local_name),
-            // Local branch: the worktree's current branch pushes to its own upstream.
-            None => crate::git::force_push_with_lease(wt),
-        };
-        if let Err(e) = pushed {
-            return BranchCleanStatus::Failed(format!("push failed: {e}"));
-        }
+
+    let cleaned = |pushed| BranchCleanStatus::Cleaned { backup_ref: backup_ref.to_string(), pushed };
+    if !push {
+        // Push not requested: clean + commit locally only.
+        return cleaned(false);
     }
-    BranchCleanStatus::Cleaned { backup_ref: plan.backup_ref.clone() }
+
+    // Push requested: force-push exactly one branch (an explicit refspec, never a bare
+    // `--force-with-lease` which under push.default=matching would push every branch).
+    match mode {
+        CleanMode::RemoteTracking { remote, leaf, .. } => {
+            let refspec = format!("HEAD:refs/heads/{leaf}");
+            match crate::git::force_push_with_lease_to(wt, remote, &refspec) {
+                Ok(()) => cleaned(true),
+                Err(e) => BranchCleanStatus::Failed(format!("push failed: {e}")),
+            }
+        }
+        CleanMode::Local => match crate::git::branch_remote(wt, &plan.branch) {
+            Some(remote) => {
+                let refspec = format!("HEAD:refs/heads/{}", plan.branch);
+                match crate::git::force_push_with_lease_to(wt, &remote, &refspec) {
+                    Ok(()) => cleaned(true),
+                    Err(e) => BranchCleanStatus::Failed(format!("push failed: {e}")),
+                }
+            }
+            // No upstream: the tip is cleaned + committed locally, just not pushed. Soft
+            // outcome, not a failure.
+            None => cleaned(false),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -410,5 +492,131 @@ mod tests {
         assert!(!main_content.contains("rmcej%otb%"));
         let statusz = git_stdout(&repo, &["status", "--porcelain"]);
         assert!(statusz.is_empty(), "working tree should be clean: {statusz}");
+    }
+
+    /// Build a repo with an infected 'evil' branch; return (tmp, repo, infected_oid).
+    fn repo_with_infected_evil() -> (TempDir, PathBuf, String) {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "export default {};\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "clean"]);
+        git(&repo, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='8';var x='rmcej%otb%';",
+        )
+        .unwrap();
+        git(&repo, &["commit", "-q", "-am", "payload"]);
+        let infected_oid = git_stdout(&repo, &["rev-parse", "evil"]);
+        git(&repo, &["checkout", "-q", "main"]);
+        (tmp, repo, infected_oid)
+    }
+
+    #[test]
+    fn dry_run_makes_no_commits_and_no_backup_ref() {
+        let (_tmp, repo, infected_oid) = repo_with_infected_evil();
+        let packs = [strip_pack()];
+        let plans = plan_branch_cleans(&crate::scanner::deep_scan_repo(&repo, &packs), &packs, 777);
+        assert_eq!(plans.len(), 1);
+
+        // Dry run: report Planned, mutate NOTHING (no commit, no backup ref).
+        let outcomes = apply_branch_cleans(&plans, true, false);
+        assert!(matches!(outcomes[0].status, BranchCleanStatus::Planned));
+        assert_eq!(git_stdout(&repo, &["rev-parse", "evil"]), infected_oid);
+        assert!(!crate::git::verify_ref(&repo, "refs/wormward-backup/evil-777"));
+
+        // For real: it commits and creates the backup ref.
+        let outcomes = apply_branch_cleans(&plans, false, false);
+        assert!(matches!(
+            outcomes[0].status,
+            BranchCleanStatus::Cleaned { pushed: false, .. }
+        ));
+        assert_ne!(git_stdout(&repo, &["rev-parse", "evil"]), infected_oid);
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "refs/wormward-backup/evil-777"]),
+            infected_oid
+        );
+    }
+
+    #[test]
+    fn backup_ref_is_create_only_and_unique() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f.txt"), "a").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "c1"]);
+        let oid1 = git_stdout(repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("f.txt"), "b").unwrap();
+        git(repo, &["commit", "-q", "-am", "c2"]);
+        let oid2 = git_stdout(repo, &["rev-parse", "HEAD"]);
+
+        let base = "refs/wormward-backup/evil-1";
+        let r1 = create_unique_backup_ref(repo, base, &oid1).unwrap();
+        assert_eq!(r1, base);
+        // Same base, still-infected rerun: must NOT clobber; returns a fresh unique name.
+        let r2 = create_unique_backup_ref(repo, base, &oid2).unwrap();
+        assert_ne!(r2, base);
+        // The original backup ref still points at the FIRST oid — rollback target intact.
+        assert_eq!(git_stdout(repo, &["rev-parse", base]), oid1);
+        assert_eq!(git_stdout(repo, &["rev-parse", &r2]), oid2);
+    }
+
+    #[test]
+    fn remote_tracking_clean_leaves_no_lingering_local_branch() {
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("origin.git");
+        let work = tmp.path().join("work");
+        Command::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("postcss.config.mjs"), "export default {};\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "clean"]);
+        git(&work, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&work, &["push", "-q", "-u", "origin", "main"]);
+        // Infected 'evil' pushed to origin, then the LOCAL evil branch is dropped so only the
+        // remote-tracking ref refs/remotes/origin/evil remains.
+        git(&work, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(
+            work.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='8';var x='rmcej%otb%';",
+        )
+        .unwrap();
+        git(&work, &["commit", "-q", "-am", "payload"]);
+        git(&work, &["push", "-q", "-u", "origin", "evil"]);
+        git(&work, &["checkout", "-q", "main"]);
+        git(&work, &["branch", "-D", "evil"]);
+        assert!(!crate::git::verify_ref(&work, "refs/heads/evil"));
+
+        let plans = vec![BranchCleanPlan {
+            repo: work.clone(),
+            branch: "origin/evil".into(),
+            backup_ref: "refs/wormward-backup/origin/evil-1".into(),
+            actions: vec![RemediationAction::StripPayload {
+                file: PathBuf::from("postcss.config.mjs"),
+                markers: vec!["global['!']=".into()],
+            }],
+        }];
+        let outcomes = apply_branch_cleans(&plans, false, true);
+        assert!(
+            matches!(outcomes[0].status, BranchCleanStatus::Cleaned { pushed: true, .. }),
+            "expected Cleaned+pushed, got {:?}",
+            outcomes[0].status
+        );
+
+        // No real-named local branch was left behind, and the throwaway is gone.
+        assert!(!crate::git::verify_ref(&work, "refs/heads/evil"));
+        let branches = git_stdout(&work, &["branch", "--list", "wormward-clean-*"]);
+        assert!(branches.is_empty(), "throwaway branch lingered: {branches}");
+
+        // Origin's 'evil' branch is now clean.
+        let remote_content = git_stdout(&remote, &["show", "evil:postcss.config.mjs"]);
+        assert!(!remote_content.contains("rmcej%otb%"), "remote still infected: {remote_content}");
+        // Backup ref preserved locally for rollback.
+        assert!(crate::git::verify_ref(&work, "refs/wormward-backup/origin/evil-1"));
     }
 }
