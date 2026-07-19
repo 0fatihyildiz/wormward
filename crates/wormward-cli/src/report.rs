@@ -110,6 +110,26 @@ pub fn render_github_json(outcomes: &[wormward_github::pipeline::RepoOutcome]) -
     serde_json::to_string_pretty(outcomes).unwrap_or_else(|_| "[]".into())
 }
 
+/// Render the read-only account-persistence audit findings as their own section. They are
+/// advisory (`remediable = false`): each line says what to review/rotate, never an auto-fix.
+pub fn render_audit_text(findings: &[wormward_core::Finding]) -> String {
+    let mut out = String::new();
+    out.push_str("\n== Account audit (read-only; advisory) ==\n");
+    if findings.is_empty() {
+        out.push_str("  no account findings.\n");
+        return out;
+    }
+    for f in findings {
+        out.push_str(&format!(
+            "  [{}] {} — {}\n",
+            severity_tag(&f.severity),
+            f.repo.display(), // "github:account" or "github:owner/repo"
+            f.evidence,
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +200,28 @@ mod tests {
         let mut r = report_with_finding();
         r.findings[0].git_ref = Some("origin/evil".into());
         assert!(render_text(&r).contains("(branch: origin/evil)"));
+    }
+
+    #[test]
+    fn renders_account_audit_section() {
+        let findings = vec![Finding {
+            campaign: "account-audit".into(),
+            severity: Severity::High,
+            repo: PathBuf::from("github:account"),
+            file: None,
+            signature_id: "account:token-scope".into(),
+            kind: FindingKind::AccountAudit,
+            evidence: "over-privileged scopes (admin:public_key) — rotate first".into(),
+            remediable: false,
+            online: None,
+            git_ref: None,
+        }];
+        let text = render_audit_text(&findings);
+        assert!(text.contains("Account audit"));
+        assert!(text.contains("[HIGH]"));
+        assert!(text.contains("github:account"));
+        assert!(text.contains("admin:public_key"));
+        assert!(render_audit_text(&[]).contains("no account findings"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+pub mod audit;
 pub mod pipeline;
 pub mod api_tree;
 
@@ -91,6 +92,58 @@ pub trait RepoHost: Sync {
     fn get_blob(&self, full_name: &str, blob_sha: &str) -> Result<Option<String>, GithubError>;
 }
 
+// ---- Account-audit host abstraction (read-only) ----------------------------------------
+
+/// An SSH / GPG / deploy key on the account or a repo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountKey {
+    pub id: String,
+    pub title: String,
+    pub created_at: Option<String>,
+    /// Deploy keys only: whether the key is read-only (a writable deploy key is a stronger tell).
+    pub read_only: Option<bool>,
+}
+
+/// A repository webhook.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Webhook {
+    pub id: String,
+    pub url: String,
+    pub events: Vec<String>,
+    pub active: bool,
+}
+
+/// A self-hosted Actions runner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Runner {
+    pub id: String,
+    pub name: String,
+    pub os: String,
+}
+
+/// A GitHub App installed on the account.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Installation {
+    pub app_slug: String,
+    pub id: String,
+}
+
+/// Read-only account-persistence surface: the artifacts a supply-chain backdoor leaves behind.
+/// Separate from [`RepoHost`] (repo scanning) so each stays focused; `GitHubHost` implements both.
+/// Every method may fail independently — the audit degrades gracefully, never sending the token
+/// anywhere but the configured API host.
+pub trait AccountHost: Sync {
+    /// The classic scopes of the token in use (from the `X-OAuth-Scopes` response header). An
+    /// empty vec means the header was absent — typically a fine-grained token with no classic scopes.
+    fn token_scopes(&self) -> Result<Vec<String>, GithubError>;
+    fn list_ssh_keys(&self) -> Result<Vec<AccountKey>, GithubError>;
+    fn list_gpg_keys(&self) -> Result<Vec<AccountKey>, GithubError>;
+    fn list_installations(&self) -> Result<Vec<Installation>, GithubError>;
+    fn list_repo_webhooks(&self, full_name: &str) -> Result<Vec<Webhook>, GithubError>;
+    fn list_repo_deploy_keys(&self, full_name: &str) -> Result<Vec<AccountKey>, GithubError>;
+    fn list_repo_runners(&self, full_name: &str) -> Result<Vec<Runner>, GithubError>;
+}
+
 pub struct GitHubHost {
     pub token: String,
     pub base_url: String,
@@ -136,7 +189,10 @@ impl GitHubHost {
     /// API authority — a malicious or buggy URL pointing elsewhere must not receive our
     /// credentials. Distinguishes rate limiting (fatal for the run) from other HTTP
     /// failures (per-repo).
-    fn get(&self, url: &str) -> Result<(Option<String>, String), GithubError> {
+    /// GET `url` with auth headers, returning the raw response (headers intact) so callers can
+    /// read `Link`, `X-OAuth-Scopes`, etc. Only ever sends the bearer token to the configured
+    /// API authority+scheme; distinguishes rate limiting (fatal) from other HTTP failures.
+    fn call(&self, url: &str) -> Result<ureq::Response, GithubError> {
         let base_authority = url_authority(&self.base_url)
             .ok_or_else(|| GithubError::Http(format!("invalid base_url: {}", self.base_url)))?;
         // Match SCHEME as well as authority: an `http://` next-link to the same host must
@@ -155,11 +211,7 @@ impl GitHubHost {
             .set("Accept", "application/vnd.github+json")
             .call()
         {
-            Ok(resp) => {
-                let link = resp.header("Link").map(|s| s.to_string());
-                let body = resp.into_string().map_err(|e| GithubError::Http(e.to_string()))?;
-                Ok((link, body))
-            }
+            Ok(resp) => Ok(resp),
             // 429, or 403 with the quota actually exhausted, is a rate limit — fatal for
             // the run. A plain 403 (permissions) stays a per-repo Http error.
             Err(ureq::Error::Status(code, resp))
@@ -170,6 +222,13 @@ impl GitHubHost {
             }
             Err(e) => Err(GithubError::Http(e.to_string())),
         }
+    }
+
+    fn get(&self, url: &str) -> Result<(Option<String>, String), GithubError> {
+        let resp = self.call(url)?;
+        let link = resp.header("Link").map(|s| s.to_string());
+        let body = resp.into_string().map_err(|e| GithubError::Http(e.to_string()))?;
+        Ok((link, body))
     }
 
     /// Follow Link: rel="next" pagination, bounded by MAX_PAGES.
@@ -303,6 +362,161 @@ impl RepoHost for GitHubHost {
             .decode(compact)
             .map_err(|e| GithubError::Parse(format!("blob base64: {e}")))?;
         Ok(String::from_utf8(bytes).ok()) // None for binary blobs, like GitTree::read
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApiSshKey {
+    id: i64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct ApiGpgKey {
+    id: i64,
+    #[serde(default)]
+    key_id: String,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+#[derive(serde::Deserialize)]
+struct ApiDeployKey {
+    id: i64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    read_only: Option<bool>,
+}
+#[derive(serde::Deserialize)]
+struct ApiHookConfig {
+    #[serde(default)]
+    url: String,
+}
+#[derive(serde::Deserialize)]
+struct ApiHook {
+    id: i64,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    events: Vec<String>,
+    config: ApiHookConfig,
+}
+#[derive(serde::Deserialize)]
+struct ApiRunner {
+    id: i64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    os: String,
+}
+#[derive(serde::Deserialize)]
+struct ApiRunnersResp {
+    #[serde(default)]
+    runners: Vec<ApiRunner>,
+}
+#[derive(serde::Deserialize)]
+struct ApiInstallation {
+    id: i64,
+    #[serde(default)]
+    app_slug: String,
+}
+#[derive(serde::Deserialize)]
+struct ApiInstallationsResp {
+    #[serde(default)]
+    installations: Vec<ApiInstallation>,
+}
+
+impl AccountHost for GitHubHost {
+    fn token_scopes(&self) -> Result<Vec<String>, GithubError> {
+        // The classic scopes are advertised on any authenticated response header.
+        let resp = self.call(&format!("{}/user", self.base_url))?;
+        let raw = resp.header("X-OAuth-Scopes").unwrap_or("").to_string();
+        Ok(raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+    }
+
+    fn list_ssh_keys(&self) -> Result<Vec<AccountKey>, GithubError> {
+        let keys: Vec<ApiSshKey> =
+            self.get_paginated(format!("{}/user/keys?per_page=100&page=1", self.base_url))?;
+        Ok(keys
+            .into_iter()
+            .map(|k| AccountKey {
+                id: k.id.to_string(),
+                title: k.title,
+                created_at: k.created_at,
+                read_only: None,
+            })
+            .collect())
+    }
+
+    fn list_gpg_keys(&self) -> Result<Vec<AccountKey>, GithubError> {
+        let keys: Vec<ApiGpgKey> =
+            self.get_paginated(format!("{}/user/gpg_keys?per_page=100&page=1", self.base_url))?;
+        Ok(keys
+            .into_iter()
+            .map(|k| AccountKey {
+                id: k.id.to_string(),
+                title: k.key_id,
+                created_at: k.created_at,
+                read_only: None,
+            })
+            .collect())
+    }
+
+    fn list_installations(&self) -> Result<Vec<Installation>, GithubError> {
+        // `/user/installations` wraps the array in an object; a single page suffices for the audit.
+        let (_, body) = self.get(&format!("{}/user/installations?per_page=100", self.base_url))?;
+        let resp: ApiInstallationsResp =
+            serde_json::from_str(&body).map_err(|e| GithubError::Parse(e.to_string()))?;
+        Ok(resp
+            .installations
+            .into_iter()
+            .map(|i| Installation { app_slug: i.app_slug, id: i.id.to_string() })
+            .collect())
+    }
+
+    fn list_repo_webhooks(&self, full_name: &str) -> Result<Vec<Webhook>, GithubError> {
+        let hooks: Vec<ApiHook> = self
+            .get_paginated(format!("{}/repos/{full_name}/hooks?per_page=100&page=1", self.base_url))?;
+        Ok(hooks
+            .into_iter()
+            .map(|h| Webhook {
+                id: h.id.to_string(),
+                url: h.config.url,
+                events: h.events,
+                active: h.active,
+            })
+            .collect())
+    }
+
+    fn list_repo_deploy_keys(&self, full_name: &str) -> Result<Vec<AccountKey>, GithubError> {
+        let keys: Vec<ApiDeployKey> = self
+            .get_paginated(format!("{}/repos/{full_name}/keys?per_page=100&page=1", self.base_url))?;
+        Ok(keys
+            .into_iter()
+            .map(|k| AccountKey {
+                id: k.id.to_string(),
+                title: k.title,
+                created_at: k.created_at,
+                read_only: k.read_only,
+            })
+            .collect())
+    }
+
+    fn list_repo_runners(&self, full_name: &str) -> Result<Vec<Runner>, GithubError> {
+        // `/actions/runners` wraps the array in an object; a single page suffices for the audit.
+        let (_, body) =
+            self.get(&format!("{}/repos/{full_name}/actions/runners?per_page=100", self.base_url))?;
+        let resp: ApiRunnersResp =
+            serde_json::from_str(&body).map_err(|e| GithubError::Parse(e.to_string()))?;
+        Ok(resp
+            .runners
+            .into_iter()
+            .map(|r| Runner { id: r.id.to_string(), name: r.name, os: r.os })
+            .collect())
     }
 }
 
@@ -597,5 +811,90 @@ mod tests {
         });
         let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
         assert!(matches!(host.list_branches("me/a"), Err(GithubError::Http(_))));
+    }
+
+    // ---- account audit host ----
+    #[test]
+    fn token_scopes_parsed_from_header() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/user");
+            then.status(200)
+                .header("X-OAuth-Scopes", "repo, admin:public_key, workflow")
+                .json_body(serde_json::json!({"login": "me"}));
+        });
+        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        assert_eq!(
+            host.token_scopes().unwrap(),
+            vec!["repo".to_string(), "admin:public_key".into(), "workflow".into()]
+        );
+    }
+
+    #[test]
+    fn token_scopes_empty_when_header_absent() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/user");
+            then.status(200).json_body(serde_json::json!({"login": "me"}));
+        });
+        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        assert!(host.token_scopes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lists_ssh_keys() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/user/keys");
+            then.status(200).json_body(serde_json::json!([
+                {"id": 1, "title": "laptop", "key": "ssh-ed25519 AAAA", "created_at": "2020-01-01T00:00:00Z"},
+                {"id": 2, "title": "backdoor", "key": "ssh-rsa BBBB"}
+            ]));
+        });
+        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let keys = host.list_ssh_keys().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].id, "1");
+        assert_eq!(keys[0].title, "laptop");
+        assert_eq!(keys[0].created_at.as_deref(), Some("2020-01-01T00:00:00Z"));
+        assert_eq!(keys[1].created_at, None);
+    }
+
+    #[test]
+    fn lists_repo_runners_from_wrapped_object() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/me/a/actions/runners");
+            then.status(200).json_body(serde_json::json!({
+                "total_count": 1,
+                "runners": [{"id": 7, "name": "SHA1HULUD", "os": "Linux"}]
+            }));
+        });
+        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        assert_eq!(
+            host.list_repo_runners("me/a").unwrap(),
+            vec![Runner { id: "7".into(), name: "SHA1HULUD".into(), os: "Linux".into() }]
+        );
+    }
+
+    #[test]
+    fn lists_repo_webhooks_with_config_url() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/me/a/hooks");
+            then.status(200).json_body(serde_json::json!([
+                {"id": 5, "active": true, "events": ["push"], "config": {"url": "https://evil.host/collect"}}
+            ]));
+        });
+        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        assert_eq!(
+            host.list_repo_webhooks("me/a").unwrap(),
+            vec![Webhook {
+                id: "5".into(),
+                url: "https://evil.host/collect".into(),
+                events: vec!["push".into()],
+                active: true,
+            }]
+        );
     }
 }

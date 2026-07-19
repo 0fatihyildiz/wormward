@@ -22,6 +22,9 @@ pub enum FindingKind {
     GitReflog,
     Analyzer,
     Capability,
+    /// A GitHub account-persistence finding (over-privileged token, injected SSH key, rogue
+    /// self-hosted runner, exfil webhook, …) — surfaced by the read-only account audit.
+    AccountAudit,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,6 +72,12 @@ mod tests {
     fn capability_kind_serializes() {
         let json = serde_json::to_string(&FindingKind::Capability).unwrap();
         assert_eq!(json, "\"capability\"");
+    }
+
+    #[test]
+    fn account_audit_kind_serializes() {
+        let json = serde_json::to_string(&FindingKind::AccountAudit).unwrap();
+        assert_eq!(json, "\"account_audit\"");
     }
 
     fn sample_finding(online: Option<OnlineVerdict>) -> Finding {

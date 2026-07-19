@@ -116,6 +116,14 @@ enum Command {
         /// Omit to scan every org you belong to.
         #[arg(long = "org")]
         org: Vec<String>,
+        /// Also run the read-only account-persistence audit (token scopes, SSH/GPG keys, app
+        /// installations, per-repo webhooks/deploy-keys/runners). Runs automatically before a push.
+        #[arg(long)]
+        audit: bool,
+        /// Assert you have rotated a potentially-stolen credential — overrides the fail-closed
+        /// rotate-first gate that otherwise refuses to push when the audit flags a persistence risk.
+        #[arg(long = "i-rotated")]
+        i_rotated: bool,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -559,7 +567,19 @@ fn main() -> ExitCode {
             }
             ExitCode::from(0)
         }
-        Command::Github { token, clone_dir, include_forks, fix, push, yes, all, org, format } => {
+        Command::Github {
+            token,
+            clone_dir,
+            include_forks,
+            fix,
+            push,
+            yes,
+            all,
+            org,
+            audit,
+            i_rotated,
+            format,
+        } => {
             // --push and --fix are destructive; require explicit --yes to write.
             if push && !yes {
                 eprintln!("refusing to force-push without --yes (destructive). Re-run with --yes to confirm.");
@@ -629,6 +649,35 @@ fn main() -> ExitCode {
                 }
             };
 
+            // Account-persistence audit + rotate-first gate. Run when --audit, or automatically
+            // before any real push — a stolen credential plus account persistence (over-privileged
+            // token, injected key, rogue runner) is the re-infection vector, so pushing a cleaned
+            // repo with the same token just re-opens the loop.
+            let will_push = opts.yes && opts.fix && opts.push;
+            let account_audit = if audit || will_push {
+                let infected: Vec<wormward_github::RepoRef> = scan
+                    .repos()
+                    .iter()
+                    .filter(|sr| sr.is_infected())
+                    .map(|sr| sr.repo.clone())
+                    .collect();
+                Some(wormward_github::audit::audit_account(&host, &infected))
+            } else {
+                None
+            };
+            // Fail-closed: a blocked audit refuses the push unless the user asserts --i-rotated.
+            if let Some(a) = &account_audit {
+                if will_push && a.blocked && !i_rotated {
+                    eprintln!(
+                        "\nRefusing to push: the account audit flagged a persistence risk (below).\n\
+                         Rotate your GitHub token (revoke the old one), review the flagged keys/\n\
+                         runners/webhooks, then re-run with a fresh minimal-scope token — or pass\n\
+                         --i-rotated to override."
+                    );
+                    opts.yes = false; // downgrade to a dry-run: report, write nothing, push nothing
+                }
+            }
+
             // Selection only matters when we will actually write (fix/push + yes). A
             // dry-run never prompts. Only offer repos that `fix_pass` can actually
             // remediate (a working-tree action on the default branch); repos infected
@@ -667,10 +716,22 @@ fn main() -> ExitCode {
                 selected.as_ref(),
             );
             match format {
-                OutputFormat::Text => print!("{}", report::render_github_text(&outcomes, writes)),
-                OutputFormat::Json => println!("{}", report::render_github_json(&outcomes)),
+                OutputFormat::Text => {
+                    print!("{}", report::render_github_text(&outcomes, writes));
+                    if let Some(a) = &account_audit {
+                        print!("{}", report::render_audit_text(&a.findings));
+                    }
+                }
+                OutputFormat::Json => match &account_audit {
+                    Some(a) => {
+                        let v = serde_json::json!({ "repos": &outcomes, "account_audit": &a.findings });
+                        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+                    }
+                    None => println!("{}", report::render_github_json(&outcomes)),
+                },
             }
-            ExitCode::from(github_exit_code(&outcomes))
+            let audit_blocked = account_audit.as_ref().is_some_and(|a| a.blocked);
+            ExitCode::from(github_exit_code(&outcomes).max(u8::from(audit_blocked)))
         }
     }
 }
