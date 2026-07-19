@@ -67,8 +67,9 @@
 <section class="card">
   <h2>GitHub account</h2>
   <p class="muted">
-    Scan the token owner's repositories: each is scanned read-only via the GitHub API, with
-    no clones. Fixing a repo <strong>force-pushes</strong> the cleaned history back to GitHub.
+    Scan repositories you own and repositories in your organizations: each is scanned
+    read-only via the GitHub API, with no clones. Fixing a repo
+    <strong>force-pushes</strong> the cleaned history back to GitHub.
   </p>
   <div class="row">
     <input

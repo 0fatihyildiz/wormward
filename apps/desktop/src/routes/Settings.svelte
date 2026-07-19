@@ -44,7 +44,8 @@
 <section class="card">
   <h2>GitHub token</h2>
   <p class="muted">
-    Used by the GitHub screen to enumerate and fix your repositories. Leave blank to fall back to
+    Used by the GitHub screen to enumerate and fix repositories you own or belong to via an
+    organization. Leave blank to fall back to
     <code>gh auth token</code> / <code>GITHUB_TOKEN</code> / <code>GH_TOKEN</code>. Stored locally
     in this app only.
   </p>

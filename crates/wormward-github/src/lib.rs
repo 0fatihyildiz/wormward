@@ -214,7 +214,14 @@ const MAX_PAGES: usize = 1000;
 
 impl RepoHost for GitHubHost {
     fn list_repos(&self, include_forks: bool) -> Result<Vec<RepoRef>, GithubError> {
-        let url = format!("{}/user/repos?affiliation=owner&per_page=100&page=1", self.base_url);
+        // Include repos in orgs the user belongs to, not just owned repos, so an org's
+        // infected repos are scanned too. `organization_member` covers "org repos I'm a
+        // part of"; `owner` keeps personal repos. Outside-collaborator repos are
+        // intentionally excluded (narrower, avoids sweeping unrelated repos).
+        let url = format!(
+            "{}/user/repos?affiliation=owner,organization_member&per_page=100&page=1",
+            self.base_url
+        );
         let mut all: Vec<RepoRef> = self.get_paginated(url)?;
         if !include_forks {
             all.retain(|r| !r.fork);
@@ -285,11 +292,16 @@ mod tests {
         let server = MockServer::start();
         let next = format!("<{}/user/repos?page=2>; rel=\"next\"", server.base_url());
         server.mock(|when, then| {
-            when.method(GET).path("/user/repos").query_param("page", "1");
+            // Assert the first request asks for owned AND org-member repos, not owner-only.
+            when.method(GET)
+                .path("/user/repos")
+                .query_param("page", "1")
+                .query_param("affiliation", "owner,organization_member");
             then.status(200)
                 .header("Link", next.as_str())
                 .json_body(serde_json::json!([
                     {"full_name":"me/a","clone_url":"https://x/a.git","default_branch":"main","fork":false},
+                    {"full_name":"org/repo","clone_url":"https://x/o.git","default_branch":"main","fork":false},
                     {"full_name":"me/forked","clone_url":"https://x/f.git","default_branch":"main","fork":true}
                 ]));
         });
@@ -303,7 +315,8 @@ mod tests {
         let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
         let repos = host.list_repos(false).unwrap();
         let names: Vec<&str> = repos.iter().map(|r| r.full_name.as_str()).collect();
-        assert_eq!(names, vec!["me/a", "me/b"]); // fork filtered out, both pages merged
+        // owned + org-member repos across both pages; the fork is filtered out.
+        assert_eq!(names, vec!["me/a", "org/repo", "me/b"]);
     }
 
     #[test]

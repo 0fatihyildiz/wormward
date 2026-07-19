@@ -339,7 +339,8 @@ pub struct GithubFixView {
     manual_review: bool,
 }
 
-/// Enumerate + API-scan (no clones) the token owner's GitHub repos (read-only), stash the
+/// Enumerate + API-scan (no clones) the token owner's GitHub repos and repos in their orgs
+/// (read-only), stash the
 /// findings in managed state for a later fix, and return a view of the infected repos. Token:
 /// explicit (non-empty) or resolved from `gh auth token`/`GITHUB_TOKEN`/`GH_TOKEN` when blank.
 #[tauri::command]

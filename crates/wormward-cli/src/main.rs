@@ -88,7 +88,7 @@ enum Command {
         #[arg(default_value = ".")]
         dirs: Vec<PathBuf>,
     },
-    /// Scan (and optionally remediate) every repo on the logged-in GitHub account.
+    /// Scan (and optionally remediate) every repo you own or belong to via an organization.
     Github {
         /// GitHub token (else GITHUB_TOKEN/GH_TOKEN, else `gh auth token`).
         #[arg(long)]
