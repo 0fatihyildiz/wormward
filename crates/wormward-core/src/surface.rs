@@ -140,7 +140,7 @@ fn derived_re() -> &'static Regex {
     // (`setup_bun.js`), `./`-relative, or nested (`dist/x.mjs`).
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?:^|[\s;&|])(?:node|bun|ts-node|tsx)\s+(?:--?\S+\s+)*['"]?((?:\.?/)?[\w.@-][\w./@-]*\.(?:c|m)?js)"#,
+            r#"(?:^|[\s;&|])(?:node|bun|ts-node|tsx)\s+(?:--?\S+\s+)*['"]?((?:\.?[\\/])?[\w.@-][\w.\\/@-]*\.(?:c|m)?js)"#,
         )
         .unwrap()
     })
@@ -148,10 +148,11 @@ fn derived_re() -> &'static Regex {
 
 /// Find local `node ./X.js` targets in an auto-run command / workflow step /
 /// tasks.json body. The one hop that lets the engine reach a dropped payload.
+/// Windows backslash paths are normalized to `/`.
 pub fn derived_targets(command: &str) -> Vec<String> {
     derived_re()
         .captures_iter(command)
-        .map(|c| c[1].trim_start_matches("./").to_string())
+        .map(|c| c[1].replace('\\', "/").trim_start_matches("./").to_string())
         .collect()
 }
 
@@ -234,5 +235,10 @@ mod tests {
         assert_eq!(derived_targets("bun ./scripts/x.mjs && echo ok"), vec!["scripts/x.mjs"]);
         assert!(derived_targets("node --version").is_empty());
         assert!(derived_targets("vite build").is_empty());
+    }
+
+    #[test]
+    fn derived_targets_windows_backslash() {
+        assert_eq!(derived_targets(r"node .\dist\setup_bun.js"), vec!["dist/setup_bun.js"]);
     }
 }

@@ -153,7 +153,11 @@ fn github_exit_code(outcomes: &[wormward_github::pipeline::RepoOutcome]) -> u8 {
             any_error = true;
         }
         if !o.findings.is_empty() {
-            let resolved = o.error.is_none() && !o.pushed.is_empty();
+            // Resolved only if a fix was pushed AND no non-remediable finding survives.
+            // Capability (campaign="generic"), npm, ioc and branch-only findings are never
+            // auto-fixed, so a push alone must not mark the repo clean.
+            let resolved =
+                o.error.is_none() && !o.pushed.is_empty() && o.findings.iter().all(|f| f.remediable);
             if !resolved {
                 any_unresolved = true;
             }
@@ -294,6 +298,9 @@ fn main() -> ExitCode {
                 findings: Vec<wormward_core::Finding>,
                 plan: wormward_core::RemediationPlan,
                 branch_plans: Vec<wormward_core::BranchCleanPlan>,
+                // Branch-tip findings that no clean action covers (non-remediable, e.g.
+                // capability findings on a non-default branch) — surfaced, never cleaned.
+                branch_manual: Vec<wormward_core::Finding>,
             }
             let mut works: Vec<RepoWork> = Vec::new();
             for dir in &dirs {
@@ -301,15 +308,24 @@ fn main() -> ExitCode {
                     let findings = scan_repo(&repo, &packs);
                     let plan = plan_remediation(&findings, &packs);
                     // Cross-branch: plan cleans for infected tips of other branches.
-                    let branch_plans = if all_branches {
-                        plan_branch_cleans(&deep_scan_repo(&repo, &packs), &packs, now_secs())
+                    let deep = if all_branches {
+                        deep_scan_repo(&repo, &packs)
                     } else {
                         Vec::new()
                     };
-                    if plan.actions.is_empty() && plan.manual.is_empty() && branch_plans.is_empty() {
+                    let branch_plans = plan_branch_cleans(&deep, &packs, now_secs());
+                    let branch_manual: Vec<wormward_core::Finding> = deep
+                        .into_iter()
+                        .filter(|f| f.git_ref.is_some() && !f.remediable)
+                        .collect();
+                    if plan.actions.is_empty()
+                        && plan.manual.is_empty()
+                        && branch_plans.is_empty()
+                        && branch_manual.is_empty()
+                    {
                         continue;
                     }
-                    works.push(RepoWork { repo, findings, plan, branch_plans });
+                    works.push(RepoWork { repo, findings, plan, branch_plans, branch_manual });
                 }
             }
 
@@ -341,6 +357,19 @@ fn main() -> ExitCode {
                         println!("    would {}", describe_action(a));
                     }
                     total_actions += bp.actions.len();
+                }
+                for m in &w.branch_manual {
+                    let file = m
+                        .file
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    let branch = m
+                        .git_ref
+                        .as_deref()
+                        .map(|r| format!(" (branch: {r})"))
+                        .unwrap_or_default();
+                    println!("  manual: {} {}{} — {}", m.campaign, file, branch, m.evidence);
                 }
             }
 
@@ -396,8 +425,9 @@ fn main() -> ExitCode {
                     continue;
                 }
                 let repo = &w.repo;
-                // Working-tree findings that need manual handling are never auto-fixed.
-                if !w.plan.manual.is_empty() {
+                // Findings that need manual handling are never auto-fixed — whether in the
+                // working tree or on a non-default branch tip (e.g. capability findings).
+                if !w.plan.manual.is_empty() || !w.branch_manual.is_empty() {
                     total_unresolved += 1;
                 }
                 let res = apply(repo, &w.plan.actions, !no_backup);
@@ -681,6 +711,19 @@ mod tests {
         let mut o = outcome(vec![finding()], None);
         o.pushed = vec!["main".into()];
         assert_eq!(github_exit_code(&[o]), 0);
+    }
+
+    #[test]
+    fn push_with_surviving_non_remediable_finding_exits_1() {
+        // A remediable pack finding is fixed and pushed, but a non-remediable capability
+        // finding survives on origin's default branch → NOT resolved (regression guard).
+        let mut cap = finding();
+        cap.kind = FindingKind::Capability;
+        cap.campaign = "generic".into();
+        cap.remediable = false;
+        let mut o = outcome(vec![finding(), cap], None);
+        o.pushed = vec!["main".into()];
+        assert_eq!(github_exit_code(&[o]), 1);
     }
 
     #[test]

