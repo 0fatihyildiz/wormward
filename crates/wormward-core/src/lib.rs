@@ -1,3 +1,4 @@
+pub mod engine;
 pub mod finding;
 pub mod git;
 pub mod matchers;
@@ -7,6 +8,7 @@ pub mod repo_files;
 pub mod scanner;
 pub mod walk;
 
+pub use engine::{SigHit, SignatureEngine};
 pub use finding::{Finding, FindingKind, OnlineVerdict, Severity};
 pub use git::{amend_head, commit_paths, force_push_with_lease, push, reflog_has_amend};
 pub use matchers::{sha256_hex, signature_matches, ContentSignature, SignatureKind};

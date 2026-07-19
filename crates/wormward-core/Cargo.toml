@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aho-corasick = { workspace = true }
+ignore = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 regex = { workspace = true }
