@@ -136,14 +136,30 @@ fn describe_action(a: &wormward_core::RemediationAction) -> String {
     }
 }
 
-/// Exit code for the `github` command. Findings take precedence over per-repo errors:
-/// a detected infection must surface as exit 1 even if another repo failed to process.
-/// Only a clean-but-errored run exits 2. (Auth/enumeration failures before `run` are
-/// handled separately and also exit 2.)
+/// Exit code for the `github` command, per the unified scan/clean/github convention:
+///   0 — no findings, or every infected repo was actually remediated (fixed AND persisted).
+///   1 — unresolved findings remain: a dry-run that found infections, a fix that failed or
+///       could not persist (temp clone / no push), or manual/branch-only findings.
+///   2 — a repo errored and no unresolved findings remain to take precedence over it.
+/// A repo's findings only count as "resolved" when the cleaned default branch was actually
+/// force-pushed back to origin with no error; a local-only clone or a dry-run leaves origin
+/// infected, so it stays unresolved. (Auth/enumeration failures before the run are handled
+/// separately and also exit 2.)
 fn github_exit_code(outcomes: &[wormward_github::pipeline::RepoOutcome]) -> u8 {
-    let any_findings = outcomes.iter().any(|o| !o.findings.is_empty());
-    let any_error = outcomes.iter().any(|o| o.error.is_some());
-    if any_findings {
+    let mut any_unresolved = false;
+    let mut any_error = false;
+    for o in outcomes {
+        if o.error.is_some() {
+            any_error = true;
+        }
+        if !o.findings.is_empty() {
+            let resolved = o.error.is_none() && !o.pushed.is_empty();
+            if !resolved {
+                any_unresolved = true;
+            }
+        }
+    }
+    if any_unresolved {
         1
     } else if any_error {
         2
@@ -328,13 +344,17 @@ fn main() -> ExitCode {
                 }
             }
 
-            // A pure dry-run lists the plan and never prompts or writes.
+            // A pure dry-run lists the plan and never prompts or writes. Any findings at all —
+            // auto-fixable, manual, or branch-tip — leave infections unresolved, so exit 1
+            // whenever a repo made it into `works` (which only holds repos with findings).
             if !do_apply {
                 if total_actions > 0 {
                     println!("\nDry run — re-run with --apply to make these changes.");
-                    return ExitCode::from(1);
                 }
-                return ExitCode::from(0);
+                if works.is_empty() {
+                    return ExitCode::from(0);
+                }
+                return ExitCode::from(1);
             }
 
             // Which repos have something to auto-fix (working-tree actions or branch cleans)?
@@ -364,13 +384,22 @@ fn main() -> ExitCode {
                 fixable.into_iter().collect()
             };
 
-            // Phase 2: apply only to the selected repos.
+            // Phase 2: apply only to the selected repos. `total_unresolved` tracks infections
+            // that remain after the run (deselected repos, manual findings, un-cleaned
+            // branch tips) so the exit code is 1 whenever anything is left unfixed.
             let mut total_failed = 0usize;
+            let mut total_unresolved = 0usize;
             for (i, w) in works.iter().enumerate() {
                 if !selected.contains(&i) {
+                    // Left alone by the user: its findings remain unresolved.
+                    total_unresolved += 1;
                     continue;
                 }
                 let repo = &w.repo;
+                // Working-tree findings that need manual handling are never auto-fixed.
+                if !w.plan.manual.is_empty() {
+                    total_unresolved += 1;
+                }
                 let res = apply(repo, &w.plan.actions, !no_backup);
                 for (a, e) in &res.skipped {
                     eprintln!("  skipped {}: {}", describe_action(a), e);
@@ -436,21 +465,26 @@ fn main() -> ExitCode {
                                 backup_ref
                             ),
                             BranchCleanStatus::Skipped(why) => {
-                                println!("  branch {}: skipped — {why}", o.plan.branch)
+                                // e.g. a remote-tracking tip that needs --push: still infected.
+                                println!("  branch {}: skipped — {why}", o.plan.branch);
+                                total_unresolved += 1;
                             }
                             BranchCleanStatus::Failed(why) => {
                                 eprintln!("  branch {}: failed — {why}", o.plan.branch);
                                 total_failed += 1;
                             }
-                            BranchCleanStatus::Planned => println!(
-                                "  branch {}: planned (re-run with --yes to clean and commit)",
-                                o.plan.branch
-                            ),
+                            BranchCleanStatus::Planned => {
+                                println!(
+                                    "  branch {}: planned (re-run with --yes to clean and commit)",
+                                    o.plan.branch
+                                );
+                                total_unresolved += 1;
+                            }
                         }
                     }
                 }
             }
-            if total_failed > 0 {
+            if total_failed > 0 || total_unresolved > 0 {
                 ExitCode::from(1)
             } else {
                 ExitCode::from(0)
@@ -489,7 +523,7 @@ fn main() -> ExitCode {
                 }
             };
             let host = wormward_github::GitHubHost::new(token.clone());
-            let opts = wormward_github::pipeline::GithubRunOpts {
+            let mut opts = wormward_github::pipeline::GithubRunOpts {
                 clone_dir,
                 include_forks,
                 // Pushing implies remediating.
@@ -497,6 +531,19 @@ fn main() -> ExitCode {
                 push,
                 yes,
             };
+
+            // A fix only persists if it has somewhere to land: a push target OR an explicit
+            // --clone-dir. Without either, remediation is applied+committed into a temp clone
+            // that is dropped at end of run, so nothing survives. Downgrade to a dry-run
+            // (report the plan, write nothing) so the outcome reflects reality rather than a
+            // false "applied".
+            let persistent_dest = opts.push || opts.clone_dir.is_some();
+            if opts.fix && opts.yes && !persistent_dest {
+                eprintln!(
+                    "note: --fix without --push or --clone-dir cannot persist changes (the temp clone is discarded); running as a dry-run. Re-run with --clone-dir <dir> or --push to apply."
+                );
+                opts.yes = false;
+            }
             let packs = builtin_packs();
             // Phase 1: enumerate → clone → scan (no fix), to learn which repos are infected.
             let scan = match wormward_github::pipeline::scan_pass(&opts, &host, &packs, &token) {
@@ -513,7 +560,9 @@ fn main() -> ExitCode {
             // only on other branches are still reported but not selectable. With >1 such
             // repo, let the user deselect any to leave alone; JSON output or no TTY keeps
             // all.
-            let writes = yes && (fix || push);
+            // Reflect the post-downgrade reality: `opts.yes` is cleared above when a fix
+            // cannot persist, so a non-persistent `--fix --yes` is treated as a dry-run here.
+            let writes = opts.yes && opts.fix;
             let fixable = scan.fixable_full_names(&packs);
             let selected: Option<HashSet<String>> = if writes && fixable.len() >= 2 {
                 let sel_opts = select::SelectOpts {
@@ -615,5 +664,28 @@ mod tests {
     fn clean_run_exits_0() {
         let outcomes = vec![outcome(vec![], None)];
         assert_eq!(github_exit_code(&outcomes), 0);
+    }
+
+    #[test]
+    fn dry_run_with_findings_exits_1() {
+        // Infections found but nothing was pushed (dry-run / no persistent destination):
+        // the origin is still infected, so the findings are unresolved.
+        let outcomes = vec![outcome(vec![finding()], None)];
+        assert_eq!(github_exit_code(&outcomes), 1);
+    }
+
+    #[test]
+    fn successful_fix_and_push_exits_0() {
+        // Findings fixed AND persisted to origin (force-pushed) with no error → resolved.
+        let mut o = outcome(vec![finding()], None);
+        o.pushed = vec!["main".into()];
+        assert_eq!(github_exit_code(&[o]), 0);
+    }
+
+    #[test]
+    fn per_repo_error_exits_2() {
+        // A repo failed to process (e.g. clone/auth) and left no unresolved findings.
+        let outcomes = vec![outcome(vec![], Some("clone failed".into()))];
+        assert_eq!(github_exit_code(&outcomes), 2);
     }
 }
