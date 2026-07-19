@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/wormward-core", "crates/wormward-packs", "crates/wormward-cli", "crates/wormward-osm"]
+members = ["crates/wormward-core", "crates/wormward-packs", "crates/wormward-cli", "crates/wormward-osm", "crates/wormward-github"]
 
 [workspace.package]
 edition = "2021"
