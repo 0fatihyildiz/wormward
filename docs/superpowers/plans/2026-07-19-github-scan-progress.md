@@ -25,10 +25,11 @@
 
 - **Wave A:** Task 1 alone (pipeline callback — Tasks 2 & 3 consume it; Task 4 also edits pipeline.rs, so it must not run concurrently with Task 1).
 - **Wave B (parallel, disjoint files):** Task 2 (`crates/wormward-cli/src/main.rs`) ∥ Task 4 (`pipeline.rs` tests + `crates/wormward-core/{scanner,git}.rs` + `crates/wormward-cli/tests/cli.rs`). Task 3 also touches `pipeline.rs`? No — Task 3 is GUI-only (`apps/desktop/*`), so Task 3 joins this wave too. But Task 4 edits `pipeline.rs` while Task 1's commit already landed; Task 3 does not touch `pipeline.rs`, so Task 3 ∥ Task 4 ∥ Task 2 is safe.
+- **Wave B also includes Task 6a** (`crates/wormward-core/src/remediate.rs`) — disjoint from Tasks 2/3/4's files, safe to run in parallel.
 - **Wave C:** Task 5 (`apps/desktop/src-tauri/src/lib.rs`) — must run AFTER Task 3 (both edit that file; Task 3 makes `github_scan` async, Task 5 converts the rest).
-- **Wave D:** Task 6 (the "no changes" fix) — BLOCKED until its root cause is filled in; `pipeline.rs`, so serialize it after Task 4.
+- **Wave D:** Task 6b — depends on Task 6a (uses `strip_marker_matches`) and edits `pipeline.rs` + `lib.rs` + GUI, so it runs last, after Tasks 4, 5, and 6a.
 
-Note: Tasks 1, 4, and 6 all touch `crates/wormward-github/src/pipeline.rs` — never run two of them concurrently.
+Note: Tasks 1, 4, and 6b all touch `crates/wormward-github/src/pipeline.rs`, and Tasks 3, 5, 6b all touch `apps/desktop/src-tauri/src/lib.rs` — never run two file-sharing tasks concurrently.
 
 ---
 
@@ -503,12 +504,287 @@ git commit -m "Run heavy desktop commands async so scans/fixes don't freeze the 
 
 ---
 
-### Task 6: Fix the GitHub "no changes" remediation bug
+### Task 6a: Marker-aware strip core (regex markers + match test + verify helper)
 
-**Status:** BLOCKED on root-cause investigation (`c:/tmp/github-fix-nochanges-investigation.md`).
-Do not implement until the controller fills this task in with the confirmed root cause,
-the exact file:line, the minimal fix, and a failing test that reproduces it. The
-symptom: repos the scan offered as `fixable` return `fixed:false, actions:[], error:None`
-("no changes") from `fix_pass` — the API-scan-of-default-tip and the local-scan-of-fresh-clone
-disagree about whether an action exists. The fix MUST come with a regression test in
-`crates/wormward-github/src/pipeline.rs` that reproduces the divergence before the fix.
+**Root cause (confirmed, reproduced — `c:/tmp/github-fix-nochanges-investigation.md`):**
+`action_for` (remediate.rs:58-61) emits a `StripPayload` for ANY `ContentSignature`/`Analyzer`
+finding of a campaign that has strip markers configured — it only sees the `Finding`, never
+the file, so it never checks a marker is actually present. PolinRider's detectors are broad
+(decoder regex, entropy tail, C2 addresses) but `strip_after_marker` only cuts at two
+literals. A repo flagged by a non-marker signature is offered as `fixable`, then `apply`
+(remediate.rs:140) finds no marker, skips, and `fix_scanned` returns at pipeline.rs's
+"applied empty" path with `actions:[], error:None` → GUI "no changes".
+
+**Files:**
+- Modify: `crates/wormward-core/src/remediate.rs`
+
+**Interfaces produced (Task 6b consumes):**
+
+```rust
+/// True if any strip marker matches `content` (literal, or regex when the marker is
+/// written `re:<pattern>`). Used to decide fixability and to gate the strip.
+pub fn strip_marker_matches(content: &str, markers: &[String]) -> bool;
+```
+Plus `earliest_marker` gains regex support (a marker `re:<pattern>` matches by regex; a
+plain marker matches by substring as today). `regex` is already a workspace dep used by
+`matchers.rs`.
+
+- [ ] **Step 1: Write failing tests** (append to remediate.rs tests)
+
+```rust
+    #[test]
+    fn regex_marker_matches_bracket_global_of_any_key() {
+        // Bracket-notation global assignment with an arbitrary key — the generalized
+        // payload-start form. `re:` prefix = regex marker.
+        let markers = vec![r"re:global\[('|\x22)[^'\x22]+('|\x22)\]\s*=".to_string()];
+        let content = "export default {};\nglobal['xyz']=1;PAYLOAD";
+        assert!(strip_marker_matches(content, &markers));
+        assert_eq!(earliest_marker(content, &markers), Some(content.find("global[").unwrap()));
+        // Dot-notation must NOT match (legit `global.x` collision risk).
+        assert!(!strip_marker_matches("const a = global.foo;", &markers));
+    }
+
+    #[test]
+    fn literal_and_regex_markers_take_earliest() {
+        let markers = vec!["global['!']=".to_string(), r"re:_\$_[0-9a-f]{4,}".to_string()];
+        // decoder pattern appears BEFORE the literal here → earliest wins.
+        let content = "ok\n_$_1a2b=1;global['!']=2;";
+        assert_eq!(earliest_marker(content, &markers), Some(content.find("_$_1a2b").unwrap()));
+    }
+
+    #[test]
+    fn strip_marker_matches_false_when_absent() {
+        assert!(!strip_marker_matches("clean config", &["global['!']=".to_string()]));
+    }
+```
+
+- [ ] **Step 2: Run to verify fail**
+
+Run: `cargo test -p wormward-core strip_marker_matches regex_marker literal_and_regex 2>&1 | tail -6`
+Expected: COMPILE ERROR (`strip_marker_matches` undefined) / regex markers treated as literal.
+
+- [ ] **Step 3: Implement**
+
+Replace `earliest_marker` and add `strip_marker_matches`:
+
+```rust
+/// Position of the earliest marker match in `content`. A marker written `re:<pattern>`
+/// is matched as a regex; any other marker is matched as a literal substring. An
+/// invalid regex is ignored (never matches) rather than panicking.
+fn earliest_marker(content: &str, markers: &[String]) -> Option<usize> {
+    markers
+        .iter()
+        .filter_map(|m| match m.strip_prefix("re:") {
+            Some(pat) => regex::Regex::new(pat).ok()?.find(content).map(|mat| mat.start()),
+            None => content.find(m),
+        })
+        .min()
+}
+
+/// True if any strip marker matches `content`. Same literal/`re:` semantics as
+/// `earliest_marker`. Callers use it to decide whether a StripPayload will actually do
+/// anything (fixability) before offering or attempting it.
+pub fn strip_marker_matches(content: &str, markers: &[String]) -> bool {
+    earliest_marker(content, markers).is_some()
+}
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `cargo test -p wormward-core 2>&1 | tail -5`
+Expected: all pass (existing remediate tests + 3 new).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/wormward-core/src/remediate.rs
+git commit -m "Support regex strip markers and expose strip_marker_matches"
+```
+
+---
+
+### Task 6b: Content-aware fixability, verify-after-strip, honest reporting, wider markers
+
+**Files:**
+- Modify: `crates/wormward-packs/src/polinrider/pack.yaml` (add generalized bracket-global marker)
+- Modify: `crates/wormward-github/src/pipeline.rs` (fixability + verify-after-strip + outcome)
+- Modify: `apps/desktop/src-tauri/src/lib.rs` (surface the new outcome variant)
+- Modify: `apps/desktop/src/routes/GitHub.svelte` + `apps/desktop/src/lib/types.ts` (render it)
+
+**Interfaces consumed:** `strip_marker_matches` (Task 6a); existing `scan_repo`, `plan_remediation`, `apply`, `action_for`.
+
+- [ ] **Step 1: Widen PolinRider markers (regex, over-strip-safe)**
+
+In `crates/wormward-packs/src/polinrider/pack.yaml`, replace the `markers:` block:
+
+```yaml
+remediation:
+  config_payload:
+    strategy: strip_after_marker
+    markers:
+      - "global['!']="
+      - "global['_V']="
+      # Generalized bracket-notation global assignment (any key). Bracket-global
+      # assignment is effectively never in legit config code, so this is safe from
+      # over-stripping; dot-notation is deliberately NOT matched (collides with
+      # legitimate `global.x`). Under-stripping is caught by verify-after-strip.
+      - 're:global\[(\x27|")[^\x27"]+(\x27|")\]\s*='
+```
+
+(YAML: `\x27` is not YAML escaping — write the literal regex. Use a single-quoted YAML
+scalar and put the actual `'` via the pattern. If single-quote escaping is awkward, use a
+double-quoted YAML scalar: `"re:global\\[('|\\\")[^'\\\"]+('|\\\")\\]\\s*="`. The
+implementer must verify the loaded string round-trips to the regex in the Task 6a test via
+a quick `PackManifest::from_yaml` check.)
+
+Verify the pack still parses: `cargo test -p wormward-packs 2>&1 | tail -3` (all pass).
+
+- [ ] **Step 2: Failing test — fixability is content-aware AND strip verifies**
+
+Add to `crates/wormward-github/src/pipeline.rs` tests. Build a fixture whose default-branch
+config is flagged by a NON-marker signature (e.g. a bare C2 address, no `global[...]=`), so
+today it is wrongly offered as fixable and "fixed" as a no-op:
+
+```rust
+    fn make_nonstrippable_infected_origin(tmp: &TempDir, name: &str) -> PathBuf {
+        let src = tmp.path().join(format!("{name}-src"));
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        // Flagged by the c2-tron-primary literal, but NO strip marker present.
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nfetch('TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP')\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "c2-only"]);
+        let bare = tmp.path().join(format!("{name}.git"));
+        Command::new("git").args(["init","-q","--bare","-b","main"]).env("GIT_TEMPLATE_DIR","").arg(&bare).status().unwrap();
+        git_ok(&src, &["remote","add","origin",bare.to_str().unwrap()]);
+        git_ok(&src, &["push","-q","origin","main"]);
+        bare
+    }
+
+    #[test]
+    fn nonstrippable_infection_is_not_offered_as_fixable() {
+        let tmp = TempDir::new().unwrap();
+        let bare = make_nonstrippable_infected_origin(&tmp, "c2only");
+        let host = GitFakeHost { repos: vec![RepoRef {
+            full_name: "me/c2only".into(),
+            clone_url: bare.to_string_lossy().to_string(),
+            default_branch: "main".into(), fork: false,
+        }]};
+        let scan = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "").unwrap();
+        assert!(scan.infected_full_names().contains(&"me/c2only".to_string()),
+            "still detected as infected");
+        assert!(!scan.fixable_full_names(&builtin_packs()).contains(&"me/c2only".to_string()),
+            "must NOT be offered as auto-fixable: no strip marker in the file");
+    }
+```
+
+Run it: expect FAIL (currently `fixable_full_names` offers it).
+
+- [ ] **Step 3: Make `fixable` content-aware**
+
+`fixable_full_names` (pipeline.rs) currently counts a repo fixable when
+`plan_remediation(&findings).actions` is non-empty. Change it so a `StripPayload` action
+only counts when the flagged file's content actually contains a marker; `DeleteFile` and
+`RemoveGitignoreLine` always count (their target's presence was already detected).
+
+Add an `auto_fixable: bool` field to `ScannedRepo`, computed where content is available:
+- In `api_scan_repo`: after collecting default-tip findings, set `auto_fixable` by checking,
+  for each default-tip (git_ref == None) finding whose `action_for` is a `StripPayload`,
+  whether `strip_marker_matches(&content, &markers)` for that file's content (read via the
+  same `ApiTree` used for scanning — reuse the tree/cache for the default tip); OR the repo
+  has any non-strip working-tree action. Store the result on `ScannedRepo`.
+- In `fallback_clone_scan`: compute the same using the cloned working tree
+  (`std::fs::read_to_string(dest.join(file))`).
+
+Then `fixable_full_names` filters on `r.is_infected() && r.auto_fixable`. Keep
+`infected_full_names` unchanged (detection ≠ fixability).
+
+Re-run Step 2 test: expect PASS.
+
+- [ ] **Step 4: Failing test — verify-after-strip never pushes a still-infected file**
+
+```rust
+    #[test]
+    fn incomplete_strip_reverts_and_reports_manual_not_pushed() {
+        // A file with a strip marker BUT residual worm content BEFORE the marker, so
+        // stripping at the marker leaves a signature match. The fix must NOT push;
+        // it must revert and report the repo as not-fixed (manual).
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("m-src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init","-q","-b","main"]);
+        // c2 address (signature) appears BEFORE the strip marker; cutting at the marker
+        // leaves the c2 line → still infected after strip.
+        std::fs::write(src.join("postcss.config.mjs"),
+            "export default {};\nvar c='TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP';\nglobal['!']='x';TAIL\n").unwrap();
+        git_ok(&src, &["add","."]);
+        git_ok(&src, &["commit","-q","--no-verify","-m","mixed"]);
+        let bare = tmp.path().join("m.git");
+        Command::new("git").args(["init","-q","--bare","-b","main"]).env("GIT_TEMPLATE_DIR","").arg(&bare).status().unwrap();
+        git_ok(&src, &["remote","add","origin",bare.to_str().unwrap()]);
+        git_ok(&src, &["push","-q","origin","main"]);
+
+        let host = GitFakeHost { repos: vec![RepoRef {
+            full_name: "me/m".into(), clone_url: bare.to_string_lossy().to_string(),
+            default_branch: "main".into(), fork: false }]};
+        let opts = GithubRunOpts { clone_dir: Some(tmp.path().join("work")),
+            include_forks:false, fix:true, push:true, yes:true };
+        let outcomes = run(&opts, &host, &builtin_packs(), "").unwrap();
+        let o = &outcomes[0];
+        assert!(o.pushed.is_empty(), "must not push a still-infected file");
+        assert!(!(o.error.is_none() && !o.actions.is_empty()),
+            "must not report as cleanly fixed");
+        // The bare origin's main tip still has the original (reverted, not half-stripped).
+        let show = Command::new("git").arg("-C").arg(&bare)
+            .args(["show","main:postcss.config.mjs"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&show.stdout).contains("TMfKQEd7"),
+            "origin must be untouched when strip is incomplete");
+    }
+```
+
+Run: expect FAIL (today it strips, commits, force-pushes the still-infected file).
+
+- [ ] **Step 5: Implement verify-after-strip + honest outcome in `fix_scanned`**
+
+After `apply(&dest, &plan.actions, true)` and before staging/commit, re-scan the working
+tree: `let residual = scan_repo(&dest, packs);` filtered to auto-strip kinds with
+`git_ref == None`. If `residual` is non-empty (the strip left detectable payload):
+- revert the working tree: `git(&dest, &["checkout", "--", "."])` (restores the committed
+  infected file — we then do NOT commit or push),
+- set `outcome.actions.clear()` and `outcome.error = None`, and add a distinguishable
+  signal so the report says "detected — manual review, not auto-strippable" rather than a
+  silent no-op. Add a field `manual_review: bool` to `RepoOutcome` (default false), set true
+  here, and also set it in the `plan.actions.is_empty()` early-return when the repo IS
+  infected (findings non-empty) — that is the "no marker at all" case.
+
+Adjust the existing "applied empty" and "plan empty" branches to set `manual_review = true`
+when `!sr.findings.is_empty()`, so an infected-but-not-auto-strippable repo is always
+reported honestly rather than as "no changes".
+
+Re-run Step 4 test: expect PASS. Re-run the full crate: `cargo test -p wormward-github` — all green (the existing `fixes_infected_repo_end_to_end` uses a canonical `global['!']=` payload with no residual, so it still fixes+pushes).
+
+- [ ] **Step 6: Surface `manual_review` in the GUI**
+
+- `apps/desktop/src-tauri/src/lib.rs`: add `manual_review: bool` to `GithubFixView`, set from
+  `o.manual_review`. `fixed` stays `o.error.is_none() && !o.actions.is_empty()`.
+- `apps/desktop/src/lib/types.ts`: add `manual_review: boolean` to `GithubFixView`.
+- `apps/desktop/src/routes/GitHub.svelte`: in the fix-results block, render a third state
+  between error and fixed:
+  ```svelte
+        {:else if r.manual_review}
+          detected — manual review needed (payload not auto-strippable)
+        {:else if r.fixed}
+  ```
+
+Gate: `cd apps/desktop && pnpm check 2>&1 | tail -3` → 0 errors; `cd apps/desktop/src-tauri && cargo check` → clean.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add crates/wormward-packs/src/polinrider/pack.yaml crates/wormward-github/src/pipeline.rs apps/desktop/src-tauri/src/lib.rs apps/desktop/src/lib/types.ts apps/desktop/src/routes/GitHub.svelte
+git commit -m "Content-aware fixability + verify-after-strip so GitHub fix never no-ops or pushes infected files"
+```
