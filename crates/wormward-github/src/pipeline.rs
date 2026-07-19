@@ -1026,9 +1026,14 @@ mod tests {
             .args(["show", "main:postcss.config.mjs"])
             .output()
             .unwrap();
+        // Check text that ONLY survives a full revert: `global['!']=` and the `TAIL`
+        // after it are both removed by a strip, so their presence proves the tree was
+        // reverted rather than half-stripped-and-pushed (the C2 line above the marker
+        // would survive either way, so asserting on it would not distinguish the two).
+        let origin = String::from_utf8_lossy(&show.stdout);
         assert!(
-            String::from_utf8_lossy(&show.stdout).contains("TMfKQEd7"),
-            "origin must be untouched when strip is incomplete"
+            origin.contains("global['!']") && origin.contains("TAIL"),
+            "origin must be the original file (reverted), not a half-stripped push"
         );
     }
 

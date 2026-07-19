@@ -688,6 +688,7 @@ mod tests {
             actions: vec![],
             pushed: vec![],
             error,
+            manual_review: false,
         }
     }
 

@@ -209,6 +209,7 @@ mod tests {
             actions: vec![],
             pushed: vec![],
             error: None,
+            manual_review: false,
         }];
         let text = render_github_text(&outcomes, false);
         // The individual finding is enumerated, not just counted, and carries its branch.
