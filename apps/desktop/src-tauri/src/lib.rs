@@ -3,12 +3,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use wormward_core::{
     apply, apply_branch_cleans, deep_scan_repo, discover_repos, now_secs, plan_branch_cleans,
     plan_remediation, restore as core_restore, scan as core_scan, scan_deep, scan_repo,
     BranchCleanStatus, Finding, RemediationAction, ScanReport,
 };
-use wormward_github::pipeline::{fix_pass, scan_pass, GithubRunOpts, ScanPass};
+use wormward_github::pipeline::{fix_pass, scan_pass_with_progress, GithubRunOpts, ScanPass};
 use wormward_github::{resolve_token, GitHubHost};
 use wormward_osm::{enrich, OsmClient};
 use wormward_packs::builtin_packs;
@@ -339,9 +340,10 @@ pub struct GithubFixView {
 /// findings in managed state for a later fix, and return a view of the infected repos. Token:
 /// explicit (non-empty) or resolved from `gh auth token`/`GITHUB_TOKEN`/`GH_TOKEN` when blank.
 #[tauri::command]
-fn github_scan(
+async fn github_scan(
     token: Option<String>,
     include_forks: bool,
+    window: tauri::Window,
     state: tauri::State<'_, GithubScanState>,
 ) -> Result<Vec<GithubRepoView>, String> {
     let token = resolve_token(token.as_deref()).map_err(|e| e.to_string())?;
@@ -354,7 +356,11 @@ fn github_scan(
         push: false,
         yes: false,
     };
-    let scan = scan_pass(&opts, &host, &packs, &token).map_err(|e| e.to_string())?;
+    let scan = scan_pass_with_progress(&opts, &host, &packs, &token, &|p| {
+        // Best-effort: a failed emit must never fail the scan.
+        let _ = window.emit("github-scan-progress", &p);
+    })
+    .map_err(|e| e.to_string())?;
     let fixable: HashSet<String> = scan.fixable_full_names(&packs).into_iter().collect();
 
     let mut views = Vec::new();

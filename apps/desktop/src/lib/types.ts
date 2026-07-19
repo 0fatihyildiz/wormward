@@ -99,3 +99,5 @@ export interface GithubFixView {
   actions: string[];
   error?: string | null;
 }
+
+export type ScanProgress = { done: number; total: number; repo: string };

@@ -1,7 +1,8 @@
 <script lang="ts">
   import { app } from "../lib/state.svelte";
   import { githubScan, githubFix } from "../lib/api";
-  import type { GithubRepoView, GithubFixView } from "../lib/types";
+  import { listen } from "@tauri-apps/api/event";
+  import type { GithubRepoView, GithubFixView, ScanProgress } from "../lib/types";
 
   let token = $state(localStorage.getItem("github_token") ?? "");
   let includeForks = $state(false);
@@ -9,6 +10,7 @@
   let fixing = $state(false);
   let confirming = $state(false);
   let scanned = $state(false);
+  let progress = $state<ScanProgress | null>(null);
 
   let repos = $state<GithubRepoView[]>([]);
   let sel = $state<Record<string, boolean>>({});
@@ -27,6 +29,12 @@
     scanning = true;
     app.error = "";
     results = [];
+    progress = null;
+    // Register BEFORE invoking so no early event is missed.
+    const unlisten = await listen<ScanProgress>("github-scan-progress", (e) => {
+      // Events arrive in completion order; never roll the counter backwards.
+      if (!progress || e.payload.done > progress.done) progress = e.payload;
+    });
     try {
       repos = await githubScan(token || undefined, includeForks);
       const s: Record<string, boolean> = {};
@@ -36,7 +44,9 @@
     } catch (e) {
       app.error = String(e);
     } finally {
+      unlisten();
       scanning = false;
+      progress = null;
     }
   }
 
@@ -85,7 +95,13 @@
 </section>
 
 {#if scanning}
-  <p class="muted">Scanning repositories via the GitHub API…</p>
+  <p class="muted">
+    {#if progress}
+      Scanning {progress.done} of {progress.total} — {progress.repo}
+    {:else}
+      Scanning repositories via the GitHub API…
+    {/if}
+  </p>
 {:else if scanned && repos.length === 0}
   <section class="card ok">
     <h2>No infected repositories</h2>
