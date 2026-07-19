@@ -16,6 +16,11 @@
     ["settings", "Settings"],
   ] as const;
 
+  // Respect the user's motion preference for the JS-driven route transition
+  // (CSS media query can't reach Svelte transitions).
+  const reduce =
+    typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+
   // Sliding active-tab indicator: measure the active button and move a single bar.
   let navEl: HTMLElement | undefined = $state();
   let ind = $state({ left: 0, width: 0, ready: false });
@@ -60,14 +65,18 @@
       <span class="indicator" style="transform: translateX({ind.left}px); width: {ind.width}px;"></span>
     {/if}
     {#each tabs as [id, label]}
-      <button class:active={app.screen === id} onclick={() => (app.screen = id)}>{label}</button>
+      <button
+        class:active={app.screen === id}
+        aria-current={app.screen === id ? "page" : undefined}
+        onclick={() => (app.screen = id)}>{label}</button>
     {/each}
   </nav>
 </header>
 
 {#if app.error}
   <div class="toast-wrap">
-    <div class="toast" role="alert">
+    <div class="toast" role="alert" out:fly={{ y: -10, duration: reduce ? 0 : 160, easing: cubicOut }}>
+      <span class="dot"></span>
       <span class="msg">{app.error}</span>
       <button class="x" aria-label="Dismiss" onclick={() => (app.error = "")}>×</button>
     </div>
@@ -76,7 +85,7 @@
 
 <main>
   {#key app.screen}
-    <div in:fly={{ y: 8, duration: 200, easing: cubicOut }}>
+    <div in:fly={{ y: reduce ? 0 : 8, duration: reduce ? 0 : 200, easing: cubicOut }}>
       {#if app.screen === "scan"}
         <Scan />
       {:else if app.screen === "results"}
@@ -97,13 +106,13 @@
     position: sticky;
     top: 0;
     z-index: 20;
+    height: var(--topbar-h);
     display: flex;
     align-items: center;
     gap: 22px;
-    padding: 11px 24px;
-    background: rgba(10, 10, 12, 0.72);
+    padding: 0 24px;
+    background: rgba(10, 10, 12, 0.7);
     backdrop-filter: blur(12px);
-    border-bottom: 1px solid var(--border);
   }
   .brand { display: flex; align-items: center; gap: 8px; }
   .wordmark {
@@ -127,12 +136,12 @@
   nav button.active { color: var(--fg); }
   nav .indicator {
     position: absolute;
-    bottom: -12px;
+    bottom: -17px;
     left: 0;
     height: 2px;
     background: var(--accent);
     border-radius: 2px;
     transition: transform var(--med) var(--ease), width var(--med) var(--ease);
   }
-  main { min-height: calc(100vh - 49px); }
+  main { min-height: calc(100vh - var(--topbar-h)); }
 </style>

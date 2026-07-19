@@ -7,6 +7,7 @@
     cleanBranchesPreview,
     cleanBranchesApply,
   } from "../lib/api";
+  import { dialog } from "../lib/modal";
   import type {
     RepoPlan,
     RemediationAction,
@@ -249,7 +250,7 @@
 
 {#if confirming}
   <div class="modal-backdrop">
-    <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal" role="dialog" aria-modal="true" tabindex="-1" use:dialog={() => (confirming = false)}>
       <h3>Apply changes?</h3>
       <p class="lede">
         This modifies files in the working tree of {selectedRepos.length} selected repo(s)
@@ -266,7 +267,7 @@
 
 {#if confirmingBranches}
   <div class="modal-backdrop">
-    <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal" role="dialog" aria-modal="true" tabindex="-1" use:dialog={() => (confirmingBranches = false)}>
       <h3>Rewrite branch tips?</h3>
       <p class="lede">
         This rewrites the tips of {selectedBranches.length} selected branch(es) with a new clean

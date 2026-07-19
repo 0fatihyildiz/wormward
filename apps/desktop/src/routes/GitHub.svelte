@@ -1,6 +1,7 @@
 <script lang="ts">
   import { app } from "../lib/state.svelte";
   import { githubScan, githubFix, githubOrgs } from "../lib/api";
+  import { dialog } from "../lib/modal";
   import { listen } from "@tauri-apps/api/event";
   import type { GithubRepoView, GithubFixView, ScanProgress } from "../lib/types";
 
@@ -226,7 +227,7 @@
 
 {#if confirming}
   <div class="modal-backdrop">
-    <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal" role="dialog" aria-modal="true" tabindex="-1" use:dialog={() => (confirming = false)}>
       <h3>Force-push cleaned history?</h3>
       <p class="crit small">
         <strong>This is destructive and remote.</strong> Wormward will remediate
