@@ -93,7 +93,7 @@ enum Command {
         /// GitHub token (else GITHUB_TOKEN/GH_TOKEN, else `gh auth token`).
         #[arg(long)]
         token: Option<String>,
-        /// Directory to clone into (default: a temp dir removed after the run).
+        /// Directory where repos selected for fixing are cloned (default: a temp dir removed after the run).
         #[arg(long)]
         clone_dir: Option<PathBuf>,
         /// Include forks (default: skip them).
@@ -545,7 +545,8 @@ fn main() -> ExitCode {
                 opts.yes = false;
             }
             let packs = builtin_packs();
-            // Phase 1: enumerate → clone → scan (no fix), to learn which repos are infected.
+            // Phase 1: enumerate → API-scan every branch tip (no clones), to learn
+            // which repos are infected.
             let scan = match wormward_github::pipeline::scan_pass(&opts, &host, &packs, &token) {
                 Ok(s) => s,
                 Err(e) => {
@@ -581,7 +582,7 @@ fn main() -> ExitCode {
                 None
             };
 
-            // Phase 2: fix only the selected repos, reusing the phase-1 clones.
+            // Phase 2: fix only the selected repos (cloned on demand by fix_pass).
             let outcomes = wormward_github::pipeline::fix_pass(
                 &scan,
                 &opts,

@@ -57,8 +57,8 @@
 <section class="card">
   <h2>GitHub account</h2>
   <p class="muted">
-    Scan the token owner's repositories: each is cloned to a temp dir and scanned read-only.
-    Fixing a repo <strong>force-pushes</strong> the cleaned history back to GitHub.
+    Scan the token owner's repositories: each is scanned read-only via the GitHub API, with
+    no clones. Fixing a repo <strong>force-pushes</strong> the cleaned history back to GitHub.
   </p>
   <div class="row">
     <input
@@ -85,7 +85,7 @@
 </section>
 
 {#if scanning}
-  <p class="muted">Cloning and scanning repositories…</p>
+  <p class="muted">Scanning repositories via the GitHub API…</p>
 {:else if scanned && repos.length === 0}
   <section class="card ok">
     <h2>No infected repositories</h2>

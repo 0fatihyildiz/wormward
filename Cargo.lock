@@ -2193,6 +2193,7 @@ dependencies = [
 name = "wormward-github"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "httpmock",
  "rayon",
  "serde",
