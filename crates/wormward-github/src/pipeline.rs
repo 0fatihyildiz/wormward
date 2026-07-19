@@ -1,13 +1,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
 use serde::Serialize;
 use wormward_core::{
-    apply, commit_paths, deep_scan_repo, force_push_with_lease, plan_remediation, scan_repo, Finding,
-    Pack, RemediationAction,
+    apply, commit_paths, deep_scan_repo, force_push_with_lease_to, now_secs, plan_remediation,
+    scan_repo, Finding, Pack, RemediationAction,
 };
 
 use crate::{GithubError, RepoHost, RepoRef};
@@ -96,8 +95,11 @@ fn has_staged_changes(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+/// Turn a repo `full_name` (e.g. `owner/name`) into a single safe directory component.
+/// Both `/` and `\` path separators AND any `..` are neutralized so a hostile or malformed
+/// `full_name` cannot escape the clone base dir via path traversal.
+fn sanitize_full_name(full_name: &str) -> String {
+    full_name.replace(['/', '\\'], "__").replace("..", "__")
 }
 
 /// A repo cloned and scanned in phase one. The clone on disk at `dest` is reused by the
@@ -156,7 +158,7 @@ impl ScanPass {
 
 /// Clone (all branches, authenticated) and read-only scan a single repo. No fixes.
 fn clone_and_scan(repo: &RepoRef, base: &Path, packs: &[Pack], token: &str) -> ScannedRepo {
-    let dest = base.join(repo.full_name.replace('/', "__"));
+    let dest = base.join(sanitize_full_name(&repo.full_name));
 
     // Clone all branches so the deep scan can inspect every branch tip. Authenticate via
     // the token so private repos clone (and the resulting origin can be pushed to), and
@@ -295,11 +297,14 @@ fn fix_scanned(sr: &ScannedRepo, opts: &GithubRunOpts, packs: &[Pack], token: &s
             "refs/remotes/origin/{b}:refs/heads/wormward-backup/{b}-{ts}",
             b = sr.repo.default_branch
         );
-        if let Err(e) = git(dest, &["push", "origin", &backup]) {
+        if let Err(e) = git(dest, &["push", "origin", "--", &backup]) {
             outcome.error = Some(redact(format!("backup push: {e}"), token));
             return outcome;
         }
-        match force_push_with_lease(dest) {
+        // Push EXACTLY the cleaned default branch via an explicit refspec, never a bare
+        // `--force-with-lease` (which under push.default=matching would push every branch).
+        let refspec = format!("HEAD:refs/heads/{}", sr.repo.default_branch);
+        match force_push_with_lease_to(dest, "origin", &refspec) {
             Ok(()) => outcome.pushed.push(sr.repo.default_branch.clone()),
             Err(e) => outcome.error = Some(redact(format!("force-push: {e}"), token)),
         }
