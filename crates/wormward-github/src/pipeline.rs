@@ -231,12 +231,23 @@ fn api_scan_repo(
             return Ok(out);
         }
     };
-    let Some(default) = branches.iter().find(|b| b.name == repo.default_branch) else {
+    if branches.is_empty() {
         return Ok(out); // empty repo / unborn default branch: nothing to scan
-    };
+    }
 
-    let mut tips: Vec<(String, Option<String>)> = vec![(default.commit_sha.clone(), None)];
-    let mut seen: HashSet<String> = [default.commit_sha.clone()].into_iter().collect();
+    // Normally the default-branch tip is scanned like a working tree (findings stay
+    // remediable, `git_ref = None`) and every other tip is `git_ref`-stamped. When the
+    // default branch is NOT among the returned branches (stale metadata, a rename race,
+    // or a serde-defaulted empty `default_branch`), we cannot tell which tip is the
+    // working tree — so we scan EVERY tip `git_ref`-stamped. Detection coverage is
+    // preserved, but nothing is offered as working-tree-fixable, which is correct: we do
+    // not know the default branch to remediate/force-push, so all findings route to manual.
+    let mut tips: Vec<(String, Option<String>)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if let Some(default) = branches.iter().find(|b| b.name == repo.default_branch) {
+        seen.insert(default.commit_sha.clone());
+        tips.push((default.commit_sha.clone(), None));
+    }
     for b in &branches {
         if seen.insert(b.commit_sha.clone()) {
             tips.push((b.commit_sha.clone(), Some(b.name.clone())));
@@ -290,14 +301,12 @@ pub fn scan_pass(
 ) -> Result<ScanPass, GithubError> {
     let repos = host.list_repos(opts.include_forks)?;
     let cache = BlobCache::new();
-    let results: Vec<Result<ScannedRepo, GithubError>> = repos
+    // `collect::<Result<Vec<_>, _>>()` lets rayon short-circuit cooperatively on the
+    // first Err (a rate limit) instead of scanning every repo before propagating it.
+    let scanned = repos
         .par_iter()
         .map(|repo| api_scan_repo(repo, host, packs, &cache, token))
-        .collect();
-    let mut scanned = Vec::with_capacity(results.len());
-    for r in results {
-        scanned.push(r?);
-    }
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ScanPass { repos: scanned })
 }
 
@@ -792,6 +801,39 @@ mod tests {
             fixable,
             vec!["me/wt".to_string()],
             "branch-only infection must not be offered as a fixable candidate"
+        );
+    }
+
+    #[test]
+    fn missing_default_branch_scans_all_tips_git_ref_stamped() {
+        // The repo's declared `default_branch` ("trunk") does not exist among the returned
+        // branches (stale metadata / rename race / serde-defaulted name). The infected tip
+        // ("evil") must still be detected, every finding must carry a `git_ref` (nothing
+        // treated as the working tree), and the repo must NOT be a fixable candidate.
+        let tmp = TempDir::new().unwrap();
+        let bare = make_branch_only_infected_origin(&tmp, "renamed");
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/renamed".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "trunk".into(), // does not exist; real branches are main + evil
+                fork: false,
+            }],
+        };
+
+        let scan = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "").unwrap();
+        let sr = &scan.repos()[0];
+        assert!(sr.error.is_none(), "unexpected error: {:?}", sr.error);
+        assert!(sr.is_infected(), "infected tip must still be detected");
+        assert!(
+            sr.findings.iter().all(|f| f.git_ref.is_some()),
+            "every finding must be git_ref-stamped when the default branch is unknown"
+        );
+        // Detection is preserved but nothing is working-tree-fixable.
+        assert_eq!(scan.infected_full_names(), vec!["me/renamed".to_string()]);
+        assert!(
+            !scan.fixable_full_names(&builtin_packs()).contains(&"me/renamed".to_string()),
+            "a repo with an unknown default branch must not be a fixable candidate"
         );
     }
 

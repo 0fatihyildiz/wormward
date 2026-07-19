@@ -129,7 +129,12 @@ impl GitHubHost {
     fn get(&self, url: &str) -> Result<(Option<String>, String), GithubError> {
         let base_authority = url_authority(&self.base_url)
             .ok_or_else(|| GithubError::Http(format!("invalid base_url: {}", self.base_url)))?;
-        if url_authority(url) != Some(base_authority) {
+        // Match SCHEME as well as authority: an `http://` next-link to the same host must
+        // not receive the bearer token over plaintext. We compare against base_url's own
+        // scheme (not https-only) so the httpmock http://127.0.0.1 test servers still work.
+        if url_authority(url) != Some(base_authority)
+            || url_scheme(url) != url_scheme(&self.base_url)
+        {
             return Err(GithubError::Http(format!(
                 "refusing to send token to unexpected host: {url}"
             )));
@@ -196,6 +201,12 @@ fn next_link(link_header: &str) -> Option<String> {
 fn url_authority(url: &str) -> Option<&str> {
     let (_scheme, rest) = url.split_once("://")?;
     Some(rest.split(['/', '?', '#']).next().unwrap_or(rest))
+}
+
+/// The scheme (e.g. `https`) of an absolute URL, so the token guard can reject a
+/// `next` link that swaps the scheme (e.g. plaintext http) to the same authority.
+fn url_scheme(url: &str) -> Option<&str> {
+    url.split_once("://").map(|(scheme, _)| scheme)
 }
 
 /// Cap on paginated requests to bound the loop even if a host keeps advertising a next link.
@@ -318,6 +329,35 @@ mod tests {
         let result = host.list_repos(false);
         assert!(result.is_err(), "expected an error, got {result:?}");
         attacker_mock.assert_hits(0); // token never sent to the foreign host
+    }
+
+    #[test]
+    fn refuses_to_follow_next_link_with_swapped_scheme() {
+        // The API host (http) returns a `next` link to the SAME authority but over https.
+        // The token must not go out over a different scheme, so the run errors before any
+        // second request. We can't mock the https side; asserting the Err is sufficient
+        // because the guard rejects before issuing a request.
+        let api = MockServer::start();
+        let evil_next = format!(
+            "<{}/user/repos?page=2>; rel=\"next\"",
+            api.base_url().replace("http://", "https://")
+        );
+        api.mock(|when, then| {
+            when.method(GET).path("/user/repos").query_param("page", "1");
+            then.status(200).header("Link", evil_next.as_str()).json_body(serde_json::json!([
+                {"full_name":"me/a","clone_url":"https://x/a.git","default_branch":"main","fork":false}
+            ]));
+        });
+        let host = GitHubHost { token: "secret".into(), base_url: api.base_url() };
+        let result = host.list_repos(false);
+        assert!(result.is_err(), "expected an error, got {result:?}");
+    }
+
+    #[test]
+    fn url_scheme_extracts_scheme() {
+        assert_eq!(url_scheme("https://api.github.com/x"), Some("https"));
+        assert_eq!(url_scheme("http://127.0.0.1:8080/p"), Some("http"));
+        assert_eq!(url_scheme("not-a-url"), None);
     }
 
     #[test]
