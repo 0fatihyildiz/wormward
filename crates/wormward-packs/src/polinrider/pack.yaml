@@ -67,6 +67,19 @@ content_signatures:
   - id: staking-uuid
     kind: literal
     value: "e9b53a7c-2342-4b15-b02d-bd8b8f6a03f9"
+  # Structural / family signatures — catch new variants (e.g. dot-notation) too.
+  - id: decoder-pattern
+    kind: regex
+    value: '_\$_[0-9a-f]{4,}'
+  - id: c2-ethereum-ip
+    kind: literal
+    value: "23.27.20.187"
+  - id: padding-run
+    kind: regex
+    value: '\x20{200,}'
+  - id: entropy-tail
+    kind: entropy-over
+    value: "5.0"
 
 artifacts:
   - path: "temp_auto_push.bat"
