@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use ignore::{WalkBuilder, WalkState};
 
 fn is_pruned_dir(name: &str) -> bool {
-    name == ".git" || name == "node_modules"
+    // `.wormward-backup` holds pristine copies of removed payloads — never rescan it,
+    // or every scan after a `clean` would re-flag the backed-up originals.
+    name == ".git" || name == "node_modules" || name == ".wormward-backup"
 }
 
 fn base_builder(root: &Path) -> WalkBuilder {
@@ -121,6 +123,7 @@ mod tests {
         touch(&repo.join("src/index.js"));
         touch(&repo.join(".git/config"));
         touch(&repo.join("node_modules/pkg/index.js"));
+        touch(&repo.join(".wormward-backup/123/postcss.config.mjs"));
 
         let files = walk_repo_files(repo);
         let names: Vec<String> = files
@@ -131,6 +134,7 @@ mod tests {
         assert!(names.contains(&"src/index.js".to_string()));
         assert!(!names.iter().any(|n| n.starts_with(".git/")));
         assert!(!names.iter().any(|n| n.starts_with("node_modules/")));
+        assert!(!names.iter().any(|n| n.starts_with(".wormward-backup/")));
     }
 
     #[test]

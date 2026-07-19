@@ -9,9 +9,23 @@ modular signature pack, so one tool covers the whole family.
 
 ## Install
 
+**CLI from source:**
 ```bash
 cargo install --path crates/wormward-cli
+# or: cargo build --release -p wormward-cli   →   target/release/wormward
 ```
+
+**Prebuilt binaries & desktop app:** grab them from the
+[Releases](https://github.com/0fatihyildiz/wormward/releases) page — CLI binaries
+(macOS / Linux / Windows) and desktop bundles (`.dmg` / `.msi` / `.AppImage`).
+
+**Desktop app from source:**
+```bash
+cd apps/desktop && pnpm install && pnpm tauri build   # or: pnpm tauri dev
+```
+
+> Release artifacts are published by CI on each `v*` tag and appear on Releases once
+> the project's GitHub Actions is active.
 
 ## Usage
 
