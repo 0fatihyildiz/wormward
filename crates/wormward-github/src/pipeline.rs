@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -160,6 +161,16 @@ impl ScanPass {
     }
 }
 
+/// A repo that just finished scanning. Events arrive in COMPLETION order, not
+/// input order (rayon) — consumers should render the latest done/total only.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanProgress {
+    pub done: usize,
+    pub total: usize,
+    /// `full_name` of the repo that just finished.
+    pub repo: String,
+}
+
 /// Clone all branches of `repo` into `dest`, authenticated via the token so private
 /// repos work (and the resulting origin can be pushed to). GIT_TERMINAL_PROMPT=0 so
 /// an auth failure fails fast instead of hanging a rayon worker. Errors are redacted.
@@ -299,13 +310,33 @@ pub fn scan_pass(
     packs: &[Pack],
     token: &str,
 ) -> Result<ScanPass, GithubError> {
+    scan_pass_with_progress(opts, host, packs, token, &|_| {})
+}
+
+/// `scan_pass` with a progress callback, invoked once per repo as it finishes
+/// (success or per-repo error alike — the repo is done either way). The callback
+/// is infallible by design: progress must never be able to fail a scan.
+pub fn scan_pass_with_progress(
+    opts: &GithubRunOpts,
+    host: &dyn RepoHost,
+    packs: &[Pack],
+    token: &str,
+    on_progress: &(dyn Fn(ScanProgress) + Sync),
+) -> Result<ScanPass, GithubError> {
     let repos = host.list_repos(opts.include_forks)?;
+    let total = repos.len();
     let cache = BlobCache::new();
+    let done_counter = AtomicUsize::new(0);
     // `collect::<Result<Vec<_>, _>>()` lets rayon short-circuit cooperatively on the
     // first Err (a rate limit) instead of scanning every repo before propagating it.
     let scanned = repos
         .par_iter()
-        .map(|repo| api_scan_repo(repo, host, packs, &cache, token))
+        .map(|repo| {
+            let result = api_scan_repo(repo, host, packs, &cache, token);
+            let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            on_progress(ScanProgress { done, total, repo: repo.full_name.clone() });
+            result
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ScanPass { repos: scanned })
 }
@@ -1047,5 +1078,44 @@ mod tests {
         let host = RateLimitedHost(one_repo_host(&tmp, "limited"));
         let result = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "");
         assert!(matches!(result, Err(GithubError::RateLimited(_))), "got {result:?}");
+    }
+
+    #[test]
+    fn scan_progress_reports_each_repo_once() {
+        use std::sync::Mutex;
+        let tmp = TempDir::new().unwrap();
+        let mut repos = Vec::new();
+        for name in ["a", "b", "c"] {
+            let bare = make_infected_origin_named(&tmp, name);
+            repos.push(RepoRef {
+                full_name: format!("me/{name}"),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            });
+        }
+        let host = GitFakeHost { repos };
+        let events: Mutex<Vec<ScanProgress>> = Mutex::new(Vec::new());
+
+        let scan = scan_pass_with_progress(
+            &scan_only_opts(),
+            &host,
+            &builtin_packs(),
+            "",
+            &|p| events.lock().unwrap().push(p),
+        )
+        .unwrap();
+
+        assert_eq!(scan.repos().len(), 3);
+        let ev = events.into_inner().unwrap();
+        assert_eq!(ev.len(), 3, "exactly one event per repo");
+        assert!(ev.iter().all(|p| p.total == 3));
+        // Completion order is nondeterministic; done values must be 1..=3 in some order.
+        let mut dones: Vec<usize> = ev.iter().map(|p| p.done).collect();
+        dones.sort();
+        assert_eq!(dones, vec![1, 2, 3]);
+        let mut names: Vec<&str> = ev.iter().map(|p| p.repo.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["me/a", "me/b", "me/c"]);
     }
 }
