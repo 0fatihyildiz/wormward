@@ -356,6 +356,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Branch, Tree, TreeEntry};
     use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
@@ -375,21 +376,73 @@ mod tests {
         assert!(status.success());
     }
 
-    struct FakeHost {
-        repo: RepoRef,
+    /// Serves list/branches/tree/blob straight from local bare fixture repos via git,
+    /// so the pipeline is exercised end-to-end without any HTTP. `clone_url` doubles
+    /// as the filesystem path of the bare repo.
+    struct GitFakeHost {
+        repos: Vec<RepoRef>,
     }
-    impl RepoHost for FakeHost {
-        fn list_repos(&self, _include_forks: bool) -> Result<Vec<RepoRef>, GithubError> {
-            Ok(vec![self.repo.clone()])
+
+    impl GitFakeHost {
+        fn bare_path(&self, full_name: &str) -> PathBuf {
+            PathBuf::from(
+                &self.repos.iter().find(|r| r.full_name == full_name).unwrap().clone_url,
+            )
+        }
+        fn git(&self, full_name: &str, args: &[&str]) -> Result<Vec<u8>, GithubError> {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(self.bare_path(full_name))
+                .args(args)
+                .output()
+                .map_err(|e| GithubError::Http(e.to_string()))?;
+            if !out.status.success() {
+                return Err(GithubError::Http(
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                ));
+            }
+            Ok(out.stdout)
         }
     }
 
-    struct FakeMultiHost {
-        repos: Vec<RepoRef>,
-    }
-    impl RepoHost for FakeMultiHost {
-        fn list_repos(&self, _include_forks: bool) -> Result<Vec<RepoRef>, GithubError> {
-            Ok(self.repos.clone())
+    impl RepoHost for GitFakeHost {
+        fn list_repos(&self, include_forks: bool) -> Result<Vec<RepoRef>, GithubError> {
+            Ok(self.repos.iter().filter(|r| include_forks || !r.fork).cloned().collect())
+        }
+        fn list_branches(&self, full_name: &str) -> Result<Vec<Branch>, GithubError> {
+            let out = self.git(
+                full_name,
+                &["for-each-ref", "--format=%(objectname) %(refname:short)", "refs/heads"],
+            )?;
+            Ok(String::from_utf8_lossy(&out)
+                .lines()
+                .filter_map(|l| {
+                    let (sha, name) = l.split_once(' ')?;
+                    Some(Branch { name: name.into(), commit_sha: sha.into() })
+                })
+                .collect())
+        }
+        fn get_tree(&self, full_name: &str, commit_sha: &str) -> Result<Tree, GithubError> {
+            let out = self.git(full_name, &["ls-tree", "-r", "-z", commit_sha])?;
+            let entries = String::from_utf8_lossy(&out)
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .filter_map(|line| {
+                    // "<mode> <type> <sha>\t<path>"
+                    let (meta, path) = line.split_once('\t')?;
+                    let mut parts = meta.split_whitespace();
+                    let _mode = parts.next()?;
+                    let kind = parts.next()?;
+                    let sha = parts.next()?;
+                    (kind == "blob")
+                        .then(|| TreeEntry { path: PathBuf::from(path), sha: sha.into() })
+                })
+                .collect();
+            Ok(Tree { entries, truncated: false })
+        }
+        fn get_blob(&self, full_name: &str, blob_sha: &str) -> Result<Option<String>, GithubError> {
+            let out = self.git(full_name, &["cat-file", "blob", blob_sha])?;
+            Ok(String::from_utf8(out).ok())
         }
     }
 
@@ -484,13 +537,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bare = make_infected_origin(&tmp);
         let clone_dir = tmp.path().join("work");
-        let host = FakeHost {
-            repo: RepoRef {
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
                 full_name: "me/proj".into(),
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
-            },
+            }],
         };
         let opts = GithubRunOpts {
             clone_dir: Some(clone_dir),
@@ -512,13 +565,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bare = make_infected_origin(&tmp);
         let clone_dir = tmp.path().join("work");
-        let host = FakeHost {
-            repo: RepoRef {
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
                 full_name: "me/proj".into(),
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
-            },
+            }],
         };
         let opts = GithubRunOpts {
             clone_dir: Some(clone_dir.clone()),
@@ -541,13 +594,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bare = make_infected_origin(&tmp);
         let clone_dir = tmp.path().join("work");
-        let host = FakeHost {
-            repo: RepoRef {
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
                 full_name: "me/proj".into(),
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
-            },
+            }],
         };
         let opts = GithubRunOpts {
             clone_dir: Some(clone_dir),
@@ -590,7 +643,7 @@ mod tests {
         let bare_branch_only = make_branch_only_infected_origin(&tmp, "branchonly");
         let bare_working_tree = make_infected_origin_named(&tmp, "wt");
         let clone_dir = tmp.path().join("work");
-        let host = FakeMultiHost {
+        let host = GitFakeHost {
             repos: vec![
                 RepoRef {
                     full_name: "me/branchonly".into(),
@@ -639,7 +692,7 @@ mod tests {
         let bare_a = make_infected_origin_named(&tmp, "a");
         let bare_b = make_infected_origin_named(&tmp, "b");
         let clone_dir = tmp.path().join("work");
-        let host = FakeMultiHost {
+        let host = GitFakeHost {
             repos: vec![
                 RepoRef {
                     full_name: "me/a".into(),
