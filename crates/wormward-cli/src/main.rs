@@ -7,9 +7,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use wormward_core::{
-    amend_head, apply, apply_branch_cleans, commit_paths, deep_scan_repo, discover_repos,
-    force_push_with_lease, now_secs, plan_branch_cleans, plan_remediation, push, restore, scan,
-    scan_deep, scan_repo, BranchCleanStatus,
+    amend_head, apply, apply_branch_cleans, branch_remote, commit_paths, current_branch,
+    deep_scan_repo, discover_repos, force_push_with_lease, force_push_with_lease_to, now_secs,
+    plan_branch_cleans, plan_remediation, push, restore, scan, scan_deep, scan_repo,
+    BranchCleanStatus,
 };
 use wormward_osm::OsmClient;
 use wormward_packs::builtin_packs;
@@ -403,10 +404,13 @@ fn main() -> ExitCode {
                 };
                 match select::select_repos(fixable, opts, |i| works[*i].repo.display().to_string()) {
                     Some(sel) => sel.into_iter().collect(),
-                    // Aborted prompt (Ctrl-C / interrupt): fail closed — fix nothing.
+                    // Aborted prompt (Ctrl-C / interrupt): fail closed — fix nothing. Fall
+                    // through with an EMPTY selection so the unresolved-infection accounting
+                    // below yields exit 1, exactly like deselecting every repo (exit-code
+                    // contract: any infection remaining -> 1, never a clean 0).
                     None => {
                         eprintln!("selection aborted; no repos fixed");
-                        return ExitCode::from(0);
+                        HashSet::new()
                     }
                 }
             } else {
@@ -451,7 +455,22 @@ fn main() -> ExitCode {
                         c.join(", ")
                     };
                     let git_result = if rewrite {
-                        amend_head(repo, &paths).and_then(|_| force_push_with_lease(repo))
+                        amend_head(repo, &paths).and_then(|_| match current_branch(repo) {
+                            // Scope the force-push to exactly the checked-out branch — never a
+                            // bare `push --force-with-lease`, which under push.default=matching
+                            // would force EVERY matching branch, not just the remediated one.
+                            Some(branch) => {
+                                let remote = branch_remote(repo, &branch)
+                                    .unwrap_or_else(|| "origin".to_string());
+                                force_push_with_lease_to(
+                                    repo,
+                                    &remote,
+                                    &format!("HEAD:refs/heads/{branch}"),
+                                )
+                            }
+                            // Detached HEAD: no branch to scope to — fall back to the bare push.
+                            None => force_push_with_lease(repo),
+                        })
                     } else {
                         commit_paths(repo, &format!("wormward: remediate {campaigns}"), &paths)
                             .and_then(|_| push(repo))
@@ -602,10 +621,12 @@ fn main() -> ExitCode {
                 };
                 match select::select_repos(fixable, sel_opts, |n| n.clone()) {
                     Some(sel) => Some(sel.into_iter().collect()),
-                    // Aborted prompt (Ctrl-C / interrupt): fail closed — fix nothing.
+                    // Aborted prompt (Ctrl-C / interrupt): fail closed — fix nothing. Fall
+                    // through with an EMPTY selection (NOT `None`, which fixes all) so
+                    // github_exit_code sees the infections unremediated and returns 1.
                     None => {
                         eprintln!("selection aborted; no repos fixed");
-                        return ExitCode::from(0);
+                        Some(HashSet::new())
                     }
                 }
             } else {

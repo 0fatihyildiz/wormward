@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use wormward_core::{
     apply, commit_paths, deep_scan_repo, force_push_with_lease_to, now_secs, plan_remediation,
-    scan_files, scan_repo, Finding, Pack, RemediationAction,
+    scan_repo, scan_tree, Finding, Pack, RemediationAction,
 };
 
 use crate::api_tree::{ApiTree, BlobCache};
@@ -211,8 +211,10 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
 /// Scan one repo entirely through the API: default-branch tip first (findings stay
 /// remediable, like a working tree), then every other branch tip deduped by commit
 /// sha with `git_ref` stamped (routed to manual by plan_remediation, like deep scan).
-/// Mirrors scan_repo + deep_scan_repo minus the reflog check (local-only, and
-/// meaningless on a fresh clone anyway). Err ONLY on rate limiting, which aborts the
+/// Each tip runs the full `scan_tree` (campaign signatures + the capability engine,
+/// deduped) — the same body `scan_repo`/`deep_scan_repo` use — so clone-free scanning
+/// detects capability-class malware too. The `.git/hooks` and reflog passes are working-
+/// tree-only and legitimately absent here. Err ONLY on rate limiting, which aborts the
 /// whole run; anything else is a per-repo error.
 fn api_scan_repo(
     repo: &RepoRef,
@@ -268,7 +270,7 @@ fn api_scan_repo(
             return Ok(fallback_clone_scan(repo, packs, token));
         }
         let files = ApiTree::new(host, &repo.full_name, &tree, cache);
-        let mut findings = scan_files(&label, &files, packs);
+        let mut findings = scan_tree(&label, &files, packs);
         if let Some(name) = &git_ref {
             for f in &mut findings {
                 f.git_ref = Some(name.clone());
@@ -804,6 +806,51 @@ mod tests {
             fixable,
             vec!["me/wt".to_string()],
             "branch-only infection must not be offered as a fixable candidate"
+        );
+    }
+
+    #[test]
+    fn api_scan_flags_capability_only_infection() {
+        // A repo whose only malware is an obfuscated auto-run config with NO pack content
+        // signature must still be flagged over the API: api_scan_repo must run the capability
+        // engine (scan_capabilities), not only scan_files. Otherwise clone-free scanning is a
+        // second-class scanner that misses every capability-class payload.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("cap-src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        // ESM re-entry shim (obfuscation) + network egress → trips the ConfigFile gate,
+        // but matches no polinrider/shai-hulud signature and not the analyzer (needs a decoder).
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nglobal['x']=require;\nfetch('http://example.com/beacon')\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "caponly"]);
+        let bare = tmp.path().join("caponly.git");
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/caponly".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let scan = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "").unwrap();
+        let sr = &scan.repos()[0];
+        assert!(sr.error.is_none(), "unexpected error: {:?}", sr.error);
+        assert!(
+            sr.findings.iter().any(|f| f.kind == wormward_core::FindingKind::Capability),
+            "capability-only infection must be detected over the API scan"
         );
     }
 

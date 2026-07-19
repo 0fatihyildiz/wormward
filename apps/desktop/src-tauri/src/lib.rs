@@ -75,13 +75,24 @@ pub struct RestoreSummary {
     restored: usize,
 }
 
+/// A scan report plus any non-fatal OSM enrichment warnings. `warnings` is flattened into
+/// the report's JSON object (`{ findings, repos_scanned, warnings }`), so the existing
+/// frontend `ScanReport` shape keeps working and simply gains a `warnings` array.
+#[derive(Serialize)]
+pub struct ScanResult {
+    #[serde(flatten)]
+    report: ScanReport,
+    /// OSM enrichment warnings (auth / rate-limit / network). Empty on an offline scan.
+    warnings: Vec<String>,
+}
+
 #[tauri::command]
 fn scan(
     dirs: Vec<String>,
     deep: bool,
     online: bool,
     token: Option<String>,
-) -> Result<ScanReport, String> {
+) -> Result<ScanResult, String> {
     let paths = to_paths(dirs);
     let packs = builtin_packs();
     let mut report = if deep {
@@ -89,19 +100,24 @@ fn scan(
     } else {
         core_scan(&paths, &packs)
     };
+    let mut warnings = Vec::new();
     if online {
+        // Mirror the CLI: an online scan with no resolvable token is a hard error, not a
+        // silent offline scan presented to the user as a completed online lookup.
         let token = token
             .filter(|t| !t.is_empty())
             .or_else(|| std::env::var("OSM_API_KEY").ok())
-            .filter(|t| !t.is_empty());
-        if let Some(token) = token {
-            let base = std::env::var("OSM_BASE_URL")
-                .unwrap_or_else(|_| "https://api.opensourcemalware.com/functions/v1".to_string());
-            let client = OsmClient::new(base, token);
-            let _ = enrich(&mut report.findings, &client);
-        }
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| {
+                "online scan requires an OSM token (set OSM_API_KEY or enter a token)".to_string()
+            })?;
+        let base = std::env::var("OSM_BASE_URL")
+            .unwrap_or_else(|_| "https://api.opensourcemalware.com/functions/v1".to_string());
+        let client = OsmClient::new(base, token);
+        // Surface enrichment warnings rather than discarding them (the CLI prints each).
+        warnings = enrich(&mut report.findings, &client);
     }
-    Ok(report)
+    Ok(ScanResult { report, warnings })
 }
 
 #[tauri::command]
@@ -408,7 +424,13 @@ fn github_fix(
         .into_iter()
         .filter(|o| sel.contains(&o.repo.full_name))
         .map(|o| GithubFixView {
-            fixed: o.error.is_none() && !o.actions.is_empty(),
+            // Mirror the CLI's per-repo resolution (github_exit_code): resolved only when a
+            // fix was actually pushed AND no non-remediable finding survives on origin —
+            // not merely "some actions ran". Otherwise the GUI reports `fixed` while a
+            // non-remediable infection is still live.
+            fixed: o.error.is_none()
+                && !o.pushed.is_empty()
+                && o.findings.iter().all(|f| f.remediable),
             full_name: o.repo.full_name,
             pushed: o.pushed,
             actions: o.actions,

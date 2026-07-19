@@ -32,7 +32,11 @@ const CONFIG_EXTS: &[&str] = &["js", "mjs", "cjs", "ts"];
 const ENTRY_BASENAMES: &[&str] = &["index.js", "app.js", "truffle.js"];
 const PROP_EXTS: &[&str] = &["bat", "cmd", "sh", "ps1"];
 const ASSET_EXTS: &[&str] = &["woff", "woff2", "ttf", "otf", "eot", "png", "jpg", "jpeg", "gif", "ico"];
-const EXCLUDED_DIRS: &[&str] = &["dist", "build", ".next", "out", "coverage", "vendor"];
+// `node_modules` / `.wormward-backup` mirror the working-tree walk prune (walk::is_pruned_dir)
+// so a GitTree / ApiTree — whose path lists are NOT pre-pruned — scan the same file set the
+// WorkingTree does. Without this, a committed node_modules produces deep-scan-only phantom findings.
+const EXCLUDED_DIRS: &[&str] =
+    &["dist", "build", ".next", "out", "coverage", "vendor", "node_modules", ".wormward-backup"];
 
 const LIFECYCLE_KEYS: &[&str] = &[
     "preinstall", "install", "postinstall", "prepare", "prepublish", "prepublishOnly", "prepack",
@@ -45,8 +49,10 @@ fn basename(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Build-output dirs and minified files are excluded from the capability pass;
-/// legitimate obfuscated/minified code lives here, not in source config.
+/// Build-output dirs, vendored deps (`node_modules`), backup dirs, and minified files are
+/// excluded from the scan; legitimate obfuscated/minified/third-party code lives here, not
+/// in source config. Applied uniformly across every file source (working tree, git tree,
+/// API tree) so their scanned file sets match.
 pub fn is_excluded_path(path: &Path) -> bool {
     if basename(path).contains(".min.") {
         return true;

@@ -14,9 +14,9 @@ pub mod walk;
 pub use engine::{SigHit, SignatureEngine};
 pub use finding::{Finding, FindingKind, OnlineVerdict, Severity};
 pub use git::{
-    amend_head, branch_remote, commit_paths, create_ref, delete_branch, force_push_with_lease,
-    force_push_with_lease_to, push, reflog_has_amend, rev_parse, update_ref, verify_ref,
-    worktree_add, worktree_add_new_branch, worktree_prune, worktree_remove,
+    amend_head, branch_remote, commit_paths, create_ref, current_branch, delete_branch,
+    force_push_with_lease, force_push_with_lease_to, push, reflog_has_amend, rev_parse, update_ref,
+    verify_ref, worktree_add, worktree_add_new_branch, worktree_prune, worktree_remove,
 };
 pub use matchers::{shannon_entropy, sha256_hex, ContentSignature, SignatureKind};
 pub use pack::{CampaignAnalyzer, Pack, PackError, PackManifest, ScannedFile};
@@ -30,6 +30,7 @@ pub use rewrite::{
     BranchCleanStatus,
 };
 pub use scanner::{
-    deep_scan_repo, scan, scan_capabilities, scan_deep, scan_files, scan_repo, ScanReport,
+    deep_scan_repo, scan, scan_capabilities, scan_deep, scan_files, scan_repo, scan_tree,
+    ScanReport,
 };
 pub use walk::{discover_repos, walk_repo_files};

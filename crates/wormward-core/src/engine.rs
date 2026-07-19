@@ -29,7 +29,7 @@ pub struct SignatureEngine {
     // share a digest, so we keep a Vec instead of collapsing to a single meta.
     sha256: HashMap<String, Vec<SigMeta>>,
     // (threshold bits/byte, meta) — fires when the content's last-512-byte tail
-    // entropy exceeds the threshold. Mirrors matchers::signature_matches.
+    // entropy exceeds the threshold.
     entropy: Vec<(f64, SigMeta)>,
 }
 
@@ -56,7 +56,7 @@ impl SignatureEngine {
                         literal_meta.push(meta);
                     }
                     SignatureKind::Regex => {
-                        // Skip patterns that don't compile (mirrors signature_matches).
+                        // Skip patterns that don't compile rather than failing the whole build.
                         if regex::Regex::new(&sig.value).is_ok() {
                             regex_patterns.push(sig.value.clone());
                             regex_meta.push(meta);
@@ -66,8 +66,7 @@ impl SignatureEngine {
                         sha256.entry(sig.value.to_ascii_lowercase()).or_default().push(meta);
                     }
                     SignatureKind::EntropyOver => {
-                        // Unparseable threshold -> f64::MAX (never fires), matching
-                        // the old signature_matches behavior.
+                        // An unparseable threshold -> f64::MAX, so the signature never fires.
                         let threshold = sig.value.parse().unwrap_or(f64::MAX);
                         entropy.push((threshold, meta));
                     }

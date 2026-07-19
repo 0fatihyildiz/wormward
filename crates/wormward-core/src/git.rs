@@ -56,7 +56,9 @@ pub fn commit_paths(repo: &Path, message: &str, paths: &[PathBuf]) -> Result<(),
 }
 
 /// Stage the given remediation paths and amend HEAD — rewrites the latest commit in place
-/// (HEAD only, no deeper history rewrite) and reattributes its authorship to wormward.
+/// (HEAD only, no deeper history rewrite). `--amend --no-edit` (no `--reset-author`) re-stamps
+/// the *committer* to the identity running wormward but PRESERVES the original author, so the
+/// forensic record of who introduced the commit is not lost.
 pub fn amend_head(repo: &Path, paths: &[PathBuf]) -> Result<(), String> {
     stage_paths(repo, paths);
     run_git(repo, &["commit", "--amend", "--no-edit"])
@@ -132,6 +134,13 @@ pub fn branch_remote(repo: &Path, branch: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The current branch name (`git rev-parse --abbrev-ref HEAD`), or `None` on a detached HEAD.
+/// Used to scope a force-push to exactly the checked-out branch, never a bare push that could
+/// touch every branch under `push.default=matching`.
+pub fn current_branch(repo: &Path) -> Option<String> {
+    run_git_stdout(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD")
+}
+
 /// `git worktree prune` — drop stale administrative worktree entries under
 /// `.git/worktrees/` (used as a fallback when a worktree dir vanished without a clean remove).
 pub fn worktree_prune(repo: &Path) -> Result<(), String> {
@@ -190,6 +199,19 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn current_branch_reports_checked_out_branch() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("f.txt"), "a").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "c"]);
+        assert_eq!(current_branch(repo), Some("main".to_string()));
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        assert_eq!(current_branch(repo), Some("feature".to_string()));
     }
 
     #[test]

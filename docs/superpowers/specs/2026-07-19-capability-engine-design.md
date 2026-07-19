@@ -220,8 +220,11 @@ steps spawn processes); it only contributes via a conjunction or the obfuscation
 - Add `FindingKind::Capability` to `finding.rs` (serializes `"capability"`).
 - Finding fields: `campaign = "generic"`, `signature_id = "capability:<surface>:<top-signal>"`,
   `kind = Capability`, `remediable = false` (v1), `severity = Critical`.
-- **No pack dedup:** if a pack and the engine both fire on a file, both findings remain (different
-  `kind`, corroborating). Report layer may group by file.
+- **Pack dedup (revised):** when a *remediable* campaign finding already covers a file, the
+  additive generic capability finding on that same file is dropped as a duplicate (the campaign
+  finding is more actionable and attributed). A non-remediable pack finding (e.g. an `IocDomain`
+  reference) does NOT suppress the capability finding — the stronger, actionable evidence wins.
+  Implemented in `scanner::dedup_capability_against_packs`. Report layer may group by file.
 - The reflog heuristic in `scan_repo` keys off `findings[0].campaign`; `"generic"` keeps it working.
 
 ## 10. Analyzer change (PolinRider ESM shim)

@@ -14,12 +14,23 @@
 
 {#if !app.report}
   <p class="muted">Run a scan first.</p>
-{:else if app.report.findings.length === 0}
+{:else}
+  {#if app.report.warnings?.length}
+    <section class="card warn">
+      <h2>Online lookup warnings</h2>
+      <ul>
+        {#each app.report.warnings as w}
+          <li class="small muted">{w}</li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
+  {#if app.report.findings.length === 0}
   <section class="card ok">
     <h2>No infections found</h2>
     <p class="muted">Scanned {app.report.repos_scanned} repositories.</p>
   </section>
-{:else}
+  {:else}
   <p class="muted">
     {app.report.findings.length} finding(s) across {app.report.repos_scanned} repositories.
   </p>
@@ -48,4 +59,5 @@
       {/each}
     </section>
   {/each}
+  {/if}
 {/if}

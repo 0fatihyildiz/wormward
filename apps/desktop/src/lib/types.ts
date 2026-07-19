@@ -24,6 +24,8 @@ export interface Finding {
 export interface ScanReport {
   findings: Finding[];
   repos_scanned: number;
+  /** Non-fatal OSM online-lookup warnings (auth / rate-limit / network). */
+  warnings?: string[];
 }
 
 export interface PackInfo {
