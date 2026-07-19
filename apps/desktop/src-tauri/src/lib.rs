@@ -13,10 +13,20 @@ use wormward_github::{resolve_token, GitHubHost};
 use wormward_osm::{enrich, OsmClient};
 use wormward_packs::builtin_packs;
 
+/// The clones + findings from a GitHub `scan_pass`, plus the exact token that was resolved at
+/// scan time and baked into each clone's credentialed `origin` URL. The fix phase reuses this
+/// stored token so it redacts the *same* secret that is embedded in the clones — re-resolving
+/// independently could redact a different (newer) token and leak the scan-time one in a push
+/// error echoing the credentialed URL.
+struct GithubScanCache {
+    scan: ScanPass,
+    token: String,
+}
+
 /// Managed Tauri state holding the clones + findings from a GitHub `scan_pass` between the
 /// scan and fix phases. The `TempDir` inside `ScanPass` keeps the clones alive on disk so the
 /// fix phase can reuse them without re-cloning.
-type GithubScanState = Mutex<Option<ScanPass>>;
+type GithubScanState = Mutex<Option<GithubScanCache>>;
 
 fn to_paths(dirs: Vec<String>) -> Vec<PathBuf> {
     dirs.into_iter().map(PathBuf::from).collect()
@@ -366,21 +376,20 @@ fn github_scan(
         });
     }
 
-    *state.lock().map_err(|e| e.to_string())? = Some(scan);
+    *state.lock().map_err(|e| e.to_string())? = Some(GithubScanCache { scan, token });
     Ok(views)
 }
 
 /// Fix the selected GitHub repos, reusing the clones from the last `github_scan`. Fixing a
 /// GitHub repo always pushes (a no-push GitHub fix would be discarded with the temp clone), so
 /// this force-pushes cleaned history to the remote. Returns per-repo outcomes for the
-/// selected repos.
+/// selected repos. Uses the token resolved at scan time (stored alongside the clones) — not a
+/// freshly resolved one — so the redacted secret matches the one embedded in the clones.
 #[tauri::command]
 fn github_fix(
-    token: Option<String>,
     selected: Vec<String>,
     state: tauri::State<'_, GithubScanState>,
 ) -> Result<Vec<GithubFixView>, String> {
-    let token = resolve_token(token.as_deref()).map_err(|e| e.to_string())?;
     let packs = builtin_packs();
     let opts = GithubRunOpts {
         clone_dir: None,
@@ -391,11 +400,11 @@ fn github_fix(
     };
     let sel: HashSet<String> = selected.into_iter().collect();
 
-    let guard = state.lock().map_err(|e| e.to_string())?;
-    let scan = guard
+    let mut guard = state.lock().map_err(|e| e.to_string())?;
+    let cache = guard
         .as_ref()
         .ok_or_else(|| "no scan available; run a GitHub scan first".to_string())?;
-    let outcomes = fix_pass(scan, &opts, &packs, &token, Some(&sel));
+    let outcomes = fix_pass(&cache.scan, &opts, &packs, &cache.token, Some(&sel));
 
     let views = outcomes
         .into_iter()
@@ -408,6 +417,11 @@ fn github_fix(
             error: o.error,
         })
         .collect();
+
+    // Drop the credentialed clones promptly: their `origin` embeds the token, so we don't want
+    // them lingering in managed state for the app's lifetime. The frontend re-scans before any
+    // subsequent fix, which repopulates this state.
+    *guard = None;
     Ok(views)
 }
 

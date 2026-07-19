@@ -45,7 +45,7 @@
     fixing = true;
     app.error = "";
     try {
-      results = await githubFix(token || undefined, selectedNames);
+      results = await githubFix(selectedNames);
     } catch (e) {
       app.error = String(e);
     } finally {

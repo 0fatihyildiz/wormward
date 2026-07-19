@@ -36,8 +36,8 @@ export const cleanBranchesApply = (selected: BranchSelection[], push: boolean) =
 export const githubScan = (token: string | undefined, includeForks: boolean) =>
   invoke<GithubRepoView[]>("github_scan", { token: token ?? null, includeForks });
 
-export const githubFix = (token: string | undefined, selected: string[]) =>
-  invoke<GithubFixView[]>("github_fix", { token: token ?? null, selected });
+export const githubFix = (selected: string[]) =>
+  invoke<GithubFixView[]>("github_fix", { selected });
 
 export async function pickDirs(): Promise<string[]> {
   const sel = await open({ directory: true, multiple: true });
