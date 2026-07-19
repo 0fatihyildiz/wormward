@@ -50,39 +50,84 @@
       app.error = String(e);
     }
   }
+
+  const pct = $derived(progress && progress.total ? (progress.done / progress.total) * 100 : 0);
 </script>
 
-<section class="card">
-  <h2>Scan for supply-chain worms</h2>
-  <div class="row">
-    <button onclick={choose} disabled={app.scanning}>Choose folders…</button>
-    <span class="muted">{app.dirs.length ? app.dirs.join(", ") : "current folder (.)"}</span>
+<div class="page">
+  <div class="page-head">
+    <h1>Scan</h1>
+    <p class="lede">Detect supply-chain worms across your repositories — read-only.</p>
   </div>
-  <label><input type="checkbox" bind:checked={deep} disabled={app.scanning} /> Deep scan — inspect every branch tip</label>
-  <label><input type="checkbox" bind:checked={online} disabled={app.scanning} /> Cross-check findings online (OpenSourceMalware)</label>
-  <div class="row">
-    {#if app.scanning}
-      <button class="primary" disabled>
-        {progress ? `Scanning… ${progress.done}/${progress.total}` : "Scanning…"}
-      </button>
-      <button onclick={stop}>Stop</button>
-    {:else}
-      <button class="primary" onclick={run}>Scan</button>
-    {/if}
-  </div>
-</section>
 
-{#if app.scanning || log.length}
   <section class="card">
-    <h2>
-      Progress
-      {#if progress}<span class="count">{progress.done}/{progress.total}</span>{/if}
-    </h2>
-    <div class="scanlog">
-      {#each log as line}
-        <div class="muted small">{line}</div>
-      {/each}
-      {#if !log.length}<div class="muted small">Discovering repositories…</div>{/if}
+    <div class="field">
+      <div class="row between">
+        <span class="field-label">Target folders</span>
+        <button class="btn sm" onclick={choose} disabled={app.scanning}>Choose folders…</button>
+      </div>
+      <p class="path-preview mono">
+        {app.dirs.length ? app.dirs.join("  ·  ") : "current folder (.)"}
+      </p>
     </div>
+
+    <div class="opts">
+      <label class="switch">
+        <input type="checkbox" bind:checked={deep} disabled={app.scanning} />
+        <span class="track"></span>
+        <span class="lbl">Deep scan <span class="muted">— inspect every branch tip</span></span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" bind:checked={online} disabled={app.scanning} />
+        <span class="track"></span>
+        <span class="lbl">Online cross-check <span class="muted">— OpenSourceMalware</span></span>
+      </label>
+    </div>
+
+    <div class="row">
+      {#if app.scanning}
+        <button class="btn primary" disabled>
+          <span class="spinner"></span>
+          {progress ? `Scanning… ${progress.done}/${progress.total}` : "Scanning…"}
+        </button>
+        <button class="btn danger" onclick={stop}>Stop</button>
+      {:else}
+        <button class="btn primary" onclick={run}>Scan →</button>
+      {/if}
+    </div>
+
+    {#if app.scanning}
+      <div class="progress" class:indet={!progress}>
+        <span style="width: {progress ? pct : 35}%"></span>
+      </div>
+    {/if}
   </section>
-{/if}
+
+  {#if app.scanning || log.length}
+    <section class="card">
+      <div class="row between">
+        <h2>Progress</h2>
+        {#if progress}<span class="count">{progress.done}/{progress.total}</span>{/if}
+      </div>
+      <div class="scanlog stack">
+        {#each log as line}<div class="mono micro muted">{line}</div>{/each}
+        {#if !log.length}<div class="muted small">Discovering repositories…</div>{/if}
+      </div>
+    </section>
+  {/if}
+</div>
+
+<style>
+  .field { display: flex; flex-direction: column; gap: 8px; }
+  .field-label { font-size: 12px; color: var(--muted); font-weight: 500; }
+  .path-preview {
+    font-size: 12px;
+    color: var(--fg);
+    background: var(--inset);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 9px 12px;
+    word-break: break-all;
+  }
+  .opts { display: flex; flex-direction: column; gap: 4px; padding: 2px 0; }
+</style>

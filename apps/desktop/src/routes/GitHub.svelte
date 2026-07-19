@@ -93,118 +93,150 @@
       fixing = false;
     }
   }
+
+  const pct = $derived(progress && progress.total ? (progress.done / progress.total) * 100 : 0);
 </script>
 
-<section class="card">
-  <h2>GitHub account</h2>
-  <p class="muted">
-    Scan repositories you own and repositories in your organizations: each is scanned
-    read-only via the GitHub API, with no clones. Fixing a repo
-    <strong>force-pushes</strong> the cleaned history back to GitHub.
-  </p>
-  <div class="row">
-    <input
-      type="password"
-      placeholder="ghp_… (blank = gh auth token / GITHUB_TOKEN / GH_TOKEN)"
-      bind:value={token}
-      oninput={saveToken}
-      style="flex:1"
-    />
-    <button onclick={loadOrgs} disabled={loadingOrgs || scanning || fixing}>
-      {loadingOrgs ? "Loading orgs…" : "Load orgs"}
-    </button>
+<div class="page">
+  <div class="page-head">
+    <h1>GitHub account</h1>
+    <p class="lede">
+      Scan repos you own and repos in your organizations — read-only via the GitHub API, no clones.
+      Fixing a repo <strong>force-pushes</strong> the cleaned history back to GitHub.
+    </p>
   </div>
-  <label><input type="checkbox" bind:checked={includeForks} /> Include forks</label>
 
-  {#if orgs.length}
-    <div class="orgs">
-      <p class="muted small">
-        Choose which organizations to scan. <strong>Your own repos are always scanned.</strong>
-      </p>
-      {#each orgs as o}
-        <label><input type="checkbox" bind:checked={selectedOrgs[o]} /> {o}</label>
-      {/each}
+  <section class="card">
+    <div class="row">
+      <input
+        type="password"
+        placeholder="ghp_… (blank = gh auth token / GITHUB_TOKEN / GH_TOKEN)"
+        bind:value={token}
+        oninput={saveToken}
+        style="flex:1"
+      />
+      <button class="btn" onclick={loadOrgs} disabled={loadingOrgs || scanning || fixing}>
+        {loadingOrgs ? "Loading orgs…" : "Load orgs"}
+      </button>
     </div>
-  {:else if orgsError}
-    <p class="muted small">Couldn't list orgs — scanning all.</p>
-  {/if}
-  <div class="row">
-    <button class="primary" onclick={scan} disabled={scanning || fixing}>
-      {scanning ? "Scanning account…" : "Scan account"}
-    </button>
-    <button
-      class="primary"
-      onclick={() => (confirming = true)}
-      disabled={fixing || selectedNames.length === 0}
-    >
-      Fix &amp; push selected…
-    </button>
-  </div>
-</section>
+    <label class="switch">
+      <input type="checkbox" bind:checked={includeForks} />
+      <span class="track"></span>
+      <span class="lbl">Include forks</span>
+    </label>
 
-{#if scanning}
-  <p class="muted">
-    {#if progress}
-      Scanning {progress.done} of {progress.total} — {progress.repo}
-    {:else}
-      Scanning repositories via the GitHub API…
+    {#if orgs.length}
+      <div class="stack">
+        <p class="muted small">
+          Choose which organizations to scan. <strong>Your own repos are always scanned.</strong>
+        </p>
+        <div class="row" style="gap:14px 18px">
+          {#each orgs as o}
+            <label class="switch">
+              <input type="checkbox" bind:checked={selectedOrgs[o]} />
+              <span class="track"></span>
+              <span class="lbl small">{o}</span>
+            </label>
+          {/each}
+        </div>
+      </div>
+    {:else if orgsError}
+      <p class="muted small">Couldn't list orgs — scanning all.</p>
     {/if}
-  </p>
-{:else if scanned && repos.length === 0}
-  <section class="card ok">
-    <h2>No infected repositories</h2>
-    <p class="muted">Nothing to fix in this account.</p>
-  </section>
-{:else if repos.length}
-  <section class="card">
-    <h3>Infected repositories</h3>
-    {#each repos as r}
-      <div class="action">
-        <label>
-          <input type="checkbox" bind:checked={sel[r.full_name]} disabled={!r.fixable} />
-          <strong>{r.full_name}</strong>
-          <span class="count">{r.findings}</span>
-          {#if r.campaigns.length}<span class="muted small">{r.campaigns.join(", ")}</span>{/if}
-          {#if !r.fixable}<span class="chip">branch-only — not auto-fixable</span>{/if}
-        </label>
-      </div>
-    {/each}
-  </section>
-{/if}
 
-{#if results.length}
-  <section class="card">
-    <h3>Fix results</h3>
-    {#each results as r}
-      <div class="small {r.error ? 'crit' : r.manual_review ? 'crit' : r.fixed ? 'ok-text' : 'muted'}">
-        {r.full_name}:
-        {#if r.error}
-          error — {r.error}
-        {:else if r.manual_review}
-          detected — manual review needed (payload not auto-strippable)
-        {:else if r.fixed}
-          fixed{r.pushed.length ? ` — pushed ${r.pushed.join(", ")}` : ""}
-        {:else}
-          no changes
-        {/if}
+    <div class="row">
+      <button class="btn primary" onclick={scan} disabled={scanning || fixing}>
+        {#if scanning}<span class="spinner"></span> Scanning account…{:else}Scan account{/if}
+      </button>
+      <button
+        class="btn danger"
+        onclick={() => (confirming = true)}
+        disabled={fixing || selectedNames.length === 0}
+      >
+        Fix &amp; push selected…
+      </button>
+    </div>
+
+    {#if scanning}
+      <div class="stack">
+        <div class="progress" class:indet={!progress}><span style="width: {progress ? pct : 35}%"></span></div>
+        <p class="muted small">
+          {#if progress}
+            <span class="mono">{progress.repo}</span> — {progress.done} of {progress.total}
+          {:else}
+            Scanning repositories via the GitHub API…
+          {/if}
+        </p>
       </div>
-    {/each}
+    {/if}
   </section>
-{/if}
+
+  {#if !scanning && scanned && repos.length === 0}
+    <div class="card ok">
+      <div class="state ok">
+        <div class="glyph">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M5 12.5 10 17.5 19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </div>
+        <h2>No infected repositories</h2>
+        <p class="muted small">Nothing to fix in this account.</p>
+      </div>
+    </div>
+  {:else if repos.length}
+    <section class="card">
+      <h2>Infected repositories</h2>
+      {#each repos as r, i}
+        <label class="switch item reveal" style="animation-delay: {Math.min(i, 12) * 25}ms">
+          <input type="checkbox" bind:checked={sel[r.full_name]} disabled={!r.fixable} />
+          <span class="track"></span>
+          <span class="lbl small" style="flex:1;min-width:0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <strong class="mono">{r.full_name}</strong>
+            <span class="count">{r.findings}</span>
+            {#if r.campaigns.length}<span class="muted">{r.campaigns.join(", ")}</span>{/if}
+            {#if !r.fixable}<span class="chip">branch-only</span>{/if}
+          </span>
+        </label>
+      {/each}
+    </section>
+  {/if}
+
+  {#if results.length}
+    <section class="card">
+      <h2>Fix results</h2>
+      <div class="stack">
+        {#each results as r}
+          <div class="small {r.error || r.manual_review ? 'crit' : r.fixed ? 'ok-text' : 'muted'}">
+            <span class="mono">{r.full_name}</span>:
+            {#if r.error}
+              error — {r.error}
+            {:else if r.manual_review}
+              detected — manual review needed (payload not auto-strippable)
+            {:else if r.fixed}
+              fixed{r.pushed.length ? ` — pushed ${r.pushed.join(", ")}` : ""}
+            {:else}
+              no changes
+            {/if}
+          </div>
+        {/each}
+      </div>
+    </section>
+  {/if}
+</div>
 
 {#if confirming}
   <div class="modal-backdrop">
     <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
       <h3>Force-push cleaned history?</h3>
-      <p class="crit">
+      <p class="crit small">
         <strong>This is destructive and remote.</strong> Wormward will remediate
-        {selectedNames.length} selected repo(s) and <strong>force-push</strong> the cleaned
-        default branch to their GitHub remotes, overwriting remote history. The pre-clean tip is
-        backed up as a <code>wormward-backup/…</code> branch on each remote.
+        {selectedNames.length} selected repo(s) and <strong>force-push</strong> the cleaned default
+        branch to their GitHub remotes, overwriting remote history. The pre-clean tip is backed up
+        as a <code>wormward-backup/…</code> branch on each remote.
       </p>
       <div class="row">
-        <button onclick={() => (confirming = false)}>Cancel</button>
-        <button class="primary" onclick={fix}>Fix &amp; push</button>
+        <button class="btn ghost" onclick={() => (confirming = false)}>Cancel</button>
+        <button class="btn danger" onclick={fix}>Fix &amp; push</button>
       </div>
     </div>
   </div>
