@@ -5,8 +5,12 @@ use wormward_core::{CampaignAnalyzer, Finding, FindingKind, ScannedFile, Severit
 
 fn marker_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    // Matches both `global.o='5-3-235-du'` (dot) and `global['!']='8-270-2'` (bracket).
-    RE.get_or_init(|| Regex::new(r"global(\.\w+|\['[^']+'\])\s*=\s*'[\w-]+'").unwrap())
+    // Version-tag marker (`global.o='5-3-235-du'` / `global['!']='8-270-2'`) OR the
+    // ESM re-entry shim (`global['r']=require` / `global.m=module`) — the shim is the
+    // strongest marker-independent tell, present in both variants.
+    RE.get_or_init(|| {
+        Regex::new(r"global(\.\w+|\['[^']+'\])\s*=\s*(?:require\b|module\b|'[\w-]+')").unwrap()
+    })
 }
 
 fn decoder_re() -> &'static Regex {
@@ -27,7 +31,9 @@ impl PolinriderAnalyzer {
     /// specific decoder name / seed — so new variants are caught, not just known literals.
     fn confirm(content: &str) -> Option<String> {
         let has_marker = marker_re().is_match(content);
-        let has_decoder = decoder_re().is_match(content) || content.contains("MDy");
+        let has_decoder = decoder_re().is_match(content)
+            || content.contains("MDy")
+            || content.contains("createRequire(import.meta.url");
         let has_seed = seed_re().is_match(content);
         if has_marker && has_decoder {
             return Some("obfuscation: injection marker + decoder".to_string());
@@ -89,6 +95,15 @@ mod tests {
         // The modus.builders variant: dot marker + _$_8e2c decoder.
         let out = PolinriderAnalyzer
             .analyze(&scanned("export default {};\nglobal.o='5-3-235-du';var _$_8e2c=[];"));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn confirms_esm_shim_variant() {
+        // require/module ESM shim + decoder → confirm structurally.
+        let out = PolinriderAnalyzer.analyze(&scanned(
+            "export default {};\nglobal['r']=require;global['m']=module;var _$_8e2c=[];",
+        ));
         assert_eq!(out.len(), 1);
     }
 
