@@ -1,6 +1,6 @@
 <script lang="ts">
   import { app, fail, clearErrors } from "../lib/state.svelte";
-  import { githubScan, githubFix, githubOrgs } from "../lib/api";
+  import { githubScan, githubFix, githubOrgs, cancelGithubScan } from "../lib/api";
   import { dialog } from "../lib/modal";
   import { listen } from "@tauri-apps/api/event";
   import type { GithubRepoView, GithubFixView, ScanProgress } from "../lib/types";
@@ -8,6 +8,7 @@
   let token = $state(localStorage.getItem("github_token") ?? "");
   let includeForks = $state(false);
   let scanning = $state(false);
+  let stopping = $state(false);
   let fixing = $state(false);
   let confirming = $state(false);
   let scanned = $state(false);
@@ -103,7 +104,17 @@
     } finally {
       unlisten();
       scanning = false;
+      stopping = false;
       progress = null;
+    }
+  }
+
+  async function stopScan() {
+    stopping = true;
+    try {
+      await cancelGithubScan();
+    } catch (e) {
+      fail(e);
     }
   }
 
@@ -182,16 +193,23 @@
     {/if}
 
     <div class="row">
-      <button class="btn primary" onclick={scan} disabled={scanning || fixing}>
-        {#if scanning}<span class="spinner"></span> Scanning account…{:else}Scan account{/if}
-      </button>
-      <button
-        class="btn danger"
-        onclick={() => (confirming = true)}
-        disabled={fixing || selectedNames.length === 0}
-      >
-        {#if fixing}<span class="spinner"></span>Pushing…{:else}Fix &amp; push {selectedNames.length} selected…{/if}
-      </button>
+      {#if scanning}
+        <button class="btn primary" disabled aria-busy="true">
+          <span class="spinner"></span> Scanning account…
+        </button>
+        <button class="btn danger" onclick={stopScan} disabled={stopping}>
+          {stopping ? "Stopping…" : "Cancel"}
+        </button>
+      {:else}
+        <button class="btn primary" onclick={scan} disabled={fixing}>Scan account</button>
+        <button
+          class="btn danger"
+          onclick={() => (confirming = true)}
+          disabled={fixing || selectedNames.length === 0}
+        >
+          {#if fixing}<span class="spinner"></span>Pushing…{:else}Fix &amp; push {selectedNames.length} selected…{/if}
+        </button>
+      {/if}
     </div>
 
     {#if scanning}

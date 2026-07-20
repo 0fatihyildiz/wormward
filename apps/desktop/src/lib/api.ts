@@ -45,6 +45,8 @@ export const githubScan = (token: string | undefined, includeForks: boolean, org
 export const githubFix = (selected: string[]) =>
   invoke<GithubFixView[]>("github_fix", { selected });
 
+export const cancelGithubScan = () => invoke<void>("cancel_github_scan");
+
 // Machine-level check (`doctor`).
 export const doctor = () => invoke<DoctorReport>("doctor");
 export const doctorClearCache = (dir: string) =>

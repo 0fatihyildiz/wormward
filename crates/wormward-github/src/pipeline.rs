@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// Never-set cancel flag so the non-cancellable public scan can delegate to the cancellable one.
+static NEVER: AtomicBool = AtomicBool::new(false);
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -371,6 +374,19 @@ pub fn scan_pass_with_progress(
     token: &str,
     on_progress: &(dyn Fn(ScanProgress) + Sync),
 ) -> Result<ScanPass, GithubError> {
+    scan_pass_with_progress_cancellable(opts, host, packs, token, &NEVER, on_progress)
+}
+
+/// Like [`scan_pass_with_progress`] but skips the remaining repos as soon as `cancel` is set —
+/// a Stop during a long org-wide scan returns a partial result (skipped repos are reported clean).
+pub fn scan_pass_with_progress_cancellable(
+    opts: &GithubRunOpts,
+    host: &dyn RepoHost,
+    packs: &[Pack],
+    token: &str,
+    cancel: &AtomicBool,
+    on_progress: &(dyn Fn(ScanProgress) + Sync),
+) -> Result<ScanPass, GithubError> {
     let repos = host.list_repos(opts.include_forks, &opts.orgs)?;
     let total = repos.len();
     let cache = BlobCache::new();
@@ -380,7 +396,17 @@ pub fn scan_pass_with_progress(
     let scanned = repos
         .par_iter()
         .map(|repo| {
-            let result = api_scan_repo(repo, host, packs, &cache, token);
+            // Cancelled: skip the network-heavy scan and report the repo clean.
+            let result = if cancel.load(Ordering::Relaxed) {
+                Ok(ScannedRepo {
+                    repo: repo.clone(),
+                    findings: Vec::new(),
+                    error: None,
+                    auto_fixable: false,
+                })
+            } else {
+                api_scan_repo(repo, host, packs, &cache, token)
+            };
             let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
             on_progress(ScanProgress { done, total, repo: repo.full_name.clone() });
             result

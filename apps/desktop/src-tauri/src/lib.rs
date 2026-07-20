@@ -10,7 +10,9 @@ use wormward_core::{
     plan_remediation, restore as core_restore, scan_repo, scan_streaming, BranchCleanStatus,
     Finding, RemediationAction, ScanReport,
 };
-use wormward_github::pipeline::{fix_pass, scan_pass_with_progress, GithubRunOpts, ScanPass};
+use wormward_github::pipeline::{
+    fix_pass, scan_pass_with_progress_cancellable, GithubRunOpts, ScanPass,
+};
 use wormward_github::{resolve_token, GitHubHost, RepoHost};
 use wormward_osm::{enrich, OsmClient};
 use wormward_packs::builtin_packs;
@@ -106,6 +108,10 @@ pub struct ScanProgress {
 /// a repo, so Stop is honored even in the middle of one large repository.
 type ScanCancel = Arc<AtomicBool>;
 
+/// Cross-command cancel flag for a running GitHub account scan. `cancel_github_scan` sets it;
+/// `github_scan` clears it at the start and skips the remaining repos once it's set.
+type GithubScanCancel = Arc<AtomicBool>;
+
 #[tauri::command]
 async fn scan(
     dirs: Vec<String>,
@@ -174,6 +180,13 @@ async fn scan(
 /// next file (or repo boundary) and returns a partial report with `cancelled = true`.
 #[tauri::command]
 fn cancel_scan(cancel: tauri::State<'_, ScanCancel>) {
+    cancel.store(true, Ordering::Relaxed);
+}
+
+/// Request cancellation of a running GitHub account scan. Cooperative: the remaining repos are
+/// skipped (reported clean) and the partial result returns.
+#[tauri::command]
+fn cancel_github_scan(cancel: tauri::State<'_, GithubScanCancel>) {
     cancel.store(true, Ordering::Relaxed);
 }
 
@@ -430,6 +443,7 @@ async fn github_scan(
     orgs: Vec<String>,
     window: tauri::Window,
     state: tauri::State<'_, GithubScanState>,
+    cancel: tauri::State<'_, GithubScanCancel>,
 ) -> Result<Vec<GithubRepoView>, String> {
     let token = resolve_token(token.as_deref()).map_err(|e| e.to_string())?;
     let host = GitHubHost::new(token.clone());
@@ -442,7 +456,10 @@ async fn github_scan(
         yes: false,
         orgs,
     };
-    let scan = scan_pass_with_progress(&opts, &host, &packs, &token, &|p| {
+    // Fresh run: clear any stale cancel request from a previous scan.
+    cancel.store(false, Ordering::Relaxed);
+    let flag: Arc<AtomicBool> = cancel.inner().clone();
+    let scan = scan_pass_with_progress_cancellable(&opts, &host, &packs, &token, &flag, &|p| {
         // Best-effort: a failed emit must never fail the scan.
         let _ = window.emit("github-scan-progress", &p);
     })
@@ -558,6 +575,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(GithubScanState::new(None))
         .manage(ScanCancel::new(AtomicBool::new(false)))
+        .manage(GithubScanCancel::new(AtomicBool::new(false)))
         .invoke_handler(tauri::generate_handler![
             scan,
             cancel_scan,
@@ -572,7 +590,8 @@ pub fn run() {
             github_fix,
             doctor,
             doctor_clear_cache,
-            doctor_harden_triggers
+            doctor_harden_triggers,
+            cancel_github_scan
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wormward desktop");
