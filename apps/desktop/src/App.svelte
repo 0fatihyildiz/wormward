@@ -21,10 +21,19 @@
     ["settings", "Settings"],
   ] as const;
 
-  // Respect the user's motion preference for the JS-driven route transition
-  // (CSS media query can't reach Svelte transitions).
-  const reduce =
-    typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // Respect the user's motion preference for the JS-driven route transitions (CSS media
+  // queries can't reach Svelte transitions). Reactive, so toggling the OS setting mid-session
+  // applies immediately and stays in sync with the CSS @media block.
+  let reduce = $state(
+    typeof matchMedia !== "undefined" && matchMedia("(prefers-reduced-motion: reduce)").matches,
+  );
+  $effect(() => {
+    if (typeof matchMedia === "undefined") return;
+    const mq = matchMedia("(prefers-reduced-motion: reduce)");
+    const on = () => (reduce = mq.matches);
+    mq.addEventListener("change", on);
+    return () => mq.removeEventListener("change", on);
+  });
 
   // Keep each screen mounted after its first visit so its local state (scan results, live log,
   // clean plans, form inputs) survives tab switches — only the active one is shown. Lazy, so an
@@ -59,15 +68,21 @@
     window.addEventListener("resize", on);
     return () => window.removeEventListener("resize", on);
   });
+  // Re-align the pill once web fonts settle — button widths can shift after first paint.
+  $effect(() => {
+    if (typeof document !== "undefined" && document.fonts) document.fonts.ready.then(place);
+  });
 
   // Notifications: failures persist until dismissed; non-error notices auto-clear (see notify()).
 </script>
+
+<a class="skip" href="#main">Skip to content</a>
 
 <header class="topbar">
   <div class="brand">
     <img class="logo" src={logo} alt="Wormward" width="46" height="46" />
   </div>
-  <nav bind:this={navEl}>
+  <nav bind:this={navEl} aria-label="Primary">
     {#if ind.ready}
       <span class="indicator" style="transform: translateX({ind.left}px); width: {ind.width}px;"></span>
     {/if}
@@ -107,7 +122,7 @@
   </div>
 {/if}
 
-<main>
+<main id="main" tabindex="-1">
   {#each tabs as [id]}
     <div class="screen" hidden={app.screen !== id}>
       {#if visited[id]}
@@ -135,6 +150,21 @@
   }
   .brand { display: flex; align-items: center; }
   .logo { width: 46px; height: 46px; border-radius: 10px; display: block; }
+  .skip {
+    position: absolute;
+    left: 12px;
+    top: -48px;
+    z-index: 100;
+    background: var(--accent);
+    color: #0a0a12;
+    padding: 8px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-weight: 600;
+    transition: top var(--fast) var(--ease);
+  }
+  .skip:focus { top: 10px; }
+  main:focus { outline: none; }
   nav { position: relative; display: flex; gap: 2px; }
   nav button {
     position: relative;
