@@ -514,7 +514,7 @@ pub fn scan_keychain_procs(procs: &[(u32, String)]) -> Vec<MachineHit> {
 /// Known C2 hosts/IPs for the network check — pulled live from the PolinRider pack (ioc_domains +
 /// hardcoded exfil IPs), so it stays in sync with the catalog. Community entries are excluded.
 fn c2_hosts() -> Vec<String> {
-    let pack = wormward_packs::polinrider_pack();
+    let pack = polinrider_pack();
     let mut hosts = pack.manifest.ioc_domains.clone();
     for sig in &pack.manifest.content_signatures {
         if sig.id.starts_with("c2-exfil-ip") || sig.id == "c2-ethereum-ip" {
@@ -601,7 +601,7 @@ fn global_package_names() -> Vec<String> {
 /// Run every deep-hygiene detector against the live machine. Read-only.
 pub fn scan_machine() -> Vec<MachineHit> {
     let procs = list_processes();
-    let bad = wormward_packs::polinrider_pack().manifest.bad_npm_packages.clone();
+    let bad = polinrider_pack().manifest.bad_npm_packages.clone();
     let mut hits = Vec::new();
     hits.extend(scan_shell_rc(&shell_rc_files()));
     hits.extend(scan_persistence(&persistence_items()));
