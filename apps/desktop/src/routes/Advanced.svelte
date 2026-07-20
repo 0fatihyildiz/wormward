@@ -1,9 +1,24 @@
 <script lang="ts">
   import { app, fail, clearErrors, go } from "../lib/state.svelte";
-  import { githubScan, githubFix, githubOrgs, cancelGithubScan } from "../lib/api";
+  import {
+    githubScan,
+    githubFix,
+    githubOrgs,
+    cancelGithubScan,
+    cleanBranchesPreview,
+    cleanBranchesApply,
+    restore,
+  } from "../lib/api";
   import { dialog } from "../lib/modal";
   import { listen } from "@tauri-apps/api/event";
-  import type { GithubRepoView, GithubFixView, ScanProgress } from "../lib/types";
+  import type {
+    GithubRepoView,
+    GithubFixView,
+    ScanProgress,
+    BranchCleanPreview,
+    BranchSelection,
+    BranchCleanResult,
+  } from "../lib/types";
 
   const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
 
@@ -136,6 +151,85 @@
   }
 
   const pct = $derived(progress && progress.total ? (progress.done / progress.total) * 100 : 0);
+
+  // ---------------- Other branches: deep clean + optional force-push ----------------
+  let busy = $state(false);
+  let busyKind = $state<"branches" | "restore" | "">("");
+  let branchPlans = $state<BranchCleanPreview[]>([]);
+  let branchSel = $state<Record<string, boolean>>({});
+  let pushBranches = $state(false);
+  let branchLoading = $state(false);
+  let confirmingBranches = $state(false);
+  let branchResults = $state<BranchCleanResult[]>([]);
+  let branchSummary = $state("");
+  let branchesScanned = $state(false);
+  const branchKey = (b: { repo: string; branch: string }) => `${b.repo}\n${b.branch}`;
+  const selectedBranches = $derived<BranchSelection[]>(
+    branchPlans.filter((b) => branchSel[branchKey(b)]).map((b) => ({ repo: b.repo, branch: b.branch })),
+  );
+
+  async function previewBranches() {
+    branchLoading = true;
+    clearErrors();
+    try {
+      branchPlans = await cleanBranchesPreview(app.dirs);
+      const s: Record<string, boolean> = {};
+      for (const b of branchPlans) s[branchKey(b)] = true;
+      branchSel = s;
+      branchesScanned = true;
+    } catch (e) {
+      fail(e);
+    } finally {
+      branchLoading = false;
+    }
+  }
+
+  async function applyBranches() {
+    confirmingBranches = false;
+    busy = true;
+    busyKind = "branches";
+    branchSummary = "";
+    clearErrors();
+    try {
+      const s = await cleanBranchesApply(selectedBranches, pushBranches);
+      branchResults = s.results;
+      branchSummary =
+        `Cleaned ${s.cleaned} ${plural(s.cleaned, "branch", "branches")}` +
+        (s.skipped ? `, ${s.skipped} skipped` : "") +
+        (s.failed ? `, ${s.failed} failed` : "") +
+        ".";
+      await previewBranches();
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = false;
+      busyKind = "";
+    }
+  }
+
+  // ---------------- Restore last backup ----------------
+  let restoreConfirm = $state(false);
+  let restoreResult = $state("");
+
+  async function doRestore() {
+    restoreConfirm = false;
+    busy = true;
+    busyKind = "restore";
+    restoreResult = "";
+    clearErrors();
+    try {
+      const s = await restore(app.dirs);
+      restoreResult =
+        s.restored > 0
+          ? `Restored ${s.restored} ${plural(s.restored, "file", "files")} across ${s.repos} ${plural(s.repos, "repo", "repos")}.`
+          : "No backup found to restore.";
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = false;
+      busyKind = "";
+    }
+  }
 </script>
 
 <div class="page">
@@ -320,6 +414,70 @@
       </div>
     </section>
   {/if}
+
+  <!-- Other branches -->
+  <section class="card">
+    <h2>Other branches — deep clean &amp; optional push</h2>
+    <p class="lede">
+      Deep-scan every branch tip and rewrite infected tips on a fresh commit (the old tip is kept in
+      a <code>refs/wormward-backup/…</code> ref). Turning on <strong>Push</strong> force-pushes the
+      rewritten tips, overwriting remote history.
+    </p>
+    {#if !app.dirs.length}
+      <p class="muted small">Add a protected location in Settings to scan branches.</p>
+    {/if}
+    <div class="row">
+      <button class="btn sm" onclick={previewBranches} disabled={branchLoading || busy || !app.dirs.length}>
+        {#if branchLoading}<span class="spinner"></span>Scanning branches…{:else}Scan other branches{/if}
+      </button>
+      <button class="btn primary sm" onclick={() => (confirmingBranches = true)} disabled={busy || selectedBranches.length === 0}>
+        {#if busyKind === "branches"}<span class="spinner"></span>Cleaning…{:else}Clean {selectedBranches.length} {plural(selectedBranches.length, "branch", "branches")}{/if}
+      </button>
+      <label class="switch sm">
+        <input type="checkbox" bind:checked={pushBranches} />
+        <span class="track"></span>
+        <span class="lbl small">Push <span class="muted">— force-push tips</span></span>
+      </label>
+    </div>
+    {#if branchSummary}<p class="ok-text small" role="status">{branchSummary}</p>{/if}
+    {#if branchPlans.length === 0}
+      {#if branchesScanned}<p class="muted micro">No infected branch tips found.</p>{/if}
+    {:else}
+      <ul class="branch-list">
+        {#each branchPlans as b (branchKey(b))}
+          <li>
+            <label class="switch item">
+              <input type="checkbox" bind:checked={branchSel[branchKey(b)]} />
+              <span class="track"></span>
+              <span class="lbl small"><span class="mono">{b.repo}</span> <span class="chip">branch: {b.branch}</span> <span class="muted">— {b.action_count} {plural(b.action_count, "action", "actions")}</span></span>
+            </label>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+    {#if branchResults.length}
+      <div class="stack" style="margin-top: 4px" role="status">
+        {#each branchResults as r, i (i)}
+          <div class="branch-res {r.status}"><span class="dot"></span><span class="mono">{r.branch}</span> — {r.status}{r.pushed ? " (pushed)" : ""}{#if r.message} — {r.message}{/if}</div>
+        {/each}
+      </div>
+    {/if}
+  </section>
+
+  <!-- Restore last backup -->
+  <section class="card">
+    <h2>Restore last backup</h2>
+    <p class="lede">
+      Undo a clean by restoring the last backup. <strong>This re-introduces the removed payloads</strong>
+      over the current files — only do this if a clean went wrong. If no backup exists, nothing changes.
+    </p>
+    <div class="row between">
+      {#if restoreResult}<p class="ok-text small" role="status">{restoreResult}</p>{:else}<span></span>{/if}
+      <button class="btn danger sm" onclick={() => (restoreConfirm = true)} disabled={busy || !app.dirs.length}>
+        {#if busyKind === "restore"}<span class="spinner"></span>Restoring…{:else}Restore last backup{/if}
+      </button>
+    </div>
+  </section>
 </div>
 
 {#if confirming}
@@ -347,6 +505,52 @@
   </div>
 {/if}
 
+{#if confirmingBranches}
+  <div class="modal-backdrop">
+    <div
+      class="modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="branch-clean-title"
+      tabindex="-1"
+      use:dialog={() => (confirmingBranches = false)}
+    >
+      <h3 id="branch-clean-title">Rewrite branch tips?</h3>
+      <p class="lede">Rewrites the tips of {selectedBranches.length} selected {plural(selectedBranches.length, "branch", "branches")} with a new clean commit. The old tip of each is kept in a <code>refs/wormward-backup/…</code> ref.</p>
+      {#if pushBranches}
+        <p class="crit small"><strong>Push is ON:</strong> cleaned tips will be <strong>force-pushed</strong>, overwriting remote history.</p>
+      {:else}
+        <p class="muted small">Push is OFF — local branches rewritten in place; remote-tracking branches are reported as skipped.</p>
+      {/if}
+      <div class="row">
+        <button class="btn ghost" onclick={() => (confirmingBranches = false)}>Cancel</button>
+        <button class="btn {pushBranches ? 'danger' : 'primary'}" onclick={applyBranches}>{pushBranches ? "Clean & force-push" : "Clean branches"}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if restoreConfirm}
+  <div class="modal-backdrop">
+    <div
+      class="modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="restore-title"
+      tabindex="-1"
+      use:dialog={() => (restoreConfirm = false)}
+    >
+      <h3 id="restore-title">Restore the last backup?</h3>
+      <p class="crit small"><strong>This re-writes the backed-up originals over the current files</strong> — including the malware that was cleaned. Only do this if a clean went wrong.</p>
+      <p class="muted small">If no backup exists, nothing changes.</p>
+      <div class="row">
+        <button class="btn ghost" onclick={() => (restoreConfirm = false)}>Cancel</button>
+        <button class="btn danger" onclick={doRestore}>Restore &amp; re-introduce</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .back { align-self: flex-start; margin-bottom: 6px; }
   .repo-list { list-style: none; display: flex; flex-direction: column; }
@@ -361,4 +565,13 @@
     font-size: 12px;
   }
   .res-line { word-break: break-all; }
+  .branch-list { list-style: none; display: flex; flex-direction: column; gap: 2px; }
+  .branch-res { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .branch-res .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .branch-res.cleaned { color: var(--ok); }
+  .branch-res.cleaned .dot { background: var(--ok); }
+  .branch-res.skipped .dot { background: var(--warn); }
+  .branch-res.failed { color: var(--danger); }
+  .branch-res.failed .dot { background: var(--danger); }
+  .branch-res.planned .dot { background: var(--accent); }
 </style>
