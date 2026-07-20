@@ -246,6 +246,7 @@ fn scan_files_inner(
         findings.extend(check_artifacts(repo, files, pack));
         findings.extend(check_gitignore(repo, files, pack));
         findings.extend(check_npm(repo, files, pack));
+        findings.extend(crate::lockfile::check_lockfiles(repo, files, pack));
     }
 
     // `remediable` must track whether an auto-remediation action actually exists

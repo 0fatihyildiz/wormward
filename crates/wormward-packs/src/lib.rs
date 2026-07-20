@@ -569,4 +569,56 @@ mod tests {
             "history pickaxe must surface the scrubbed payload, got {hist:?}"
         );
     }
+
+    // ---- Phase 1 lockfile / dependency detection (G2) ----
+
+    #[test]
+    fn lockfile_flags_bad_package_version() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("pnpm-lock.yaml"),
+            "packages:\n  /tailwindcss-style-animate@1.1.6:\n    resolution: {integrity: sha512-x}\n",
+        )
+        .unwrap();
+        let f = scan_repo(&repo, &builtin_packs());
+        assert!(
+            f.iter().any(|x| x.campaign == "polinrider"
+                && x.signature_id == "pkg:npm:tailwindcss-style-animate@1.1.6"),
+            "malicious locked package must be flagged, got {f:?}"
+        );
+    }
+
+    #[test]
+    fn lockfile_clean_version_not_flagged() {
+        // A different (safe) version of a version-pinned bad package must NOT fire.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("clean");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("pnpm-lock.yaml"),
+            "packages:\n  /tailwindcss-style-animate@9.9.9:\n    resolution: {integrity: sha512-x}\n  /react@18.2.0:\n    resolution: {integrity: sha512-y}\n",
+        )
+        .unwrap();
+        assert!(
+            scan_repo(&repo, &builtin_packs()).is_empty(),
+            "a non-malicious version of a version-pinned package must not fire"
+        );
+    }
+
+    #[test]
+    fn lockfile_flags_composer_package() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("composer.lock"),
+            r#"{"packages":[{"name":"thiio/kubernetes-php-sdk","version":"1.0.0"}]}"#,
+        )
+        .unwrap();
+        assert!(scan_repo(&repo, &builtin_packs())
+            .iter()
+            .any(|x| x.signature_id == "pkg:composer:thiio/kubernetes-php-sdk@1.0.0"));
+    }
 }
