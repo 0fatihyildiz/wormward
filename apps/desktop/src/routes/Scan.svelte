@@ -89,11 +89,12 @@
       </p>
     </div>
 
-    <div class="opts">
+    <fieldset class="opts">
+      <legend class="sr">Scan options</legend>
       <label class="switch">
         <input type="checkbox" bind:checked={deep} disabled={app.scanning} />
         <span class="track"></span>
-        <span class="lbl">Deep scan <span class="muted">— inspect every branch tip</span></span>
+        <span class="lbl">Deep scan <span class="muted">— check the latest commit on every branch, not just the default one</span></span>
       </label>
       <label class="switch">
         <input type="checkbox" bind:checked={online} disabled={app.scanning} />
@@ -106,7 +107,7 @@
           service.{#if noOsmToken} Needs a token — add one in Settings.{/if}
         </p>
       {/if}
-    </div>
+    </fieldset>
 
     <div class="row">
       {#if app.scanning}
@@ -145,7 +146,9 @@
 
   {#if app.scanning || repoLog.length}
     <section class="terminal">
-      <div class="term-body" bind:this={bodyEl}>
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+      <!-- Intentionally focusable so the scrollable log is keyboard-scrollable (WCAG 2.1.1). -->
+      <div class="term-body" bind:this={bodyEl} tabindex="0" role="log" aria-label="Scan progress log">
         {#each repoLog as r (r.repo)}
           {#if r.phase === "scanning"}
             <div class="line scanning">
@@ -184,7 +187,7 @@
     word-break: break-all;
   }
   .path-preview.empty { color: var(--faint); }
-  .opts { display: flex; flex-direction: column; gap: 4px; padding: 2px 0; }
+  .opts { display: flex; flex-direction: column; gap: 4px; padding: 2px 0; margin: 0; border: 0; min-width: 0; }
   .opt-note {
     font-size: 11.5px;
     color: var(--muted);
