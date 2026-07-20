@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app } from "../lib/state.svelte";
+  import { app, fail, clearErrors } from "../lib/state.svelte";
   import { scan, pickDirs, cancelScan } from "../lib/api";
   import { listen } from "@tauri-apps/api/event";
   import type { ScanProgress } from "../lib/types";
@@ -15,12 +15,12 @@
       const dirs = await pickDirs();
       if (dirs.length) app.dirs = dirs;
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     }
   }
 
   async function run() {
-    app.error = "";
+    clearErrors();
     app.scanning = true;
     repoLog = [];
     progress = null;
@@ -39,7 +39,7 @@
       app.report = await scan(app.dirs.length ? app.dirs : ["."], deep, online, token);
       app.screen = "results";
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       unlisten();
       app.scanning = false;
@@ -51,7 +51,7 @@
     try {
       await cancelScan();
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     }
   }
 
@@ -150,7 +150,6 @@
     font-size: 12px;
     color: var(--fg);
     background: var(--inset);
-    border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     padding: 9px 12px;
     word-break: break-all;

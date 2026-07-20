@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app } from "./lib/state.svelte";
+  import { app, dismiss } from "./lib/state.svelte";
   import Scan from "./routes/Scan.svelte";
   import Results from "./routes/Results.svelte";
   import Clean from "./routes/Clean.svelte";
@@ -60,12 +60,7 @@
     return () => window.removeEventListener("resize", on);
   });
 
-  // Auto-dismiss the error toast after a while; manual dismiss stays available.
-  $effect(() => {
-    if (!app.error) return;
-    const t = setTimeout(() => (app.error = ""), 7000);
-    return () => clearTimeout(t);
-  });
+  // Notifications: failures persist until dismissed; non-error notices auto-clear (see notify()).
 </script>
 
 <header class="topbar">
@@ -86,20 +81,29 @@
 </header>
 
 {#if !isTauri}
-  <div class="env-banner" role="alert">
-    <strong>Browser preview</strong> — the scanner backend isn't reachable here, so scanning,
-    cleaning and GitHub actions won't work. Run the desktop app:
-    <code>cd apps/desktop &amp;&amp; npm run tauri dev</code>
+  <div class="env-banner" role="status">
+    <strong>Browser preview</strong> — scanning, cleaning, and GitHub actions run in the Wormward
+    desktop app. Open it on your desktop to use them.
   </div>
 {/if}
 
-{#if app.error}
+{#if app.toasts.length}
   <div class="toast-wrap">
-    <div class="toast" role="alert" out:fly={{ y: -10, duration: reduce ? 0 : 160, easing: cubicOut }}>
-      <span class="dot"></span>
-      <span class="msg">{app.error}</span>
-      <button class="x" aria-label="Dismiss" onclick={() => (app.error = "")}>×</button>
-    </div>
+    {#each app.toasts as t (t.id)}
+      <div
+        class="toast {t.kind}"
+        role={t.kind === "error" ? "alert" : "status"}
+        in:fly={{ y: -8, duration: reduce ? 0 : 150, easing: cubicOut }}
+        out:fly={{ y: -10, duration: reduce ? 0 : 150, easing: cubicOut }}
+      >
+        <span class="dot"></span>
+        <div class="body">
+          <span class="msg">{t.message}</span>
+          {#if t.detail}<span class="detail">{t.detail}</span>{/if}
+        </div>
+        <button class="x" aria-label="Dismiss" onclick={() => dismiss(t.id)}>×</button>
+      </div>
+    {/each}
   </div>
 {/if}
 
@@ -163,13 +167,6 @@
     color: var(--warn);
     font-size: 12.5px;
     line-height: 1.5;
-    border-bottom: 1px solid var(--border);
-  }
-  .env-banner code {
-    background: rgba(0, 0, 0, 0.28);
-    color: var(--fg);
-    padding: 1px 6px;
-    border-radius: 5px;
   }
   main { min-height: calc(100vh - var(--topbar-h)); }
   .screen[hidden] { display: none; }

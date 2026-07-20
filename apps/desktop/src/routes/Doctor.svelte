@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { doctor, doctorClearCache, doctorHardenTriggers } from "../lib/api";
   import type { DoctorReport } from "../lib/types";
-  import { app } from "../lib/state.svelte";
+  import { app, fail } from "../lib/state.svelte";
 
   let report = $state<DoctorReport | null>(null);
   let running = $state(false);
@@ -20,7 +20,7 @@
       report = await doctor();
       scanned = true;
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       running = false;
     }
@@ -50,7 +50,7 @@
       await doctorHardenTriggers();
       await runCheck();
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       hardening = false;
     }
@@ -62,7 +62,7 @@
       await doctorClearCache(dir);
       await runCheck();
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       clearing = null;
     }

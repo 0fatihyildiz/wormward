@@ -1,7 +1,7 @@
 <script lang="ts">
   import { listPacks } from "../lib/api";
   import type { PackInfo } from "../lib/types";
-  import { app } from "../lib/state.svelte";
+  import { app, fail } from "../lib/state.svelte";
 
   let packs = $state<PackInfo[]>([]);
   let token = $state(localStorage.getItem("osm_token") ?? "");
@@ -10,7 +10,7 @@
   $effect(() => {
     listPacks()
       .then((p) => (packs = p))
-      .catch((e) => (app.error = String(e)));
+      .catch((e) => (fail(e)));
   });
 
   function saveToken() {

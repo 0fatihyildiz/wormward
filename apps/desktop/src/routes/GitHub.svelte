@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app } from "../lib/state.svelte";
+  import { app, fail, clearErrors } from "../lib/state.svelte";
   import { githubScan, githubFix, githubOrgs } from "../lib/api";
   import { dialog } from "../lib/modal";
   import { listen } from "@tauri-apps/api/event";
@@ -55,7 +55,7 @@
 
   async function scan() {
     scanning = true;
-    app.error = "";
+    clearErrors();
     results = [];
     progress = null;
     // Register BEFORE invoking so no early event is missed.
@@ -74,7 +74,7 @@
       sel = s;
       scanned = true;
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       unlisten();
       scanning = false;
@@ -85,11 +85,11 @@
   async function fix() {
     confirming = false;
     fixing = true;
-    app.error = "";
+    clearErrors();
     try {
       results = await githubFix(selectedNames);
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       fixing = false;
     }

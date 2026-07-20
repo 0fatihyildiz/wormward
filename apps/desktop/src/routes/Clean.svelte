@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app } from "../lib/state.svelte";
+  import { app, fail, clearErrors } from "../lib/state.svelte";
   import {
     cleanPreview,
     cleanApply,
@@ -47,14 +47,14 @@
 
   async function preview() {
     loading = true;
-    app.error = "";
+    clearErrors();
     try {
       plans = await cleanPreview(dirs);
       const sel: Record<string, boolean> = {};
       for (const p of plans) if (p.actions.length) sel[p.repo] = true;
       repoSel = sel;
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       loading = false;
     }
@@ -68,7 +68,7 @@
     confirming = false;
     busy = true;
     result = "";
-    app.error = "";
+    clearErrors();
     try {
       const s = await cleanApply(selectedRepos);
       result =
@@ -77,7 +77,7 @@
         (s.backups.length ? `. Backup at ${s.backups[0]}` : "");
       await preview();
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       busy = false;
     }
@@ -86,12 +86,12 @@
   async function doRestore() {
     busy = true;
     result = "";
-    app.error = "";
+    clearErrors();
     try {
       const s = await restore(dirs);
       result = `Restored ${s.restored} file(s) across ${s.repos} repo(s).`;
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       busy = false;
     }
@@ -99,14 +99,14 @@
 
   async function previewBranches() {
     branchLoading = true;
-    app.error = "";
+    clearErrors();
     try {
       branchPlans = await cleanBranchesPreview(dirs);
       const sel: Record<string, boolean> = {};
       for (const b of branchPlans) sel[branchKey(b)] = true;
       branchSel = sel;
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       branchLoading = false;
     }
@@ -122,7 +122,7 @@
     confirmingBranches = false;
     busy = true;
     branchSummary = "";
-    app.error = "";
+    clearErrors();
     try {
       const s = await cleanBranchesApply(selectedBranches, pushBranches);
       branchResults = s.results;
@@ -133,7 +133,7 @@
         ".";
       await previewBranches();
     } catch (e) {
-      app.error = String(e);
+      fail(e);
     } finally {
       busy = false;
     }
