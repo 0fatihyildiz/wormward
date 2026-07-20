@@ -49,9 +49,24 @@
     }
   }
 
+  const fixableRepos = $derived(repos.filter((r) => r.fixable));
+  // Repos already cleaned this session — never re-arm the force-push against them.
+  const fixedNames = $derived(new Set(results.filter((r) => r.fixed).map((r) => r.full_name)));
   const selectedNames = $derived(
-    repos.filter((r) => r.fixable && sel[r.full_name]).map((r) => r.full_name)
+    fixableRepos
+      .filter((r) => sel[r.full_name] && !fixedNames.has(r.full_name))
+      .map((r) => r.full_name)
   );
+  const selectableCount = $derived(fixableRepos.filter((r) => !fixedNames.has(r.full_name)).length);
+
+  function selectAll() {
+    const s = { ...sel };
+    for (const r of fixableRepos) if (!fixedNames.has(r.full_name)) s[r.full_name] = true;
+    sel = s;
+  }
+  function clearAll() {
+    sel = {};
+  }
 
   async function scan() {
     scanning = true;
@@ -69,9 +84,10 @@
       // always scanned regardless.
       const chosen = orgs.filter((o) => selectedOrgs[o]);
       repos = await githubScan(token || undefined, includeForks, chosen);
-      const s: Record<string, boolean> = {};
-      for (const r of repos) if (r.fixable) s[r.full_name] = true;
-      sel = s;
+      // Default to UNSELECTED — a destructive multi-repo remote force-push must be a
+      // deliberate, per-repo choice, never armed for the whole account by default.
+      sel = {};
+      results = [];
       scanned = true;
     } catch (e) {
       fail(e);
@@ -88,6 +104,8 @@
     clearErrors();
     try {
       results = await githubFix(selectedNames);
+      // Disarm: clear the selection so the just-pushed repos aren't re-fixable in one click.
+      sel = {};
     } catch (e) {
       fail(e);
     } finally {
@@ -111,7 +129,10 @@
     <div class="row">
       <input
         type="password"
-        placeholder="ghp_… (blank = gh auth token / GITHUB_TOKEN / GH_TOKEN)"
+        aria-label="GitHub token"
+        placeholder="ghp_… (or leave blank to use your gh CLI login)"
+        autocomplete="off"
+        spellcheck="false"
         bind:value={token}
         oninput={saveToken}
         style="flex:1"
@@ -142,7 +163,7 @@
         </div>
       </div>
     {:else if orgsError}
-      <p class="muted small">Couldn't list orgs — scanning all.</p>
+      <p class="warn-note">Couldn't list your organizations, so all of them will be scanned.</p>
     {/if}
 
     <div class="row">
@@ -154,7 +175,7 @@
         onclick={() => (confirming = true)}
         disabled={fixing || selectedNames.length === 0}
       >
-        Fix &amp; push selected…
+        {#if fixing}<span class="spinner"></span>Pushing…{:else}Fix &amp; push {selectedNames.length} selected…{/if}
       </button>
     </div>
 
@@ -186,37 +207,61 @@
     </div>
   {:else if repos.length}
     <section class="card">
-      <h2>Infected repositories</h2>
-      {#each repos as r, i}
-        <label class="switch item reveal" style="animation-delay: {Math.min(i, 12) * 25}ms">
-          <input type="checkbox" bind:checked={sel[r.full_name]} disabled={!r.fixable} />
-          <span class="track"></span>
-          <span class="lbl small" style="flex:1;min-width:0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-            <strong class="mono">{r.full_name}</strong>
-            <span class="count">{r.findings}</span>
-            {#if r.campaigns.length}<span class="muted">{r.campaigns.join(", ")}</span>{/if}
-            {#if !r.fixable}<span class="chip">branch-only</span>{/if}
-          </span>
-        </label>
-      {/each}
+      <div class="row between">
+        <h2>Infected repositories</h2>
+        {#if selectableCount}
+          <div class="row" style="gap: 8px">
+            <span class="muted micro">{selectedNames.length} of {selectableCount} selected</span>
+            <button class="btn ghost sm" onclick={selectAll}>Select all</button>
+            <button class="btn ghost sm" onclick={clearAll}>Clear</button>
+          </div>
+        {/if}
+      </div>
+      <ul class="repo-list">
+        {#each repos as r, i (r.full_name)}
+          {@const done = fixedNames.has(r.full_name)}
+          <li class="reveal" style="animation-delay: {Math.min(i, 12) * 25}ms">
+            <label class="switch item" class:done>
+              <input type="checkbox" bind:checked={sel[r.full_name]} disabled={!r.fixable || done} />
+              <span class="track"></span>
+              <span class="lbl small repo-line">
+                <strong class="mono">{r.full_name}</strong>
+                <span class="count">{r.findings}</span>
+                {#if r.campaigns.length}<span class="muted">{r.campaigns.join(", ")}</span>{/if}
+                {#if done}<span class="chip ok-chip">Cleaned ✓</span>
+                {:else if !r.fixable}<span class="chip">branch-only</span>{/if}
+              </span>
+            </label>
+          </li>
+        {/each}
+      </ul>
+      {#if repos.some((r) => !r.fixable)}
+        <p class="muted micro">
+          "branch-only" repositories have the infection on a non-default branch — clean those from
+          the Clean screen.
+        </p>
+      {/if}
     </section>
   {/if}
 
   {#if results.length}
-    <section class="card">
-      <h2>Fix results</h2>
+    <section class="card" aria-live="polite">
+      <div class="row between">
+        <h2>Fix results</h2>
+        <button class="btn sm" onclick={scan} disabled={scanning || fixing}>Re-scan to confirm</button>
+      </div>
       <div class="stack">
-        {#each results as r}
-          <div class="small {r.error || r.manual_review ? 'crit' : r.fixed ? 'ok-text' : 'muted'}">
-            <span class="mono">{r.full_name}</span>:
+        {#each results as r, i (i)}
+          <div class="res-line small {r.error || r.manual_review ? 'crit' : r.fixed ? 'ok-text' : 'muted'}">
+            <span class="mono">{r.full_name}</span> —
             {#if r.error}
-              error — {r.error}
+              couldn't fix: {r.error}
             {:else if r.manual_review}
-              detected — manual review needed (payload not auto-strippable)
+              needs manual review — the malicious code couldn't be safely removed automatically
             {:else if r.fixed}
-              fixed{r.pushed.length ? ` — pushed ${r.pushed.join(", ")}` : ""}
+              cleaned and pushed{r.pushed.length ? ` to ${r.pushed.join(", ")}` : ""}
             {:else}
-              no changes
+              already clean — no changes needed
             {/if}
           </div>
         {/each}
@@ -242,3 +287,18 @@
     </div>
   </div>
 {/if}
+
+<style>
+  .repo-list { list-style: none; display: flex; flex-direction: column; }
+  .repo-line { flex: 1; min-width: 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .switch.item.done { opacity: 0.65; }
+  .ok-chip { background: var(--ok-tint); color: var(--ok); }
+  .warn-note {
+    color: var(--warn);
+    background: var(--surface-warn);
+    padding: 8px 11px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+  }
+  .res-line { word-break: break-all; }
+</style>
