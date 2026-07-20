@@ -1,6 +1,10 @@
+mod axios_bluenoroff;
+mod glassworm;
 mod polinrider;
 mod shai_hulud;
 
+pub use axios_bluenoroff::axios_bluenoroff_pack;
+pub use glassworm::glassworm_pack;
 pub use polinrider::{polinrider_fingerprint, polinrider_pack};
 pub use shai_hulud::shai_hulud_pack;
 
@@ -8,7 +12,7 @@ use wormward_core::Pack;
 
 /// All campaign packs compiled into this build.
 pub fn builtin_packs() -> Vec<Pack> {
-    vec![polinrider_pack(), shai_hulud_pack()]
+    vec![polinrider_pack(), shai_hulud_pack(), glassworm_pack(), axios_bluenoroff_pack()]
 }
 
 #[cfg(test)]

@@ -1,0 +1,33 @@
+id: axios-bluenoroff
+name: Axios (BlueNoroff)
+description: >
+  BlueNoroff/Lazarus supply-chain compromise of SPECIFIC axios versions (2026-03-31), delivering a
+  Linux RAT. Distinct from PolinRider. axios itself is legitimate and hugely popular — ONLY the exact
+  malicious versions are flagged (never the package by name). The campaign's C2 IP, XOR key, and RAT
+  dropper path are specific literal indicators.
+references:
+  - https://github.com/branch8/PolinRiderScanner
+severity: critical
+
+target_files:
+  - "package.json"
+  - "index.js"
+  - "App.js"
+  - "app.js"
+
+content_signatures:
+  - id: c2-ip
+    kind: literal
+    value: "142.11.206.73"
+  - id: xor-key
+    kind: literal
+    value: "OrDeR_7077"
+  - id: rat-dropper-path
+    kind: literal
+    value: "/tmp/ld.py"
+
+# Version-pinned: a clean axios install must never match. Consumed by lockfile + node_modules scans.
+bad_packages:
+  npm:
+    - {name: axios, versions: ["1.14.1", "0.30.4"]}
+    - {name: plain-crypto-js, versions: ["4.2.1"]}

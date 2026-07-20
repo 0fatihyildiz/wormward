@@ -1,0 +1,27 @@
+id: glassworm
+name: Glassworm
+description: >
+  Invisible-Unicode (variation-selector / bidi) source-stego worm with Solana-Memo dead-drop C2.
+  STRUCTURALLY DISTINCT from PolinRider — do not conflate. The stego payload is caught by the
+  capability engine's campaign-agnostic invisible-unicode detector (not by literals here); this pack
+  adds the known malicious npm packages. Solana RPC hosts and the Memo program id are deliberately
+  NOT literal signatures — they are legitimate endpoints used by real dApps and would false-positive.
+references:
+  - https://socket.dev/blog/polinrider-north-korea-linked-supply-chain-campaign-expands
+severity: critical
+
+target_files:
+  - "package.json"
+
+# Clearly attacker-namespaced packages — safe to match by name.
+bad_npm_packages:
+  - "@aifabrix/miso-client"
+  - "@iflow-mcp/watercrawl-watercrawl-mcp"
+  - "@usebioerhold8733/s-format"
+
+# Names that collide with plausibly-legitimate packages are community-tier leads (advisory only),
+# so a clean install of a same-named package never produces a hard verdict.
+bad_packages:
+  npm:
+    - {name: "react-native-international-phone-number", confidence: community}
+    - {name: "react-native-country-select", confidence: community}
