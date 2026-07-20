@@ -21,8 +21,6 @@ export type FlowStep = "scanning" | "results" | "cleaning" | "clean";
 export const app = $state({
   view: "home" as View,
   flow: null as FlowStep | null,
-  // TRANSITIONAL: drives the legacy tab UI; App.svelte drops this in Phase 2.
-  screen: "scan" as "scan" | "github" | "doctor" | "settings",
   dirs: [] as string[],
   report: null as ScanReport | null,
   machineReport: null as DoctorReport | null,
