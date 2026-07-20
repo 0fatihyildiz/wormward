@@ -47,6 +47,9 @@ enum Command {
         /// Include lower-confidence, community-sourced IOC leads (suppressed by default).
         #[arg(long)]
         include_community: bool,
+        /// Also gate lockfiles against the OSV database via `osv-scanner` (if installed).
+        #[arg(long)]
+        osv: bool,
     },
     /// List the campaign packs compiled into this build.
     ListPacks,
@@ -210,7 +213,7 @@ fn github_exit_code(outcomes: &[wormward_github::pipeline::RepoOutcome]) -> u8 {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan { dirs, format, online, osm_token, deep, history, include_community } => {
+        Command::Scan { dirs, format, online, osm_token, deep, history, include_community, osv } => {
             for dir in &dirs {
                 if !dir.exists() {
                     eprintln!("error: path does not exist: {}", dir.display());
@@ -234,6 +237,31 @@ fn main() -> ExitCode {
             // single-source list never inflates a default scan's verdict.
             if !include_community {
                 report.findings.retain(|f| !f.signature_id.starts_with("pkg-community:"));
+            }
+            if osv {
+                if wormward_core::osv_available() {
+                    for dir in &dirs {
+                        for hit in wormward_core::osv_scan(dir) {
+                            report.findings.push(wormward_core::Finding {
+                                campaign: "osv".into(),
+                                severity: wormward_core::Severity::High,
+                                repo: dir.clone(),
+                                file: None,
+                                signature_id: format!("osv:{}", hit.advisory),
+                                kind: wormward_core::FindingKind::NpmPackage,
+                                evidence: format!(
+                                    "OSV malicious-package advisory {} for '{}'",
+                                    hit.advisory, hit.package
+                                ),
+                                remediable: false,
+                                online: None,
+                                git_ref: None,
+                            });
+                        }
+                    }
+                } else {
+                    eprintln!("warning: --osv requested but osv-scanner is not installed; skipping");
+                }
             }
             if online {
                 let token = osm_token

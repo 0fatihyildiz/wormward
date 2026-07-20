@@ -4,6 +4,7 @@ pub mod finding;
 pub mod git;
 pub mod lockfile;
 pub mod matchers;
+pub mod osv;
 pub mod pack;
 pub mod remediate;
 pub mod repo_files;
@@ -15,6 +16,7 @@ pub mod walk;
 pub use engine::{SigHit, SignatureEngine};
 pub use finding::{Finding, FindingKind, OnlineVerdict, Severity};
 pub use lockfile::{check_lockfiles, parse_lockfile, version_matches, LockEntry};
+pub use osv::{osv_available, osv_scan, OsvHit};
 pub use git::{
     amend_head, branch_remote, commit_paths, create_ref, current_branch, delete_branch,
     force_push_with_lease, force_push_with_lease_to, push, reflog_has_amend, rev_parse, update_ref,
