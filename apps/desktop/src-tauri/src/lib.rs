@@ -109,8 +109,10 @@ pub struct ScanProgress {
 type ScanCancel = Arc<AtomicBool>;
 
 /// Cross-command cancel flag for a running GitHub account scan. `cancel_github_scan` sets it;
-/// `github_scan` clears it at the start and skips the remaining repos once it's set.
-type GithubScanCancel = Arc<AtomicBool>;
+/// `github_scan` clears it at the start and skips the remaining repos once it's set. A distinct
+/// newtype (not a bare `Arc<AtomicBool>` alias) so Tauri's type-keyed state doesn't collide with
+/// `ScanCancel`.
+struct GithubScanCancel(Arc<AtomicBool>);
 
 #[tauri::command]
 async fn scan(
@@ -187,7 +189,7 @@ fn cancel_scan(cancel: tauri::State<'_, ScanCancel>) {
 /// skipped (reported clean) and the partial result returns.
 #[tauri::command]
 fn cancel_github_scan(cancel: tauri::State<'_, GithubScanCancel>) {
-    cancel.store(true, Ordering::Relaxed);
+    cancel.0.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -457,8 +459,8 @@ async fn github_scan(
         orgs,
     };
     // Fresh run: clear any stale cancel request from a previous scan.
-    cancel.store(false, Ordering::Relaxed);
-    let flag: Arc<AtomicBool> = cancel.inner().clone();
+    cancel.0.store(false, Ordering::Relaxed);
+    let flag: Arc<AtomicBool> = cancel.0.clone();
     let scan = scan_pass_with_progress_cancellable(&opts, &host, &packs, &token, &flag, &|p| {
         // Best-effort: a failed emit must never fail the scan.
         let _ = window.emit("github-scan-progress", &p);
@@ -575,7 +577,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(GithubScanState::new(None))
         .manage(ScanCancel::new(AtomicBool::new(false)))
-        .manage(GithubScanCancel::new(AtomicBool::new(false)))
+        .manage(GithubScanCancel(Arc::new(AtomicBool::new(false))))
         .invoke_handler(tauri::generate_handler![
             scan,
             cancel_scan,
