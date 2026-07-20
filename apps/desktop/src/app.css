@@ -238,7 +238,8 @@ input:focus:not(:focus-visible) { background: #101217; }
   padding: 3px 8px; border-radius: 5px; height: fit-content; white-space: nowrap;
   background: var(--surface-3); color: var(--muted);
 }
-.pill.critical, .pill.high { background: var(--danger-tint); color: var(--danger); }
+.pill.critical { background: var(--danger); color: #150a0b; }
+.pill.high { background: var(--danger-tint); color: var(--danger); }
 .pill.medium { background: var(--warn-tint); color: var(--warn); }
 .pill.low, .pill.info { background: var(--accent-tint); color: var(--accent-hi); }
 
