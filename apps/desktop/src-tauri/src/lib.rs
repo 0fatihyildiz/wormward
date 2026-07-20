@@ -524,6 +524,34 @@ async fn github_fix(
     Ok(views)
 }
 
+/// Machine-level PolinRider check (running loader, tainted caches, trigger paths). Runs on a
+/// blocking thread since it shells out to `ps`/`npm`.
+#[tauri::command]
+async fn doctor() -> Result<wormward_doctor::DoctorReport, String> {
+    tauri::async_runtime::spawn_blocking(wormward_doctor::check)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a tainted toolchain cache directory. Guarded: only known cache targets are removable,
+/// so the frontend can never be tricked into deleting an arbitrary path.
+#[tauri::command]
+fn doctor_clear_cache(dir: String) -> Result<(), String> {
+    let path = std::path::PathBuf::from(&dir);
+    if !wormward_doctor::cache_targets().contains(&path) {
+        return Err("refusing to delete a directory that is not a known toolchain cache".into());
+    }
+    std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
+}
+
+/// Apply the safe trigger hardening (npm/pnpm ignore-scripts=true). Returns a line per fix applied.
+#[tauri::command]
+async fn doctor_harden_triggers() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(wormward_doctor::fix_triggers)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -541,7 +569,10 @@ pub fn run() {
             clean_branches_apply,
             github_orgs,
             github_scan,
-            github_fix
+            github_fix,
+            doctor,
+            doctor_clear_cache,
+            doctor_harden_triggers
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wormward desktop");

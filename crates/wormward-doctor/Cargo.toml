@@ -1,0 +1,11 @@
+[package]
+name = "wormward-doctor"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wormward-packs = { path = "../wormward-packs" }
+serde = { workspace = true }
+serde_json = { workspace = true }

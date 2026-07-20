@@ -4,6 +4,7 @@
   import Results from "./routes/Results.svelte";
   import Clean from "./routes/Clean.svelte";
   import GitHub from "./routes/GitHub.svelte";
+  import Doctor from "./routes/Doctor.svelte";
   import Settings from "./routes/Settings.svelte";
   import { fly } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
@@ -16,6 +17,7 @@
     ["results", "Results"],
     ["clean", "Clean"],
     ["github", "GitHub"],
+    ["doctor", "Doctor"],
     ["settings", "Settings"],
   ] as const;
 
@@ -32,6 +34,7 @@
     results: Results,
     clean: Clean,
     github: GitHub,
+    doctor: Doctor,
     settings: Settings,
   };
   let visited = $state<Record<string, boolean>>({});

@@ -112,3 +112,26 @@ export type ScanProgress = {
   repo: string;
   findings: number;
 };
+
+// Machine-level check (`doctor`).
+export interface ProcHit {
+  pid: number;
+  reason: string;
+  snippet: string;
+}
+export interface CacheHit {
+  path: string;
+  reason: string;
+}
+export interface TriggerCheck {
+  name: string;
+  exposed: boolean;
+  detail: string;
+}
+export interface DoctorReport {
+  processes: ProcHit[];
+  caches: CacheHit[];
+  triggers: TriggerCheck[];
+  /** Distinct cache dirs holding tainted files — the deletable units. */
+  cache_dirs: string[];
+}

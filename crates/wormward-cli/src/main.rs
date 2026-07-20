@@ -757,7 +757,7 @@ fn main() -> ExitCode {
                     OutputFormat::Json => println!("{}", doctor::render_json(&report)),
                 }
                 if fix {
-                    for dir in doctor::affected_cache_dirs(&report) {
+                    for dir in report.cache_dirs.clone() {
                         let ok = dialoguer::Confirm::new()
                             .with_prompt(format!(
                                 "Delete tainted cache dir {}? (regenerates cleanly)",

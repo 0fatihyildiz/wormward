@@ -2163,9 +2163,11 @@ dependencies = [
  "clap",
  "dialoguer",
  "httpmock",
+ "serde",
  "serde_json",
  "tempfile",
  "wormward-core",
+ "wormward-doctor",
  "wormward-github",
  "wormward-osm",
  "wormward-packs",
@@ -2187,6 +2189,15 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "wormward-doctor"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wormward-packs",
 ]
 
 [[package]]

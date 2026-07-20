@@ -11,6 +11,7 @@ import type {
   BranchCleanApplySummary,
   GithubRepoView,
   GithubFixView,
+  DoctorReport,
 } from "./types";
 
 export const scan = (dirs: string[], deep: boolean, online: boolean, token?: string) =>
@@ -43,6 +44,12 @@ export const githubScan = (token: string | undefined, includeForks: boolean, org
 
 export const githubFix = (selected: string[]) =>
   invoke<GithubFixView[]>("github_fix", { selected });
+
+// Machine-level check (`doctor`).
+export const doctor = () => invoke<DoctorReport>("doctor");
+export const doctorClearCache = (dir: string) =>
+  invoke<void>("doctor_clear_cache", { dir });
+export const doctorHardenTriggers = () => invoke<string[]>("doctor_harden_triggers");
 
 export async function pickDirs(): Promise<string[]> {
   const sel = await open({ directory: true, multiple: true });
