@@ -73,6 +73,9 @@
   const applicable = $derived(plans.filter((p) => p.actions.length));
   const fixableRepos = $derived(applicable.map((p) => p.repo));
   const manualCount = $derived(plans.reduce((n, p) => n + p.manual.length, 0));
+  // Findings on a branch tip (not the working tree) — the working-tree Clean can't touch them;
+  // they're fixed via the Advanced branch-clean.
+  const branchFindings = $derived(findings.filter((f) => f.git_ref));
 
   // ---------------- advanced: branches + restore ----------------
   let showAdvanced = $state(false);
@@ -192,6 +195,12 @@
       busy = false;
       busyKind = "";
     }
+  }
+
+  // Open Advanced and scan branches so branch-tip findings become actionable in one click.
+  function cleanOnBranches() {
+    showAdvanced = true;
+    previewBranches();
   }
 
   async function previewBranches() {
@@ -386,9 +395,20 @@
             <button class="btn primary" onclick={() => (confirming = true)} disabled={busy}>
               {#if busyKind === "apply"}<span class="spinner"></span>Cleaning…{:else}Clean {applicable.length} {plural(applicable.length, "repo", "repos")}{/if}
             </button>
+          {:else if branchFindings.length}
+            <button class="btn primary" onclick={cleanOnBranches} disabled={busy || branchLoading}>
+              {#if branchLoading}<span class="spinner"></span>Scanning branches…{:else}Clean on branches →{/if}
+            </button>
           {/if}
         </div>
         {#if previewing}<p class="muted micro"><span class="spinner"></span> Preparing remediation…</p>{/if}
+        {#if !applicable.length && branchFindings.length}
+          <p class="branch-note">
+            These findings are on other branches, not your working tree — so the working-tree clean
+            doesn't apply. Use <strong>Clean on branches</strong> below; a remote-tracking branch
+            like <code>origin/main</code> needs <strong>Push</strong> enabled to rewrite.
+          </p>
+        {/if}
         {#if manualCount}
           <p class="manual-note">⚠ {manualCount} {plural(manualCount, "finding", "findings")} need manual review — they can't be removed automatically.</p>
         {/if}
@@ -574,6 +594,15 @@
   .count.sev-high { background: var(--danger-tint); color: var(--danger); }
   .count.sev-medium { background: var(--warn-tint); color: var(--warn); }
   .manual-note { color: var(--warn); font-size: 12.5px; }
+  .branch-note {
+    color: var(--muted);
+    font-size: 12.5px;
+    line-height: 1.5;
+    background: var(--inset);
+    padding: 9px 12px;
+    border-radius: var(--radius-sm);
+  }
+  .branch-note strong { color: var(--fg); }
   .warn-text { color: var(--warn); }
   .danger-text { color: var(--danger); }
   .notes { display: flex; flex-direction: column; gap: 4px; list-style: none; }
