@@ -383,8 +383,7 @@ fn is_invisible(c: char) -> bool {
     matches!(c as u32,
         0x200B..=0x200F   // zero-width space/joiner/non-joiner + bidi marks
         | 0x202A..=0x202E // bidi embeddings / overrides
-        | 0x2060..=0x206F // invisible operators / deprecated format controls
-        | 0x2066..=0x2069 // bidi isolates
+        | 0x2060..=0x206F // invisible operators / format controls (incl. bidi isolates 2066-2069)
         | 0xFE00..=0xFE0F // variation selectors
         | 0xE0000..=0xE007F // tags block (Glassworm)
         | 0xE0100..=0xE01EF) // variation selectors supplement
