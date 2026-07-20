@@ -79,6 +79,12 @@ fn check_gitignore(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Findi
     if pack.manifest.gitignore_injections.is_empty() {
         return findings;
     }
+    // Respect the file source's membership: on a diff-restricted deep-scan tree, an UNCHANGED
+    // .gitignore is not "present" here (the working-tree pass already covered it), so skip it
+    // rather than re-reading via the unrestricted blob reader and double-reporting.
+    if !files.exists(Path::new(".gitignore")) {
+        return findings;
+    }
     let content = match files.read(Path::new(".gitignore")) {
         Some(c) => c,
         None => return findings,
@@ -106,6 +112,10 @@ fn check_gitignore(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Findi
 fn check_npm(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Finding> {
     let mut findings = Vec::new();
     if pack.manifest.bad_npm_packages.is_empty() {
+        return findings;
+    }
+    // See check_gitignore: skip an unchanged package.json on a diff-restricted deep-scan tree.
+    if !files.exists(Path::new("package.json")) {
         return findings;
     }
     let content = match files.read(Path::new("package.json")) {
@@ -623,6 +633,25 @@ fn head_commit(repo: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Paths that differ between two commits (`git diff --name-only <base> <tip>`). NUL-delimited so
+/// special/non-ASCII paths survive. Commit-to-commit (no working-tree stat), so it stays cheap.
+fn diff_paths(repo: &Path, base: &str, tip: &str) -> Vec<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--name-only", "-z", base, tip])
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// Scan the tip tree of every local/remote branch (deduped by commit, excluding HEAD's
 /// commit which the working-tree pass already covers). Findings carry the branch ref.
 pub fn deep_scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
@@ -649,9 +678,23 @@ pub fn deep_scan_repo_cancellable(
         if !seen.insert(oid.clone()) {
             continue;
         }
-        let tree = match GitTree::new(repo, &oid) {
-            Some(t) => t,
-            None => continue,
+        // Scan ONLY the files this tip changes vs HEAD. Content shared with HEAD is already covered
+        // by the working-tree pass, so the tip's added/changed files are all that is left to check.
+        // This drops per-tip work from the whole tree to the (usually tiny) diff — the key to a fast
+        // deep scan on a many-branch repo WITHOUT adding parallelism (and thus without more heat).
+        let tree = match head.as_deref() {
+            Some(base) => {
+                let changed = diff_paths(repo, base, &oid);
+                if changed.is_empty() {
+                    continue;
+                }
+                GitTree::new_for_paths(repo, &oid, changed)
+            }
+            // No HEAD (unborn/detached edge): fall back to scanning the full tip tree.
+            None => match GitTree::new(repo, &oid) {
+                Some(t) => t,
+                None => continue,
+            },
         };
         let mut tree_findings = scan_tree_inner(repo, &tree, packs, cancel);
         for f in &mut tree_findings {
@@ -1721,6 +1764,41 @@ mod tests {
         let deep = deep_scan_repo(&repo, &[literal_pack()]);
         assert!(deep.iter().any(|f| f.kind == FindingKind::ContentSignature
             && f.git_ref.as_deref() == Some("evil")));
+    }
+
+    #[test]
+    fn deep_scan_skips_files_unchanged_from_head() {
+        // Optimization contract: a branch tip is scanned by its DIFF from HEAD. A payload in a file
+        // that is IDENTICAL on HEAD is the working-tree pass's responsibility and must NOT be
+        // re-reported per-branch. Here `main` (HEAD) carries the payload; `evil` only adds an
+        // unrelated clean file, leaving the infected config unchanged — so `evil` yields no finding.
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status().unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "payload"]);
+        git(&repo, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(repo.join("other.txt"), "clean").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "unrelated"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        // The infected config is unchanged between HEAD and `evil`; deep scan must not re-report it.
+        let deep = deep_scan_repo(&repo, &[literal_pack()]);
+        assert!(
+            deep.iter().all(|f| f.git_ref.as_deref() != Some("evil")),
+            "a payload identical to HEAD must not be re-reported per-branch: {deep:?}"
+        );
     }
 
     #[test]

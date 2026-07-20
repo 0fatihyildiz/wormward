@@ -90,6 +90,20 @@ impl GitTree {
             reader: RefCell::new(None),
         })
     }
+
+    /// Build a tree source RESTRICTED to a known set of paths (e.g. the files a branch tip changes
+    /// vs HEAD), skipping the full `ls-tree`. `paths()` / `exists()` report only this set, so the
+    /// scan is scoped to it — but blob reads still work for ANY path in the commit, so cross-file
+    /// derived-script reachability can still read a referenced-but-unchanged file. This is what lets
+    /// deep scan check only a tip's diff instead of re-reading its whole tree on every branch.
+    pub fn new_for_paths(repo: &Path, commit: &str, paths: Vec<PathBuf>) -> Self {
+        GitTree {
+            repo: repo.to_path_buf(),
+            commit: commit.to_string(),
+            paths,
+            reader: RefCell::new(None),
+        }
+    }
 }
 
 impl RepoFiles for GitTree {

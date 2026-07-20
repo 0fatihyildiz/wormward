@@ -257,6 +257,11 @@ pub fn check_lockfiles(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<F
         return findings;
     }
     for (name, _eco) in LOCKFILES {
+        // Respect the source's membership: skip an unchanged lockfile on a diff-restricted deep-scan
+        // tree (the working-tree pass covered it) instead of re-reading + double-reporting.
+        if !files.exists(Path::new(name)) {
+            continue;
+        }
         let Some(content) = files.read(Path::new(name)) else {
             continue;
         };
