@@ -519,6 +519,10 @@ fn scan_repo_inner(repo: &Path, packs: &[Pack], cancel: &AtomicBool) -> Vec<Find
     let mut findings = scan_tree_inner(repo, &working, packs, cancel);
     // .git/hooks is a working-tree-only surface (absent from a GitTree / ApiTree).
     findings.extend(scan_git_hooks(repo));
+    // Installed dependencies (node_modules) are pruned from the general walk; scan them targeted.
+    if !cancel.load(Ordering::Relaxed) {
+        findings.extend(scan_node_modules(repo, packs));
+    }
 
     if !cancel.load(Ordering::Relaxed) && !findings.is_empty() && reflog_has_amend(repo) {
         // Attribute the reflog corroboration to a campaign (pack) finding when one
@@ -648,6 +652,131 @@ pub fn deep_scan_repo_cancellable(
             f.git_ref = Some(name.clone());
         }
         findings.extend(tree_findings);
+    }
+    findings
+}
+
+/// Cap on installed packages scanned, so a giant `node_modules` can't stall the scan.
+const MAX_NODE_MODULES_PKGS: usize = 5_000;
+
+/// Scan installed dependencies under `node_modules/` for malicious packages (name+version vs
+/// `bad_packages`) and for an injected payload in each package's entrypoint (via the analyzer). The
+/// general file walk prunes `node_modules` for performance; this targeted pass reads only each
+/// package's `package.json` + entrypoint, so a dropper shipped *inside a dependency* is still
+/// caught. Working-tree only — git trees have no `node_modules`. Findings are advisory
+/// (non-remediable): the fix is to reinstall the dependency clean, not to strip an installed file.
+pub fn scan_node_modules(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
+    let root = repo.join("node_modules");
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    // Top-level packages plus one level of @scope.
+    let mut pkg_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') || !p.is_dir() {
+                continue;
+            }
+            if name.starts_with('@') {
+                if let Ok(scoped) = std::fs::read_dir(&p) {
+                    pkg_dirs.extend(scoped.flatten().map(|s| s.path()).filter(|s| s.is_dir()));
+                }
+            } else {
+                pkg_dirs.push(p);
+            }
+        }
+    }
+    let total = pkg_dirs.len();
+    let mut findings = Vec::new();
+    for dir in pkg_dirs.into_iter().take(MAX_NODE_MODULES_PKGS) {
+        let Ok(pj) = std::fs::read_to_string(dir.join("package.json")) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&pj) else {
+            continue;
+        };
+        let name = v.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+        let version = v.get("version").and_then(|x| x.as_str()).map(String::from);
+        // 1) Known-malicious installed package (name + version).
+        for pack in packs {
+            let Some(bads) = pack.manifest.bad_packages.get("npm") else {
+                continue;
+            };
+            let entry = crate::lockfile::LockEntry {
+                ecosystem: "npm".into(),
+                name: name.clone(),
+                version: version.clone(),
+            };
+            for bad in bads {
+                if bad.name == name && crate::lockfile::version_matches(&entry, &bad.versions) {
+                    let ver = version.as_deref().map(|x| format!("@{x}")).unwrap_or_default();
+                    let rel = dir.strip_prefix(repo).unwrap_or(&dir).join("package.json");
+                    findings.push(Finding {
+                        campaign: pack.manifest.id.clone(),
+                        severity: pack.manifest.severity.clone(),
+                        repo: repo.to_path_buf(),
+                        file: Some(rel),
+                        signature_id: format!("pkg:npm:{name}{ver}"),
+                        kind: FindingKind::NpmPackage,
+                        evidence: format!("malicious npm package '{name}'{ver} installed in node_modules"),
+                        remediable: false,
+                        online: None,
+                        git_ref: None,
+                    });
+                }
+            }
+        }
+        // 2) Injected payload in the package entrypoint (analyzer-confirmed).
+        let main = v.get("main").and_then(|x| x.as_str()).unwrap_or("index.js");
+        let mut seen_entry = HashSet::new();
+        for cand in [main, "index.js", "src/index.js"] {
+            if !seen_entry.insert(cand.to_string()) {
+                continue;
+            }
+            let entry_path = dir.join(cand);
+            let Ok(content) = std::fs::read_to_string(&entry_path) else {
+                continue;
+            };
+            if looks_binary(&content) || content.len() > MAX_CONTENT_BYTES {
+                continue;
+            }
+            let rel = entry_path.strip_prefix(repo).unwrap_or(&entry_path).to_path_buf();
+            for pack in packs {
+                if let Some(analyzer) = &pack.analyzer {
+                    let sf = ScannedFile {
+                        repo: repo.to_path_buf(),
+                        path: rel.clone(),
+                        content: content.clone(),
+                    };
+                    findings.extend(analyzer.analyze(&sf));
+                }
+            }
+        }
+    }
+    // Advisory only — the remediation for a tainted dependency is a clean reinstall, not an
+    // in-place strip of a file npm will overwrite.
+    for f in &mut findings {
+        f.remediable = false;
+    }
+    if total > MAX_NODE_MODULES_PKGS {
+        findings.push(Finding {
+            campaign: "generic".into(),
+            severity: Severity::Info,
+            repo: repo.to_path_buf(),
+            file: Some(PathBuf::from("node_modules")),
+            signature_id: "node-modules-truncated".into(),
+            kind: FindingKind::Capability,
+            evidence: format!(
+                "node_modules scan capped at {MAX_NODE_MODULES_PKGS} of {total} packages — some deps not inspected"
+            ),
+            remediable: false,
+            online: None,
+            git_ref: None,
+        });
     }
     findings
 }

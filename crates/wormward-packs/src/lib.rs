@@ -608,6 +608,46 @@ mod tests {
     }
 
     #[test]
+    fn node_modules_dependency_payload_flagged() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        let pkg = repo.join("node_modules/tailwind-animationbased");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(pkg.join("package.json"), r#"{"name":"tailwind-animationbased","version":"2.0.0","main":"index.js"}"#).unwrap();
+        // Entrypoint carries the injected v1 payload.
+        fs::write(
+            pkg.join("index.js"),
+            "module.exports={};\nglobal['!']='8-270-2';var _$_1e42=[];",
+        )
+        .unwrap();
+
+        let f = scan_repo(&repo, &builtin_packs());
+        assert!(
+            f.iter().any(|x| x.kind == FindingKind::NpmPackage
+                && x.signature_id == "pkg:npm:tailwind-animationbased@2.0.0"),
+            "installed malicious package must be flagged, got {f:?}"
+        );
+        assert!(
+            f.iter().any(|x| x.kind == FindingKind::Analyzer
+                && x.file == Some(std::path::PathBuf::from("node_modules/tailwind-animationbased/index.js"))),
+            "injected payload in a dependency entrypoint must be flagged, got {f:?}"
+        );
+    }
+
+    #[test]
+    fn clean_node_modules_dependency_not_flagged() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("clean");
+        let pkg = repo.join("node_modules/lodash");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(pkg.join("package.json"), r#"{"name":"lodash","version":"4.17.21","main":"index.js"}"#).unwrap();
+        fs::write(pkg.join("index.js"), "module.exports = require('./lodash');").unwrap();
+        assert!(scan_repo(&repo, &builtin_packs()).is_empty(), "a clean dependency must not fire");
+    }
+
+    #[test]
     fn lockfile_flags_composer_package() {
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("v");
