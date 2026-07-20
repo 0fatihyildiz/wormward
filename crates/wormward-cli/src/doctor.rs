@@ -5,7 +5,13 @@
 //! detector reuses [`polinrider_fingerprint`], so a machine hit is confirmed by the exact same
 //! obfuscation fingerprint as an on-disk finding.
 
+use std::path::{Path, PathBuf};
+
 use wormward_packs::polinrider_fingerprint;
+
+/// Payloads are small; skip huge cache blobs and cap how many files we walk.
+const MAX_CACHE_FILES: usize = 20_000;
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// A running process whose command line matches the loader fingerprint.
 #[derive(Debug, PartialEq, serde::Serialize)]
@@ -19,23 +25,25 @@ pub struct ProcHit {
 #[derive(Debug, serde::Serialize)]
 pub struct DoctorReport {
     pub processes: Vec<ProcHit>,
+    pub caches: Vec<CacheHit>,
 }
 
 impl DoctorReport {
     /// True if anything actionable was found — drives the process exit code.
     pub fn has_findings(&self) -> bool {
-        !self.processes.is_empty()
+        !self.processes.is_empty() || !self.caches.is_empty()
     }
 }
 
 /// Run the machine check once (single point-in-time snapshot).
 pub fn check() -> DoctorReport {
-    DoctorReport { processes: scan_process_lines(&list_processes()) }
+    DoctorReport { processes: scan_process_lines(&list_processes()), caches: scan_caches() }
 }
 
 /// Render the report as a sectioned text summary.
 pub fn render_text(r: &DoctorReport) -> String {
     let mut out = String::from("wormward doctor — machine check\n\n");
+
     out.push_str("Running loader processes\n");
     if r.processes.is_empty() {
         out.push_str(
@@ -46,6 +54,16 @@ pub fn render_text(r: &DoctorReport) -> String {
         for h in &r.processes {
             out.push_str(&format!("  ✗ pid {} — {}\n      {}\n", h.pid, h.reason, h.snippet));
         }
+    }
+
+    out.push_str("\nToolchain caches\n");
+    if r.caches.is_empty() {
+        out.push_str("  ✓ no tainted files in the npx / TypeScript caches\n");
+    } else {
+        for h in &r.caches {
+            out.push_str(&format!("  ✗ {} — {}\n", h.path.display(), h.reason));
+        }
+        out.push_str("    → re-run with --fix to clear the affected cache dirs (they regenerate)\n");
     }
     out
 }
@@ -98,6 +116,83 @@ pub fn list_processes() -> Vec<(u32, String)> {
         .collect()
 }
 
+/// A cached file whose content matches the loader fingerprint.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct CacheHit {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// Pure: fingerprint `(path, content)` pairs. Testable without a filesystem.
+pub fn scan_contents(files: &[(PathBuf, String)]) -> Vec<CacheHit> {
+    files
+        .iter()
+        .filter_map(|(p, c)| {
+            polinrider_fingerprint(c).map(|reason| CacheHit { path: p.clone(), reason })
+        })
+        .collect()
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+}
+
+/// Toolchain cache dirs (present ones only) that may hold worm-executed artifacts — machine-level
+/// state the repo scan does not cover.
+pub fn cache_targets() -> Vec<PathBuf> {
+    let home = home_dir();
+    [home.join(".npm/_npx"), home.join("Library/Caches/typescript")]
+        .into_iter()
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// Recursively collect regular files under `dir` (bounded; symlinks not followed).
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if out.len() >= MAX_CACHE_FILES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => collect_files(&entry.path(), out),
+            Ok(t) if t.is_file() => out.push(entry.path()),
+            _ => {}
+        }
+        if out.len() >= MAX_CACHE_FILES {
+            return;
+        }
+    }
+}
+
+/// Scan one cache directory: fingerprint each small text file.
+pub fn scan_cache_dir(dir: &Path) -> Vec<CacheHit> {
+    let mut files = Vec::new();
+    collect_files(dir, &mut files);
+    let contents: Vec<(PathBuf, String)> = files
+        .into_iter()
+        .filter(|p| std::fs::metadata(p).map(|m| m.len() <= MAX_FILE_BYTES).unwrap_or(false))
+        .filter_map(|p| std::fs::read_to_string(&p).ok().map(|c| (p, c)))
+        .collect();
+    scan_contents(&contents)
+}
+
+/// Scan every present toolchain cache dir.
+pub fn scan_caches() -> Vec<CacheHit> {
+    cache_targets().iter().flat_map(|d| scan_cache_dir(d)).collect()
+}
+
+/// The distinct cache dirs that hold at least one tainted file — the `--fix` deletes these
+/// whole (they regenerate cleanly), mirroring the guide's `rm -rf ~/.npm/_npx`.
+pub fn affected_cache_dirs(report: &DoctorReport) -> Vec<PathBuf> {
+    cache_targets()
+        .into_iter()
+        .filter(|t| report.caches.iter().any(|h| h.path.starts_with(t)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +234,22 @@ mod tests {
             (201, "npm exec tsc --noEmit".to_string()),
         ];
         assert!(scan_process_lines(&procs).is_empty());
+    }
+
+    #[test]
+    fn cache_scan_flags_tainted_file_only() {
+        let files = vec![
+            // A legit cached type stub / package file.
+            (PathBuf::from("_npx/abc/index.js"), "module.exports = { hello: 1 };".to_string()),
+            (PathBuf::from("typescript/node_modules/@types/node/index.d.ts"), "export {};".to_string()),
+            // A tainted cached artifact carrying the loader.
+            (
+                PathBuf::from("_npx/evil/postinstall.js"),
+                "global.i='5-3-168';var _$_8e2c=(function(r,i){return r})('x',7);".to_string(),
+            ),
+        ];
+        let hits = scan_contents(&files);
+        assert_eq!(hits.len(), 1, "only the tainted cache file should match, got {hits:?}");
+        assert_eq!(hits[0].path, PathBuf::from("_npx/evil/postinstall.js"));
     }
 }

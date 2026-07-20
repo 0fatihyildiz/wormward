@@ -136,6 +136,10 @@ enum Command {
         /// trigger — open your editor/projects during the window. Omit for a single snapshot.
         #[arg(long)]
         watch: Option<u64>,
+        /// After the scan, delete tainted toolchain cache dirs (npx / TypeScript). Prompts
+        /// first; the caches regenerate cleanly. Ignored with --watch.
+        #[arg(long)]
+        fix: bool,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -745,16 +749,35 @@ fn main() -> ExitCode {
             let audit_blocked = account_audit.as_ref().is_some_and(|a| a.blocked);
             ExitCode::from(github_exit_code(&outcomes).max(u8::from(audit_blocked)))
         }
-        Command::Doctor { watch, format } => match watch {
+        Command::Doctor { watch, fix, format } => match watch {
             None => {
                 let report = doctor::check();
                 match format {
                     OutputFormat::Text => print!("{}", doctor::render_text(&report)),
                     OutputFormat::Json => println!("{}", doctor::render_json(&report)),
                 }
+                if fix {
+                    for dir in doctor::affected_cache_dirs(&report) {
+                        let ok = dialoguer::Confirm::new()
+                            .with_prompt(format!(
+                                "Delete tainted cache dir {}? (regenerates cleanly)",
+                                dir.display()
+                            ))
+                            .default(false)
+                            .interact()
+                            .unwrap_or(false);
+                        if ok {
+                            match std::fs::remove_dir_all(&dir) {
+                                Ok(()) => println!("  removed {}", dir.display()),
+                                Err(e) => eprintln!("  failed to remove {}: {e}", dir.display()),
+                            }
+                        }
+                    }
+                }
                 ExitCode::from(u8::from(report.has_findings()))
             }
             Some(secs) => {
+                let _ = fix; // --fix is a no-op in watch mode (process-focused)
                 // Poll across the window so a loader that only fires on a trigger is caught.
                 let interval = 5u64;
                 let iters = (secs / interval).max(1);
