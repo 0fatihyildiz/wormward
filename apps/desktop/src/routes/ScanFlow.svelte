@@ -150,7 +150,7 @@
 
 <div class="flow">
   {#if app.flow === "scanning" || app.flow === null}
-    <section class="flow-step">
+    <section class="flow-step scanning-step">
       <h1 class="flow-title" tabindex="-1" bind:this={stepHeadingEl}>Scanning…</h1>
       <GuidedProgress
         label="Checking your Mac and your code…"
@@ -264,7 +264,12 @@
 </div>
 
 <style>
-  .flow { max-width: var(--content); margin: 0 auto; padding: 40px 24px; display: flex; flex-direction: column; gap: var(--gap-page); }
+  /* Fill the view and center the step so a short/compact flow (and the capped log) doesn't
+     leave a tall empty tail below it — `main` reserves min-height: 100vh - topbar, and a
+     top-aligned .flow left that space blank (the "scroll gap" under Show details). `safe`
+     centering falls back to top-aligned + page scroll when a step is taller than the viewport
+     (e.g. a long results list), so nothing is ever clipped. */
+  .flow { max-width: var(--content); margin: 0 auto; padding: 40px 24px; min-height: calc(100vh - var(--topbar-h)); display: flex; flex-direction: column; justify-content: safe center; gap: var(--gap-page); }
   .flow-step { display: flex; flex-direction: column; gap: 16px; }
   .flow-title { font-size: 20px; letter-spacing: -0.025em; }
   .flow-summary { font-size: 14px; line-height: 1.6; color: var(--fg); }
@@ -275,6 +280,14 @@
   .log-details > summary:hover { color: var(--fg); }
   .log-details[open] > summary { margin-bottom: 10px; }
   .term-body { background: var(--inset); border-radius: var(--radius); padding: 12px 14px; max-height: 220px; overflow-y: auto; font-family: var(--mono); font-size: 12px; line-height: 1.6; color: var(--fg); }
+
+  /* Scanning step fills the view; its OPEN log takes the leftover height and scrolls INTERNALLY,
+     so a streaming log never grows the page (no growing scroll), leaves no empty tail, and doesn't
+     reflow as lines stream in. The status block above it keeps its natural height. */
+  .scanning-step { flex: 1; min-height: 0; justify-content: safe center; }
+  .scanning-step .log-details[open] { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .scanning-step .log-details[open] > summary { flex: none; }
+  .scanning-step .log-details[open] .term-body { flex: 1; min-height: 0; max-height: none; }
   .line { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .line .spinner { width: 11px; height: 11px; flex: none; border-color: var(--ok-tint); border-top-color: var(--ok); }
   .tag { flex: none; color: var(--faint); }
