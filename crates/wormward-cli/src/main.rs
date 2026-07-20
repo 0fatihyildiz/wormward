@@ -148,9 +148,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Machine-level PolinRider check (macOS): running loader processes (and later tainted
-    /// caches + trigger paths). Complements the repo scan; read-only. Reuses the same
-    /// obfuscation fingerprint as the file analyzer.
+    /// Machine-level check (macOS): running loader processes, tainted toolchain caches, editor/npm
+    /// trigger paths, persistence (launchd/cron), live C2 connections, shell-rc injection, global
+    /// malicious packages, and keychain-theft activity. Read-only; fails closed on an unreadable
+    /// root. Reuses the same obfuscation fingerprint as the file analyzer.
     Doctor {
         /// Poll for this many seconds (every 5s) to catch a loader that only respawns on a
         /// trigger — open your editor/projects during the window. Omit for a single snapshot.
