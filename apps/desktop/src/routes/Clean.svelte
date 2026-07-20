@@ -6,6 +6,7 @@
     restore,
     cleanBranchesPreview,
     cleanBranchesApply,
+    pickDirs,
   } from "../lib/api";
   import { dialog } from "../lib/modal";
   import type {
@@ -36,8 +37,18 @@
   let branchesScanned = $state(false);
   let restoreConfirm = $state(false);
 
-  const dirs = $derived(app.dirs.length ? app.dirs : ["."]);
+  const dirs = $derived(app.dirs);
+  const hasDirs = $derived(app.dirs.length > 0);
   const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
+
+  async function choose() {
+    try {
+      const picked = await pickDirs();
+      if (picked.length) app.dirs = picked;
+    } catch (e) {
+      fail(e);
+    }
+  }
 
   // "\n" separator: never appears in a filesystem path or a git branch name, so the
   // key is collision-free (a raw NUL byte here would corrupt the source file as binary).
@@ -159,7 +170,7 @@
   }
 
   $effect(() => {
-    preview();
+    if (app.dirs.length) preview();
   });
 </script>
 
@@ -175,19 +186,39 @@
       Payloads stripped, dropped artifacts deleted, <code>.gitignore</code> fixed — the current
       checkout only. Pick which repos to fix below.
     </p>
+    <div class="target">
+      <div class="row between">
+        <span class="tlabel">Target folders</span>
+        <button class="btn sm" onclick={choose} disabled={busy || loading}>Choose folders…</button>
+      </div>
+      <p class="tbox mono" class:empty={!hasDirs}>
+        {hasDirs ? app.dirs.join("  ·  ") : "No folders chosen — pick folders, or run a Scan first."}
+      </p>
+    </div>
     <div class="row">
-      <button class="btn" onclick={preview} disabled={loading || busy}>Refresh</button>
-      <button class="btn primary" onclick={() => (confirming = true)} disabled={busy || nothingToApply}>
+      <button class="btn" onclick={preview} disabled={loading || busy || !hasDirs}>Refresh</button>
+      <button
+        class="btn primary"
+        onclick={() => (confirming = true)}
+        disabled={busy || nothingToApply}
+      >
         {#if busyKind === "apply"}<span class="spinner"></span>Applying…{:else}Apply &amp; fix…{/if}
       </button>
-      <button class="btn" onclick={() => (restoreConfirm = true)} disabled={busy}>
+      <button class="btn" onclick={() => (restoreConfirm = true)} disabled={busy || !hasDirs}>
         {#if busyKind === "restore"}<span class="spinner"></span>Restoring…{:else}Restore last backup{/if}
       </button>
     </div>
     {#if result}<p class="ok-text small">{result}</p>{/if}
   </section>
 
-  {#if loading}
+  {#if !hasDirs}
+    <div class="card">
+      <div class="state">
+        <div class="glyph">◎</div>
+        <p>Choose target folders above, or run a Scan first, to see what can be cleaned.</p>
+      </div>
+    </div>
+  {:else if loading}
     <div class="card"><div class="row"><span class="spinner"></span><span class="muted small">Scanning…</span></div></div>
   {:else if applicable.length === 0 && manualCount === 0}
     <div class="card ok">
@@ -247,7 +278,7 @@
       fixed with push enabled — otherwise they are reported as skipped.
     </p>
     <div class="row">
-      <button class="btn" onclick={previewBranches} disabled={branchLoading || busy}>
+      <button class="btn" onclick={previewBranches} disabled={branchLoading || busy || !hasDirs}>
         {#if branchLoading}<span class="spinner"></span>Scanning branches…{:else}Scan other branches{/if}
       </button>
       <button
@@ -363,6 +394,18 @@
 {/if}
 
 <style>
+  .target { display: flex; flex-direction: column; gap: 8px; margin-bottom: 2px; }
+  .tlabel { font-size: 12px; color: var(--muted); font-weight: 500; }
+  .tbox {
+    font-size: 12px;
+    color: var(--fg);
+    background: var(--inset);
+    border-radius: var(--radius-sm);
+    padding: 9px 12px;
+    word-break: break-all;
+  }
+  .tbox.empty { color: var(--faint); }
+
   /* Pending actions read as "will do", not done (the global .action is green). */
   .action { color: var(--fg); }
   .will { flex: none; color: var(--accent); font-weight: 700; }

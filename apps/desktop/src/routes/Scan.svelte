@@ -36,7 +36,7 @@
     });
     try {
       const token = localStorage.getItem("osm_token") || undefined;
-      app.report = await scan(app.dirs.length ? app.dirs : ["."], deep, online, token);
+      app.report = await scan(app.dirs, deep, online, token);
       app.screen = "results";
     } catch (e) {
       fail(e);
@@ -78,8 +78,8 @@
         <span class="field-label">Target folders</span>
         <button class="btn sm" onclick={choose} disabled={app.scanning}>Choose folders…</button>
       </div>
-      <p class="path-preview mono">
-        {app.dirs.length ? app.dirs.join("  ·  ") : "current folder (.)"}
+      <p class="path-preview mono" class:empty={!app.dirs.length}>
+        {app.dirs.length ? app.dirs.join("  ·  ") : "No folder chosen — pick one to scan."}
       </p>
     </div>
 
@@ -104,7 +104,8 @@
         </button>
         <button class="btn danger" onclick={stop}>Stop</button>
       {:else}
-        <button class="btn primary" onclick={run}>Scan →</button>
+        <button class="btn primary" onclick={run} disabled={!app.dirs.length}>Scan →</button>
+        {#if !app.dirs.length}<span class="muted micro">Choose a folder to scan.</span>{/if}
       {/if}
     </div>
 
@@ -154,6 +155,7 @@
     padding: 9px 12px;
     word-break: break-all;
   }
+  .path-preview.empty { color: var(--faint); }
   .opts { display: flex; flex-direction: column; gap: 4px; padding: 2px 0; }
 
   /* ---- terminal-styled progress log ---- */
