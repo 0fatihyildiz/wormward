@@ -564,14 +564,14 @@ pub fn scan(roots: &[PathBuf], packs: &[Pack]) -> ScanReport {
 }
 
 fn branch_commits(repo: &Path) -> Vec<(String, String)> {
-    // Output format is "<40-char oid> <short refname>"; neither field contains a
-    // space, so splitn(2, ' ') below is safe.
+    // Format: "<oid> <short refname> <symref>". oids and refnames contain no spaces, so the
+    // fields split cleanly; `symref` is non-empty only for symbolic refs.
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args([
             "for-each-ref",
-            "--format=%(objectname) %(refname:short)",
+            "--format=%(objectname) %(refname:short) %(symref)",
             "refs/heads",
             "refs/remotes",
         ])
@@ -583,9 +583,17 @@ fn branch_commits(repo: &Path) -> Vec<(String, String)> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(2, ' ');
+            let mut parts = line.splitn(3, ' ');
             let oid = parts.next()?.to_string();
             let name = parts.next()?.to_string();
+            let symref = parts.next().unwrap_or("");
+            // Skip symbolic refs — chiefly `refs/remotes/origin/HEAD`, whose short name is the
+            // bare remote ("origin"). It only points at a real branch that is already scanned
+            // (e.g. origin/main) and cannot be rewritten as a branch, so cleaning it fails with
+            // "branch 'origin' is neither a local nor a remote-tracking ref".
+            if !symref.is_empty() {
+                return None;
+            }
             Some((oid, name))
         })
         .collect()
