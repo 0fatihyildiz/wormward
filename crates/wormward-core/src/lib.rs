@@ -9,6 +9,7 @@ pub mod pack;
 pub mod remediate;
 pub mod repo_files;
 pub mod rewrite;
+pub mod rules;
 pub mod sarif;
 pub mod scanner;
 pub mod surface;
@@ -18,6 +19,7 @@ pub use engine::{SigHit, SignatureEngine};
 pub use finding::{Finding, FindingKind, OnlineVerdict, Severity};
 pub use lockfile::{check_lockfiles, parse_lockfile, version_matches, LockEntry};
 pub use osv::{osv_available, osv_scan, OsvHit};
+pub use rules::{to_sigma, to_suricata, to_yara};
 pub use sarif::to_sarif;
 pub use git::{
     amend_head, branch_remote, commit_paths, create_ref, current_branch, delete_branch,

@@ -53,6 +53,11 @@ enum Command {
     },
     /// List the campaign packs compiled into this build.
     ListPacks,
+    /// Export the IOC catalog as detection rules for third-party engines (stdout).
+    ExportRules {
+        #[arg(long, value_enum, default_value_t = RuleFormat::Yara)]
+        format: RuleFormat,
+    },
     /// Check a single asset against the live OSM database.
     Check {
         /// report_type: package | repository | url | domain | ip | wallet | container
@@ -160,6 +165,13 @@ enum OutputFormat {
     Json,
     /// SARIF 2.1.0 (for the GitHub Security tab / code scanning upload). Primary on `scan`.
     Sarif,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum RuleFormat {
+    Yara,
+    Sigma,
+    Suricata,
 }
 
 fn osm_base_url() -> String {
@@ -299,6 +311,16 @@ fn main() -> ExitCode {
             for pack in builtin_packs() {
                 println!("{} — {}", pack.manifest.id, pack.manifest.name);
             }
+            ExitCode::from(0)
+        }
+        Command::ExportRules { format } => {
+            let packs = builtin_packs();
+            let out = match format {
+                RuleFormat::Yara => wormward_core::to_yara(&packs),
+                RuleFormat::Sigma => wormward_core::to_sigma(&packs),
+                RuleFormat::Suricata => wormward_core::to_suricata(&packs),
+            };
+            print!("{out}");
             ExitCode::from(0)
         }
         Command::Check { report_type, ecosystem, version, osm_token, identifier } => {
