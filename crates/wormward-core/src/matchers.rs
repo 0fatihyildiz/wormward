@@ -13,17 +13,12 @@ pub enum SignatureKind {
 /// Trust tier for an IOC. `Vendor` = confirmed by a security vendor / byte-exact analysis;
 /// `Community` = single-source or gist-sourced lead. Community-tier matches must never produce a
 /// hard "infected" verdict on their own — callers downgrade their severity to advisory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Confidence {
+    #[default]
     Vendor,
     Community,
-}
-
-impl Default for Confidence {
-    fn default() -> Self {
-        Confidence::Vendor
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
