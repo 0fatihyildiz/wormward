@@ -259,30 +259,98 @@ fn trailing_code(content: &str, surface: Surface) -> bool {
         None => return false,
     };
     let end = export_statement_end(content, start);
-    // Everything after the completed export statement — on the same line or the
-    // following lines — is candidate trailing payload. Exclude comments and further
-    // import/export declarations (legitimate named exports are not injected code).
-    let meaningful: String = content[end..]
-        .lines()
-        .map(|l| l.trim())
-        .filter(|t| {
-            !t.is_empty()
-                && *t != ";"
-                && !t.starts_with("//")
-                && !t.starts_with("/*")
-                && !t.starts_with('*')
-                && !t.starts_with("export ")
-                && !t.starts_with("import ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    // A multi-line expression export (e.g. `export default cond ? withA(...) : withB(...)`)
-    // continues past the apparent statement end; content that BEGINS with an expression-
-    // continuation operator (a ternary `:`/`?`, a method-chain `.`, `||`/`&&`, a comma or a
-    // closing bracket) is part of the export, not injected payload. Real payloads start a new
-    // statement (`;`, `(`, `!`, an identifier, …), never these.
-    let continues = meaningful.chars().next().is_some_and(|c| ":?.,)]}|&".contains(c));
-    meaningful.len() > 8 && meaningful.contains('(') && !continues
+    // Legit configs place helper/plugin DECLARATIONS after the export (function/const/class/…) —
+    // hoisted, they never run on their own, so they are NOT payload even when their bodies fetch
+    // or spawn. And a multi-line ternary/expression export continues past the apparent end. Fire
+    // only if a TOP-LEVEL statement in the trailing region actually EXECUTES (an IIFE or a call).
+    trailing_has_executable_statement(&content[end..])
+}
+
+/// True if `trailing` (the region after a completed `export default`/`module.exports`) contains a
+/// top-level statement that executes immediately — an IIFE or an appended call. Declarations
+/// (function/const/class/type/…) and expression continuations (`: g()`, `.then()`) are benign.
+fn trailing_has_executable_statement(trailing: &str) -> bool {
+    let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut stmt_start = true;
+    for (idx, c) in trailing.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        // Statement boundaries at top level (JS ASI: a newline can end a statement).
+        if depth == 0 && (c == ';' || c == '\n') {
+            stmt_start = true;
+            continue;
+        }
+        if c.is_whitespace() {
+            continue; // preserves stmt_start
+        }
+        // Classify the FIRST non-whitespace char of a top-level statement BEFORE the bracket
+        // handling below — an IIFE's leading `(` must be seen as execution, not just depth.
+        if depth == 0 && stmt_start {
+            if starts_with_execution(&trailing[idx..]) {
+                return true;
+            }
+            stmt_start = false;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                if depth == 0 {
+                    stmt_start = true; // a fresh statement may follow a closed block
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Classify the start of a top-level trailing statement: does it EXECUTE (injected payload) or is
+/// it a benign declaration / expression-continuation?
+fn starts_with_execution(s: &str) -> bool {
+    let s = s.trim_start();
+    let first = match s.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    // IIFE / unary-prefixed immediate execution.
+    if matches!(first, '(' | '!' | '~' | '+' | '`') {
+        return true;
+    }
+    // Expression-continuation operators — the export expression continues (ternary `:`/`?`, a
+    // method chain `.`, `||`/`&&`, a comma, a closing bracket). Not a fresh statement.
+    if matches!(
+        first,
+        ':' | '?' | '.' | ',' | ')' | ']' | '}' | '|' | '&' | '=' | '<' | '>' | '*' | '/' | '%' | '-'
+    ) {
+        return false;
+    }
+    // Identifier-led: a declaration keyword is benign code organization; a bare identifier that
+    // immediately calls or member-accesses (`require(`, `eval(`, `fetch(`, `foo.bar(`) executes.
+    let word: String =
+        s.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+    const DECL: &[&str] = &[
+        "function", "async", "const", "let", "var", "class", "type", "interface", "enum",
+        "export", "import", "declare", "abstract", "namespace",
+    ];
+    if word.is_empty() || DECL.contains(&word.as_str()) {
+        return false;
+    }
+    let after = s[word.len()..].trim_start();
+    after.starts_with('(') || after.starts_with('.') || after.starts_with('`')
 }
 
 // --- DestructiveWipe ---
@@ -549,6 +617,19 @@ mod tests {
         // A real fetch / node-module require still fires.
         assert!(score("fetch('https://x')", Surface::ConfigFile).network_egress);
         assert!(score("const https = require('https')", Surface::ConfigFile).network_egress);
+    }
+
+    #[test]
+    fn trailing_code_false_on_helper_functions_after_export() {
+        // Legit configs define helper/plugin functions AFTER `export default` (hoisted) — a
+        // declaration, not injected payload, even when its body fetches or spawns.
+        let vite = "import { defineConfig } from 'vite'\nexport default defineConfig({ plugins: [p()] })\n\nfunction p() {\n  return { name: 'x', buildStart() { void fetchIcons() } }\n}\n\nasync function fetchIcons() {\n  const url = process.env.U || 'https://models.dev'\n  await fetch(`${url}/api.json`)\n}\n";
+        assert!(!score(vite, Surface::ConfigFile).trailing_code);
+        assert!(!gate(Surface::ConfigFile, &score(vite, Surface::ConfigFile)));
+
+        let astro = "import { defineConfig } from 'astro/config'\nimport { spawnSync } from 'child_process'\nexport default defineConfig({ integrations: [s()] })\n\nfunction s() {\n  return { hooks: { done: () => { spawnSync('./script.ts', []) } } }\n}\n";
+        assert!(!score(astro, Surface::ConfigFile).trailing_code);
+        assert!(!gate(Surface::ConfigFile, &score(astro, Surface::ConfigFile)));
     }
 
     #[test]
