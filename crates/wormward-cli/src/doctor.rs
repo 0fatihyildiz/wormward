@@ -28,6 +28,17 @@ pub fn render_text(r: &DoctorReport) -> String {
         out.push_str("    → re-run with --fix to clear the affected cache dirs (they regenerate)\n");
     }
 
+    if !r.unscanned.is_empty() {
+        out.push_str("\nUnscanned (blind spots — NOT certified clean)\n");
+        for u in &r.unscanned {
+            out.push_str(&format!("  ✗ {} — {}\n", u.path.display(), u.reason));
+        }
+        out.push_str(
+            "    → grant read access (macOS: System Settings → Privacy & Security → Full Disk\n\
+             \x20     Access) and re-run; these paths were skipped, not verified clean\n",
+        );
+    }
+
     out.push_str("\nTrigger paths (how the worm re-runs)\n");
     if r.triggers.is_empty() {
         out.push_str("  · no trigger checks available on this platform\n");

@@ -38,6 +38,15 @@ pub struct TriggerCheck {
     pub detail: String,
 }
 
+/// A path we were meant to scan but could not read (e.g. macOS Full Disk Access / TCC, or a
+/// permission error). Recorded so the report never certifies "clean" over data it could not see —
+/// an unreadable root is the worst case (a silent false CLEAN), so it must fail the run.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct Unscanned {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
 /// Aggregated machine-check results.
 #[derive(Debug, serde::Serialize)]
 pub struct DoctorReport {
@@ -47,20 +56,40 @@ pub struct DoctorReport {
     /// Distinct cache dirs that hold at least one tainted file — the deletable units for a fix
     /// (they regenerate cleanly). Precomputed so both the CLI and GUI act on the same set.
     pub cache_dirs: Vec<PathBuf>,
+    /// Roots that exist but could not be read — blind spots, not "clean".
+    pub unscanned: Vec<Unscanned>,
 }
 
 impl DoctorReport {
-    /// True if an ACTIVE infection was found (running loader or tainted cache) — drives the exit
-    /// code. Trigger exposures are advisory risk, not an infection, so they don't fail the run.
+    /// True if an ACTIVE infection was found (running loader or tainted cache) OR a scan root was
+    /// unreadable — both drive a non-zero exit. Trigger exposures are advisory risk, not an
+    /// infection, so they don't fail the run; an unscanned root does, because a blind spot must
+    /// never be reported as clean.
     pub fn has_findings(&self) -> bool {
-        !self.processes.is_empty() || !self.caches.is_empty()
+        !self.processes.is_empty() || !self.caches.is_empty() || !self.unscanned.is_empty()
     }
+}
+
+/// If `dir` exists (stat succeeds) but cannot be enumerated (read_dir errors), it is a blind spot —
+/// return an [`Unscanned`]. This stat-vs-enumerate split is exactly how macOS TCC manifests: the
+/// directory name is visible but its contents are not. A non-existent path is not a blind spot
+/// (there is nothing to scan there), so it returns None.
+pub fn probe_root(dir: &Path) -> Option<Unscanned> {
+    if dir.is_dir() && std::fs::read_dir(dir).is_err() {
+        return Some(Unscanned {
+            path: dir.to_path_buf(),
+            reason: "exists but is unreadable (permission / Full Disk Access) — not scanned".into(),
+        });
+    }
+    None
 }
 
 /// Run the machine check once (single point-in-time snapshot).
 pub fn check() -> DoctorReport {
+    let targets = cache_targets();
+    let unscanned = targets.iter().filter_map(|d| probe_root(d)).collect();
     let caches = scan_caches();
-    let cache_dirs = cache_targets()
+    let cache_dirs = targets
         .into_iter()
         .filter(|t| caches.iter().any(|h| h.path.starts_with(t)))
         .collect();
@@ -69,6 +98,7 @@ pub fn check() -> DoctorReport {
         caches,
         triggers: audit_triggers(),
         cache_dirs,
+        unscanned,
     }
 }
 
@@ -394,6 +424,25 @@ mod tests {
         let hits = scan_contents(&files);
         assert_eq!(hits.len(), 1, "only the tainted cache file should match, got {hits:?}");
         assert_eq!(hits[0].path, PathBuf::from("_npx/evil/postinstall.js"));
+    }
+
+    #[test]
+    fn unreadable_root_fails_clean() {
+        // An unscanned root is the worst case (a silent false CLEAN); has_findings must be true.
+        let report = DoctorReport {
+            processes: vec![],
+            caches: vec![],
+            triggers: vec![],
+            cache_dirs: vec![],
+            unscanned: vec![Unscanned { path: PathBuf::from("/blocked"), reason: "x".into() }],
+        };
+        assert!(report.has_findings(), "an unscanned root must not certify clean");
+    }
+
+    #[test]
+    fn probe_root_none_for_missing_path() {
+        // A path that does not exist is not a blind spot — nothing to scan there.
+        assert!(probe_root(Path::new("/definitely/not/here/xyz-123")).is_none());
     }
 
     #[test]
