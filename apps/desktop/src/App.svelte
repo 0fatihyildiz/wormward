@@ -138,7 +138,7 @@
 
 <main id="main" tabindex="-1">
   {#each tabs as [id]}
-    <div class="screen" hidden={app.screen !== id}>
+    <div class="screen" style:display={app.screen === id ? "block" : "none"}>
       {#if visited[id]}
         {@const Screen = screens[id]}
         <div in:fly={{ y: reduce ? 0 : 8, duration: reduce ? 0 : 200, easing: cubicOut }}>
@@ -213,5 +213,4 @@
     line-height: 1.5;
   }
   main { min-height: calc(100vh - var(--topbar-h)); }
-  .screen[hidden] { display: none; }
 </style>
