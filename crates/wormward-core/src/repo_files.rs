@@ -2,7 +2,13 @@ use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
+
+/// A lazily-spawned `git cat-file --batch` reader that can be SHARED across many [`GitTree`]s of the
+/// same repo (e.g. every branch tip in a deep scan), so the whole repo spawns ONE cat-file process
+/// instead of one per tip. Single-threaded (a repo's deep scan is sequential), so `Rc` is fine.
+pub(crate) type SharedReader = Rc<RefCell<Option<CatFile>>>;
 
 use crate::walk::walk_repo_files_cancellable;
 
@@ -57,11 +63,11 @@ pub struct GitTree {
     repo: PathBuf,
     commit: String,
     paths: Vec<PathBuf>,
-    // One lazily-spawned `git cat-file --batch` process, reused for every blob read in this
-    // tree. Deep scan reads config/manifest files across many branch tips; a shared reader turns
-    // that from one `git show` subprocess per file into a single reader per tree — a large drop
-    // in process churn (and CPU/heat) on repos with many branches.
-    reader: RefCell<Option<CatFile>>,
+    // A lazily-spawned `git cat-file --batch` reader for blob reads. Owned per-tree by default, or
+    // SHARED across every tip of a repo in a deep scan (see [`GitTree::new_for_paths_with_reader`])
+    // so the whole repo spawns ONE cat-file process instead of one per tip — a large drop in
+    // process churn on repos with many branches.
+    reader: SharedReader,
 }
 
 impl GitTree {
@@ -87,7 +93,7 @@ impl GitTree {
             repo: repo.to_path_buf(),
             commit: commit.to_string(),
             paths,
-            reader: RefCell::new(None),
+            reader: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -101,8 +107,26 @@ impl GitTree {
             repo: repo.to_path_buf(),
             commit: commit.to_string(),
             paths,
-            reader: RefCell::new(None),
+            reader: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// A fresh shared cat-file reader — pass the SAME one to every tip's
+    /// [`GitTree::new_for_paths_with_reader`] so a deep scan spawns one cat-file process per repo.
+    pub(crate) fn shared_reader() -> SharedReader {
+        Rc::new(RefCell::new(None))
+    }
+
+    /// Like [`GitTree::new_for_paths`] but reuses a caller-provided [`SharedReader`] instead of
+    /// spawning its own — the deep-scan optimization that collapses N per-tip cat-file processes
+    /// into one per repo.
+    pub(crate) fn new_for_paths_with_reader(
+        repo: &Path,
+        commit: &str,
+        paths: Vec<PathBuf>,
+        reader: SharedReader,
+    ) -> Self {
+        GitTree { repo: repo.to_path_buf(), commit: commit.to_string(), paths, reader }
     }
 }
 
@@ -121,7 +145,7 @@ impl RepoFiles for GitTree {
 
 /// A persistent `git cat-file --batch` reader for one repo. Specs `<rev>:<path>` are written to
 /// stdin; each reply is `<oid> <type> <size>\n<content>\n`, or `<spec> missing\n` when absent.
-struct CatFile {
+pub(crate) struct CatFile {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,

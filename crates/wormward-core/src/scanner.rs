@@ -668,6 +668,10 @@ pub fn deep_scan_repo_cancellable(
     let head = head_commit(repo);
     let mut seen = std::collections::HashSet::new();
     let mut findings = Vec::new();
+    // One `git cat-file --batch` reader shared by every tip, so a many-branch repo spawns a single
+    // blob reader instead of one per tip (the tip specs carry their own commit, so one reader
+    // serves them all).
+    let reader = GitTree::shared_reader();
     for (oid, name) in branch_commits(repo) {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -688,7 +692,7 @@ pub fn deep_scan_repo_cancellable(
                 if changed.is_empty() {
                     continue;
                 }
-                GitTree::new_for_paths(repo, &oid, changed)
+                GitTree::new_for_paths_with_reader(repo, &oid, changed, reader.clone())
             }
             // No HEAD (unborn/detached edge): fall back to scanning the full tip tree.
             None => match GitTree::new(repo, &oid) {
