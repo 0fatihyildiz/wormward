@@ -773,6 +773,16 @@ fn main() -> ExitCode {
                             }
                         }
                     }
+                    // Safe trigger hardening: block install lifecycle scripts globally.
+                    let scripts_exposed = report
+                        .triggers
+                        .iter()
+                        .any(|t| t.name.contains("ignore-scripts") && t.exposed);
+                    if scripts_exposed {
+                        for msg in doctor::fix_triggers() {
+                            println!("  {msg}");
+                        }
+                    }
                 }
                 ExitCode::from(u8::from(report.has_findings()))
             }
