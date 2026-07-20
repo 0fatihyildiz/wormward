@@ -1,0 +1,69 @@
+<script lang="ts">
+  import type { Finding } from "../types";
+
+  let { finding }: { finding: Finding } = $props();
+
+  const SEV_WORD: Record<string, string> = {
+    critical: "Critical threat",
+    high: "Serious threat",
+    medium: "Threat",
+    low: "Minor issue",
+    info: "Note",
+  };
+  const title = $derived(SEV_WORD[finding.severity] ?? "Threat");
+  const where = $derived(finding.file ?? finding.repo);
+  const label = $derived(finding.remediable ? "Removable automatically" : "Needs your attention");
+</script>
+
+<div class="finding-card">
+  <div class="fc-top">
+    <span class="fc-title sev-{finding.severity}">{title}</span>
+    <span class="fc-where mono">{where}</span>
+    <span class="fc-label {finding.remediable ? 'ok' : 'warn'}">{label}</span>
+  </div>
+  <details class="fc-details">
+    <summary>Details</summary>
+    <dl class="fc-dl">
+      <dt>What we found</dt>
+      <dd class="mono">{finding.evidence}</dd>
+      <dt>Repository</dt>
+      <dd class="mono">{finding.repo}</dd>
+      {#if finding.file}
+        <dt>File</dt>
+        <dd class="mono">{finding.file}</dd>
+      {/if}
+      <dt>Campaign</dt>
+      <dd>{finding.campaign}</dd>
+      {#if finding.git_ref}
+        <dt>Branch</dt>
+        <dd class="mono">{finding.git_ref}</dd>
+      {/if}
+      {#if finding.online}
+        <dt>Online check</dt>
+        <dd class={finding.online.malicious ? "crit" : "muted"}>
+          OpenSourceMalware: {finding.online.malicious ? "flagged as malicious" : "not flagged"}{#if finding.online.message} — {finding.online.message}{/if}{#if finding.online.osm_url} · <a href={finding.online.osm_url} target="_blank" rel="noreferrer noopener">View advisory ↗</a>{/if}
+        </dd>
+      {/if}
+    </dl>
+  </details>
+</div>
+
+<style>
+  .finding-card { background: var(--surface-2); border-radius: var(--radius-sm); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+  .fc-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .fc-title { font-size: 13px; font-weight: 600; color: var(--fg); }
+  .fc-title.sev-critical, .fc-title.sev-high { color: var(--danger); }
+  .fc-title.sev-medium { color: var(--warn); }
+  .fc-where { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; min-width: 0; }
+  .fc-label { font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 999px; margin-left: auto; white-space: nowrap; }
+  .fc-label.ok { background: var(--ok-tint); color: var(--ok); }
+  .fc-label.warn { background: var(--warn-tint); color: var(--warn); }
+  .fc-details > summary { cursor: pointer; color: var(--muted); font-size: 12px; width: fit-content; }
+  .fc-details > summary:hover { color: var(--fg); }
+  .fc-dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 10px 0 0; }
+  .fc-dl dt { color: var(--faint); font-size: 11px; }
+  .fc-dl dd { margin: 0; color: var(--fg); font-size: 12px; overflow-wrap: anywhere; min-width: 0; }
+  .fc-dl dd.mono { font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+  .fc-dl dd.crit { color: var(--danger); }
+  .fc-dl dd.muted { color: var(--muted); }
+</style>
