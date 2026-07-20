@@ -1,0 +1,33 @@
+name: 'Wormward Supply-Chain Scan'
+description: 'Read-only scan for PolinRider / TasksJacker / Glassworm supply-chain worm infections. Fails the build on findings and can upload SARIF.'
+author: 'wormward'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  path:
+    description: 'Directory to scan (relative to the checked-out repo).'
+    required: false
+    default: '.'
+  history:
+    description: 'Also pickaxe git history (git log --all -S) for payloads scrubbed from the tip. Requires fetch-depth: 0 on checkout.'
+    required: false
+    default: 'false'
+  sarif:
+    description: 'Also write a SARIF report to wormward.sarif for upload to the Security tab.'
+    required: false
+    default: 'true'
+  include-community:
+    description: 'Include lower-confidence community IOC leads (suppressed by default).'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+
+# NOTE ON SAFETY: wormward is READ-ONLY — it greps/parses files and git objects and never executes
+# scanned code. The action image is built from wormward's own (pinned) ref, not from the pull
+# request, so a malicious PR cannot alter the scanner. Consumers should pin this action to a commit
+# SHA and make the resulting check a required status check.
