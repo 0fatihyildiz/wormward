@@ -37,6 +37,28 @@ fn polinrider_config_injection() {
 }
 
 #[test]
+fn glassworm_invisible_unicode_run() {
+    // A run of variation-selector chars in a config file (Glassworm stego payload) fires.
+    let run = "\u{FE00}\u{FE01}\u{FE02}\u{FE03}\u{FE04}";
+    let content = format!("export default {{}};\nconst x = '{run}';");
+    assert!(fires(&[("postcss.config.mjs", &content)]));
+}
+
+#[test]
+fn trojan_source_bidi_override_fires() {
+    let content = "export default {};\n// \u{202E}reordered comment";
+    assert!(fires(&[("next.config.mjs", content)]));
+}
+
+#[test]
+fn legit_emoji_and_rtl_not_flagged() {
+    // FP guard: legit emoji (ZWJ family, variation selectors) and Arabic RTL text interleave
+    // visible glyphs, so no 4-long invisible run forms — must NOT fire.
+    let content = "export default {\n  greeting: '\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{645}\u{631}\u{62D}\u{628}\u{627} \u{2705}\u{FE0F}',\n};";
+    assert!(!fires(&[("postcss.config.mjs", content)]));
+}
+
+#[test]
 fn shai_hulud_dropped_file_via_reachability() {
     assert!(fires(&[
         ("package.json", r#"{"scripts":{"preinstall":"node setup_bun.js"}}"#),

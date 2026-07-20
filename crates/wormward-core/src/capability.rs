@@ -37,6 +37,10 @@ pub struct CapabilityScore {
     /// A lone outbound fetch/download token (curl/wget/fetch/iwr/…). Only consumed by the
     /// TasksJson gate — a folder-open task that reaches out is suspicious on its own.
     pub remote_fetch: bool,
+    /// A run of invisible/bidi-override Unicode (Trojan-Source reorder controls, or a Glassworm
+    /// variation-selector/tag stego run). A self-evident worm tell — hidden control characters are
+    /// effectively never legitimate in source code.
+    pub invisible_unicode: bool,
     pub evidence: Vec<String>,
 }
 
@@ -373,6 +377,41 @@ pub fn is_exfil_staging(content: &str) -> bool {
 }
 
 /// Score every capability for a piece of content on a given surface.
+/// Invisible / bidi-control code points used for source-stego. A run of these encodes data
+/// (Glassworm) or reorders displayed source (Trojan-Source).
+fn is_invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x200B..=0x200F   // zero-width space/joiner/non-joiner + bidi marks
+        | 0x202A..=0x202E // bidi embeddings / overrides
+        | 0x2060..=0x206F // invisible operators / deprecated format controls
+        | 0x2066..=0x2069 // bidi isolates
+        | 0xFE00..=0xFE0F // variation selectors
+        | 0xE0000..=0xE007F // tags block (Glassworm)
+        | 0xE0100..=0xE01EF) // variation selectors supplement
+}
+
+/// Detect Unicode source-stego, FP-safely. Fires on (a) a bidi-OVERRIDE control (U+202D/U+202E) —
+/// the Trojan-Source attack, essentially never legitimate in code; or (b) a run of ≥4 consecutive
+/// invisible chars — a Glassworm stego payload. Legit emoji (single ZWJ/variation-selector between
+/// visible glyphs) and RTL i18n text never produce a 4-long invisible run, so both are spared.
+pub fn invisible_unicode(content: &str) -> bool {
+    if content.contains('\u{202D}') || content.contains('\u{202E}') {
+        return true;
+    }
+    let mut run = 0usize;
+    for c in content.chars() {
+        if is_invisible(c) {
+            run += 1;
+            if run >= 4 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
 pub fn score(content: &str, surface: Surface) -> CapabilityScore {
     let mut s = CapabilityScore::default();
     let mark = |cond: bool, field: &mut bool, label: &str, ev: &mut Vec<String>| {
@@ -430,6 +469,12 @@ pub fn score(content: &str, surface: Surface) -> CapabilityScore {
     );
     // Scored last so it never displaces the primary evidence label in `signature_id`.
     mark(remote_fetch(content), &mut s.remote_fetch, "remote-fetch", &mut s.evidence);
+    mark(
+        invisible_unicode(content),
+        &mut s.invisible_unicode,
+        "invisible-unicode",
+        &mut s.evidence,
+    );
     s
 }
 
@@ -453,8 +498,10 @@ pub fn gate(surface: Surface, s: &CapabilityScore) -> bool {
     // scripts/keys), as are the behavior capabilities themselves.
     let concealed = s.obfuscation || s.trailing_code;
     // Self-evident worm tells — effectively never in legitimate automation, so they fire without
-    // a concealment prior.
-    let worm_tell = s.propagation || s.destructive_wipe || s.credential_exfil;
+    // a concealment prior. Invisible/bidi-override Unicode (Trojan-Source / Glassworm stego) joins
+    // them: hidden control-character runs in source are never legitimate.
+    let worm_tell =
+        s.propagation || s.destructive_wipe || s.credential_exfil || s.invisible_unicode;
     match surface {
         // Config/entry files, one-hop dropped scripts, and every auto-run script surface
         // (lifecycle, workflow, git hook, propagation script) all require a concealment prior
