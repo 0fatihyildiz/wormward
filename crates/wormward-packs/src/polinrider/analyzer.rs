@@ -7,9 +7,14 @@ fn marker_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // Version-tag marker (`global.o='5-3-235-du'` / `global['!']='8-270-2'`) OR the
     // ESM re-entry shim (`global['r']=require` / `global.m=module`) — the shim is the
-    // strongest marker-independent tell, present in both variants.
+    // strongest marker-independent tell, present in both variants. Bracket keys and string
+    // values may be single- OR double-quoted (some variants use `global["!"]="10"`), matching
+    // the quote-agnostic remediation strip marker.
     RE.get_or_init(|| {
-        Regex::new(r"global(\.\w+|\['[^']+'\])\s*=\s*(?:require\b|module\b|'[\w-]+')").unwrap()
+        Regex::new(
+            r#"global(\.\w+|\[('[^']+'|"[^"]+")\])\s*=\s*(?:require\b|module\b|'[\w-]+'|"[\w-]+")"#,
+        )
+        .unwrap()
     })
 }
 
@@ -33,7 +38,10 @@ impl PolinriderAnalyzer {
         let has_marker = marker_re().is_match(content);
         let has_decoder = decoder_re().is_match(content)
             || content.contains("MDy")
-            || content.contains("createRequire(import.meta.url");
+            || content.contains("createRequire(import.meta.url")
+            // Structural string-shuffle tell: the decoder builds strings via a
+            // String.fromCharCode(127) sentinel, present even when the decoder is renamed.
+            || content.contains("String.fromCharCode(127)");
         let has_seed = seed_re().is_match(content);
         if has_marker && has_decoder {
             return Some("obfuscation: injection marker + decoder".to_string());
@@ -95,6 +103,25 @@ mod tests {
         // The modus.builders variant: dot marker + _$_8e2c decoder.
         let out = PolinriderAnalyzer
             .analyze(&scanned("export default {};\nglobal.o='5-3-235-du';var _$_8e2c=[];"));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn confirms_double_quoted_bracket_marker_variant() {
+        // The guide documents double-quoted `global["..."]` variants; our strip marker already
+        // handles both quote styles, so the detection marker must too (single-quote-only was a
+        // blind spot that let a double-quoted variant evade analyzer confirmation).
+        let out = PolinriderAnalyzer
+            .analyze(&scanned("export default {};\nglobal[\"!\"]=\"10\";var _$_1e42=[];"));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn confirms_fromcharcode_decoder_variant() {
+        // A renamed decoder (no `_$_` name) is still caught via the String.fromCharCode(127)
+        // string-shuffle tell the guide calls out as the structural fingerprint.
+        let out = PolinriderAnalyzer
+            .analyze(&scanned("export default {};\nglobal.i='5-3-168';var y=String.fromCharCode(127);"));
         assert_eq!(out.len(), 1);
     }
 
