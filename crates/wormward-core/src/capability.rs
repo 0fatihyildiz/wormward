@@ -87,7 +87,7 @@ fn high_entropy(content: &str) -> bool {
         return true;
     }
     let b = content.as_bytes();
-    shannon_entropy(&b[b.len().saturating_sub(512)..]) > 5.0
+    shannon_entropy(&b[b.len().saturating_sub(512)..]) > 7.0
 }
 
 // --- CredentialAccess ---
