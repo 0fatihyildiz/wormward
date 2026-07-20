@@ -20,6 +20,9 @@ pub enum FindingKind {
     NpmPackage,
     IocDomain,
     GitReflog,
+    /// A payload marker found in a past commit via `git log --all -S` — the working tree/tips are
+    /// clean but the infection is still reachable via `git checkout`. Advisory, non-remediable.
+    HistoryHit,
     Analyzer,
     Capability,
     /// A GitHub account-persistence finding (over-privileged token, injected SSH key, rogue
@@ -78,6 +81,11 @@ mod tests {
     fn account_audit_kind_serializes() {
         let json = serde_json::to_string(&FindingKind::AccountAudit).unwrap();
         assert_eq!(json, "\"account_audit\"");
+    }
+
+    #[test]
+    fn history_hit_kind_serializes() {
+        assert_eq!(serde_json::to_string(&FindingKind::HistoryHit).unwrap(), "\"history_hit\"");
     }
 
     fn sample_finding(online: Option<OnlineVerdict>) -> Finding {

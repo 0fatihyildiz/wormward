@@ -526,4 +526,47 @@ mod tests {
             "legit RPC endpoints must not be flagged as literal IOCs"
         );
     }
+
+    #[test]
+    fn history_pickaxe_finds_scrubbed_payload() {
+        use std::process::Command;
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        // Commit the infection...
+        fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default {};\nvar q=(\"rmcej%otb%\",2857687);",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add"]);
+        // ...then scrub it from the working tree and commit the clean version.
+        fs::write(repo.join("postcss.config.mjs"), "export default {};\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "clean"]);
+
+        let packs = builtin_packs();
+        // The tip is clean...
+        assert!(scan_repo(&repo, &packs).is_empty(), "tip must be clean after scrub");
+        // ...but the pickaxe still surfaces the infection from history.
+        let hist = wormward_core::scan_history(&repo, &packs);
+        assert!(
+            hist.iter().any(|f| f.kind == FindingKind::HistoryHit && f.git_ref.is_some()),
+            "history pickaxe must surface the scrubbed payload, got {hist:?}"
+        );
+    }
 }

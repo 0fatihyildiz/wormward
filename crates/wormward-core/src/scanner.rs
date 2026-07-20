@@ -651,6 +651,83 @@ pub fn deep_scan_repo_cancellable(
     findings
 }
 
+/// High-specificity injection markers to pickaxe through full history. Deliberately EXCLUDES the
+/// bare decoder name (`_$_1e42`) and generic seeds — those legitimately appear in security
+/// write-ups and scanner sources and would false-positive (as they did for `stamparm/maltrail`).
+/// The composite markers below essentially never occur outside a real payload.
+fn history_markers(packs: &[Pack]) -> Vec<(String, String)> {
+    const MARKER_IDS: [&str; 3] = ["primary", "secondary", "variant-april"];
+    let mut out = Vec::new();
+    for pack in packs {
+        for sig in &pack.manifest.content_signatures {
+            if sig.kind == crate::matchers::SignatureKind::Literal
+                && MARKER_IDS.contains(&sig.id.as_str())
+            {
+                out.push((pack.manifest.id.clone(), sig.value.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Cap on history findings per repo, so a pathological history can't flood the report.
+const MAX_HISTORY_HITS: usize = 200;
+
+/// Opt-in per-commit history scan (`--history`): pickaxe (`git log --all -S <marker>`) each
+/// high-specificity injection marker across ALL refs to surface infections scrubbed from the
+/// working tree / branch tips but still reachable via `git checkout`. Emits Medium, advisory,
+/// non-remediable [`FindingKind::HistoryHit`]s stamped with the commit sha.
+pub fn scan_history(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for (campaign, marker) in history_markers(packs) {
+        if findings.len() >= MAX_HISTORY_HITS {
+            break;
+        }
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["log", "--all", "-S", &marker, "--format=%H%x1f%aI%x1f%an%x1f%s"])
+            .output();
+        let out = match out {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if findings.len() >= MAX_HISTORY_HITS {
+                break;
+            }
+            let mut p = line.split('\u{1f}');
+            let sha = match p.next() {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => continue,
+            };
+            let date = p.next().unwrap_or("");
+            let author = p.next().unwrap_or("");
+            let subject = p.next().unwrap_or("");
+            if !seen.insert((campaign.clone(), sha.clone())) {
+                continue;
+            }
+            let short = sha.chars().take(12).collect::<String>();
+            findings.push(Finding {
+                campaign: campaign.clone(),
+                severity: Severity::Medium,
+                repo: repo.to_path_buf(),
+                file: None,
+                signature_id: "history-hit".into(),
+                kind: FindingKind::HistoryHit,
+                evidence: format!(
+                    "payload marker in history commit {short} ({date}, {author}: {subject}) — reachable via git checkout"
+                ),
+                remediable: false,
+                online: None,
+                git_ref: Some(short),
+            });
+        }
+    }
+    findings
+}
+
 pub fn scan_deep(roots: &[PathBuf], packs: &[Pack]) -> ScanReport {
     let mut repos: Vec<PathBuf> = Vec::new();
     for root in roots {

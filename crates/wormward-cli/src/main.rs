@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use wormward_core::{
     amend_head, apply, apply_branch_cleans, branch_remote, commit_paths, current_branch,
     deep_scan_repo, discover_repos, force_push_with_lease, force_push_with_lease_to, now_secs,
-    plan_branch_cleans, plan_remediation, push, restore, scan, scan_deep, scan_repo,
+    plan_branch_cleans, plan_remediation, push, restore, scan, scan_deep, scan_history, scan_repo,
     BranchCleanStatus,
 };
 use wormward_osm::OsmClient;
@@ -41,6 +41,9 @@ enum Command {
         /// Also scan the tip of every local/remote branch (read-only, no checkout).
         #[arg(long)]
         deep: bool,
+        /// Also pickaxe full git history (`git log --all -S`) for scrubbed-but-reachable payloads.
+        #[arg(long)]
+        history: bool,
     },
     /// List the campaign packs compiled into this build.
     ListPacks,
@@ -204,7 +207,7 @@ fn github_exit_code(outcomes: &[wormward_github::pipeline::RepoOutcome]) -> u8 {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan { dirs, format, online, osm_token, deep } => {
+        Command::Scan { dirs, format, online, osm_token, deep, history } => {
             for dir in &dirs {
                 if !dir.exists() {
                     eprintln!("error: path does not exist: {}", dir.display());
@@ -216,6 +219,14 @@ fn main() -> ExitCode {
             } else {
                 scan(&dirs, &builtin_packs())
             };
+            if history {
+                let packs = builtin_packs();
+                for dir in &dirs {
+                    for repo in discover_repos(dir) {
+                        report.findings.extend(scan_history(&repo, &packs));
+                    }
+                }
+            }
             if online {
                 let token = osm_token
                     .or_else(|| std::env::var("OSM_API_KEY").ok())
