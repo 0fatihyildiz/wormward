@@ -713,16 +713,21 @@ pub fn scan_node_modules(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
             };
             for bad in bads {
                 if bad.name == name && crate::lockfile::version_matches(&entry, &bad.versions) {
+                    let community = bad.confidence == crate::matchers::Confidence::Community;
+                    let prefix = if community { "pkg-community" } else { "pkg" };
                     let ver = version.as_deref().map(|x| format!("@{x}")).unwrap_or_default();
                     let rel = dir.strip_prefix(repo).unwrap_or(&dir).join("package.json");
                     findings.push(Finding {
                         campaign: pack.manifest.id.clone(),
-                        severity: pack.manifest.severity.clone(),
+                        severity: if community { Severity::Low } else { pack.manifest.severity.clone() },
                         repo: repo.to_path_buf(),
                         file: Some(rel),
-                        signature_id: format!("pkg:npm:{name}{ver}"),
+                        signature_id: format!("{prefix}:npm:{name}{ver}"),
                         kind: FindingKind::NpmPackage,
-                        evidence: format!("malicious npm package '{name}'{ver} installed in node_modules"),
+                        evidence: format!(
+                            "malicious npm package '{name}'{ver} installed in node_modules{}",
+                            if community { " (community-sourced lead)" } else { "" }
+                        ),
                         remediable: false,
                         online: None,
                         git_ref: None,

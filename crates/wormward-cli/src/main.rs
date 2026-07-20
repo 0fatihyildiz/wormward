@@ -44,6 +44,9 @@ enum Command {
         /// Also pickaxe full git history (`git log --all -S`) for scrubbed-but-reachable payloads.
         #[arg(long)]
         history: bool,
+        /// Include lower-confidence, community-sourced IOC leads (suppressed by default).
+        #[arg(long)]
+        include_community: bool,
     },
     /// List the campaign packs compiled into this build.
     ListPacks,
@@ -207,7 +210,7 @@ fn github_exit_code(outcomes: &[wormward_github::pipeline::RepoOutcome]) -> u8 {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan { dirs, format, online, osm_token, deep, history } => {
+        Command::Scan { dirs, format, online, osm_token, deep, history, include_community } => {
             for dir in &dirs {
                 if !dir.exists() {
                     eprintln!("error: path does not exist: {}", dir.display());
@@ -226,6 +229,11 @@ fn main() -> ExitCode {
                         report.findings.extend(scan_history(&repo, &packs));
                     }
                 }
+            }
+            // Community-sourced leads carry a `pkg-community:` id; drop them unless opted in, so a
+            // single-source list never inflates a default scan's verdict.
+            if !include_community {
+                report.findings.retain(|f| !f.signature_id.starts_with("pkg-community:"));
             }
             if online {
                 let token = osm_token

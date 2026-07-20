@@ -268,6 +268,9 @@ pub fn check_lockfiles(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<F
                 if bad.name == entry.name && version_matches(&entry, &bad.versions) {
                     let community = bad.confidence == Confidence::Community;
                     let ver = entry.version.as_deref().map(|v| format!("@{v}")).unwrap_or_default();
+                    // Community-tier findings carry a distinct `pkg-community:` id so a caller can
+                    // suppress leads without threading a flag through the whole scan pipeline.
+                    let prefix = if community { "pkg-community" } else { "pkg" };
                     findings.push(Finding {
                         campaign: pack.manifest.id.clone(),
                         severity: if community {
@@ -277,7 +280,7 @@ pub fn check_lockfiles(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<F
                         },
                         repo: repo.to_path_buf(),
                         file: Some(std::path::PathBuf::from(name)),
-                        signature_id: format!("pkg:{}:{}{ver}", entry.ecosystem, entry.name),
+                        signature_id: format!("{prefix}:{}:{}{ver}", entry.ecosystem, entry.name),
                         kind: FindingKind::NpmPackage,
                         evidence: format!(
                             "malicious {} package '{}'{ver} resolved in {name}{}",

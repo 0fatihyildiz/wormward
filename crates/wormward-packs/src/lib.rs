@@ -648,6 +648,24 @@ mod tests {
     }
 
     #[test]
+    fn community_package_is_low_and_tagged() {
+        // A community-sourced lead must surface as a Low, `pkg-community:`-tagged finding (so the
+        // CLI can suppress it by default) — never a hard critical/"infected" verdict.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("pnpm-lock.yaml"),
+            "packages:\n  /plain-crypto-js@4.2.1:\n    resolution: {integrity: sha512-x}\n",
+        )
+        .unwrap();
+        let f = scan_repo(&repo, &builtin_packs());
+        let hit = f.iter().find(|x| x.signature_id.starts_with("pkg-community:npm:plain-crypto-js"));
+        assert!(hit.is_some(), "community lead must be tagged pkg-community, got {f:?}");
+        assert_eq!(hit.unwrap().severity, wormward_core::Severity::Low);
+    }
+
+    #[test]
     fn lockfile_flags_composer_package() {
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("v");
