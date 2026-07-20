@@ -728,8 +728,21 @@ pub fn scan_machine() -> Vec<MachineHit> {
     hits.extend(scan_persistence(&persistence_items()));
     hits.extend(scan_connections(&tcp_connection_lines(), &c2_hosts()));
     hits.extend(scan_global_packages(&global_package_names(), &bad));
-    hits.extend(scan_keychain_procs(&procs));
+    hits.extend(scan_keychain_correlated(&procs));
     hits
+}
+
+/// Keychain-theft hits, CORRELATED. Reading the GitHub keychain credential is also what many
+/// legitimate tools do — git's credential flow (`security find-internet-password -s github.com`
+/// fires on every `git push`), `gh`, editors, keychain-sync — so a bare match is not evidence of
+/// theft. Report it only when a confirmed loader process is ALSO present (the actual worm reading
+/// creds), never on its own. Pure/testable.
+pub fn scan_keychain_correlated(procs: &[(u32, String)]) -> Vec<MachineHit> {
+    if scan_process_lines(procs).is_empty() {
+        Vec::new()
+    } else {
+        scan_keychain_procs(procs)
+    }
 }
 
 #[cfg(test)]
@@ -897,6 +910,27 @@ mod tests {
         let hits = scan_connections(&conns, &["166.88.54.158".to_string()]);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].target, "166.88.54.158");
+    }
+
+    #[test]
+    fn keychain_access_alone_is_not_theft() {
+        // A `security find-internet-password -s github.com` process with NO loader present is the
+        // normal git/gh credential flow — must NOT be reported (this was a live FP on `git push`).
+        let benign = vec![
+            (100, "security find-internet-password -s github.com -a me".to_string()),
+            (101, "git push origin main".to_string()),
+        ];
+        assert!(scan_keychain_correlated(&benign).is_empty(), "keychain read alone is not theft");
+
+        // Same keychain access WITH a confirmed loader process → correlated → reported.
+        let infected = vec![
+            (200, "security find-internet-password -s github.com".to_string()),
+            (
+                201,
+                "node -e global['!']='10';var _$_1e42=(function(r,i){return r})('x',7);global[_$_1e42[0]]=require".to_string(),
+            ),
+        ];
+        assert_eq!(scan_keychain_correlated(&infected).len(), 1, "loader + keychain = theft");
     }
 
     #[test]
