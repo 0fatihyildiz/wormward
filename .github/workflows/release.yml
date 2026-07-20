@@ -5,7 +5,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write      # create the release + upload assets
+  id-token: write      # OIDC token for build-provenance attestation
+  attestations: write  # write the provenance attestation
 
 jobs:
   release:
@@ -53,7 +55,8 @@ jobs:
       - name: Build CLI (release)
         run: cargo build --release -p wormward-cli
 
-      - name: Package + upload CLI binary
+      - name: Package + checksum + upload CLI binary
+        id: package
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -65,4 +68,16 @@ jobs:
             *)              src="target/release/wormward";     name="wormward-${tag}-linux-x86_64" ;;
           esac
           cp "$src" "$name"
-          gh release upload "$tag" "$name" --clobber
+          # SHA-256 checksum: sha256sum on Linux + Git-Bash/Windows, shasum on macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$name" > "$name.sha256"
+          else
+            shasum -a 256 "$name" > "$name.sha256"
+          fi
+          gh release upload "$tag" "$name" "$name.sha256" --clobber
+          echo "artifact=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Attest CLI binary build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.package.outputs.artifact }}
