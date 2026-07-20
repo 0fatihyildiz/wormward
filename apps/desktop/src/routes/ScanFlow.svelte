@@ -28,7 +28,12 @@
   const findings = $derived(report?.findings ?? []);
   const total = $derived(findings.length);
   const cancelled = $derived(report?.cancelled ?? false);
-  const removable = $derived(findings.filter((f) => f.remediable).length);
+  // Branch-tip findings (git_ref set) have no working-tree clean action — cleanPreview
+  // produces no plan for them, so the "Remove threats safely" button can't touch them.
+  // They're only reachable via Advanced → branch cleaning, so they must count toward
+  // "manual" (need your review), not "removable" — otherwise the summary promises an
+  // automatic removal the UI has no button for.
+  const removable = $derived(findings.filter((f) => f.remediable && !f.git_ref).length);
   const manual = $derived(total - removable);
 
   const SEV_RANK: Record<string, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
