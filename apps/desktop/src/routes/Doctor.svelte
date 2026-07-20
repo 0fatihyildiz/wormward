@@ -68,7 +68,9 @@
     }
   }
 
-  onMount(runCheck);
+  onMount(() => {
+    runCheck();
+  });
 
   const procHits = $derived(report?.processes.length ?? 0);
   const cacheHits = $derived(report?.caches.length ?? 0);

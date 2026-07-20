@@ -1,8 +1,6 @@
 <script lang="ts">
-  import { app, dismiss } from "./lib/state.svelte";
-  import Scan from "./routes/Scan.svelte";
-  import Results from "./routes/Results.svelte";
-  import Clean from "./routes/Clean.svelte";
+  import { app, dismiss, notify } from "./lib/state.svelte";
+  import Workspace from "./routes/Workspace.svelte";
   import GitHub from "./routes/GitHub.svelte";
   import Doctor from "./routes/Doctor.svelte";
   import Settings from "./routes/Settings.svelte";
@@ -14,8 +12,6 @@
 
   const tabs = [
     ["scan", "Scan"],
-    ["results", "Results"],
-    ["clean", "Clean"],
     ["github", "GitHub"],
     ["doctor", "Doctor"],
     ["settings", "Settings"],
@@ -39,9 +35,7 @@
   // clean plans, form inputs) survives tab switches — only the active one is shown. Lazy, so an
   // unvisited tab runs no work at startup.
   const screens: Record<string, Component> = {
-    scan: Scan,
-    results: Results,
-    clean: Clean,
+    scan: Workspace,
     github: GitHub,
     doctor: Doctor,
     settings: Settings,
@@ -74,6 +68,26 @@
   });
 
   // Notifications: failures persist until dismissed; non-error notices auto-clear (see notify()).
+  // Surface any uncaught JS error / rejection instead of failing silently. De-duped and
+  // guarded to script errors so a repeated error can't spin up a toast loop.
+  $effect(() => {
+    const seen = new Set<string>();
+    const report = (msg: string) => {
+      if (seen.has(msg)) return;
+      seen.add(msg);
+      notify("error", msg);
+    };
+    const onErr = (e: ErrorEvent) => {
+      if (e.error) report(`Unexpected error: ${e.message}`);
+    };
+    const onRej = (e: PromiseRejectionEvent) => report(`Unexpected error: ${String(e.reason)}`);
+    window.addEventListener("error", onErr);
+    window.addEventListener("unhandledrejection", onRej);
+    return () => {
+      window.removeEventListener("error", onErr);
+      window.removeEventListener("unhandledrejection", onRej);
+    };
+  });
 </script>
 
 <a class="skip" href="#main">Skip to content</a>

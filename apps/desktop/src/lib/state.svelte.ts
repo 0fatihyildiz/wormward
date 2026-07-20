@@ -11,7 +11,7 @@ export interface Toast {
 let seq = 0;
 
 export const app = $state({
-  screen: "scan" as "scan" | "results" | "clean" | "github" | "doctor" | "settings",
+  screen: "scan" as "scan" | "github" | "doctor" | "settings",
   dirs: [] as string[],
   report: null as ScanReport | null,
   scanning: false,
