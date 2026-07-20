@@ -21,6 +21,7 @@
   let repoSel = $state<Record<string, boolean>>({});
   let loading = $state(false);
   let busy = $state(false);
+  let busyKind = $state<"apply" | "restore" | "branches" | "">("");
   let confirming = $state(false);
   let result = $state("");
 
@@ -32,17 +33,20 @@
   let confirmingBranches = $state(false);
   let branchResults = $state<BranchCleanResult[]>([]);
   let branchSummary = $state("");
+  let branchesScanned = $state(false);
+  let restoreConfirm = $state(false);
 
   const dirs = $derived(app.dirs.length ? app.dirs : ["."]);
+  const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
 
   // "\n" separator: never appears in a filesystem path or a git branch name, so the
   // key is collision-free (a raw NUL byte here would corrupt the source file as binary).
   const branchKey = (b: { repo: string; branch: string }) => `${b.repo}\n${b.branch}`;
 
   function describe(a: RemediationAction): string {
-    if ("StripPayload" in a) return `strip payload from ${a.StripPayload.file}`;
-    if ("DeleteFile" in a) return `delete ${a.DeleteFile.file}`;
-    return `remove '${a.RemoveGitignoreLine.line}' from ${a.RemoveGitignoreLine.file}`;
+    if ("StripPayload" in a) return `Strip injected payload from ${a.StripPayload.file}`;
+    if ("DeleteFile" in a) return `Delete dropped artifact ${a.DeleteFile.file}`;
+    return `Remove '${a.RemoveGitignoreLine.line}' from ${a.RemoveGitignoreLine.file}`;
   }
 
   async function preview() {
@@ -63,37 +67,49 @@
   const applicable = $derived(plans.filter((p) => p.actions.length));
   const selectedRepos = $derived(applicable.filter((p) => repoSel[p.repo]).map((p) => p.repo));
   const nothingToApply = $derived(selectedRepos.length === 0);
+  const manualCount = $derived(plans.reduce((n, p) => n + p.manual.length, 0));
 
   async function apply() {
     confirming = false;
     busy = true;
+    busyKind = "apply";
     result = "";
     clearErrors();
     try {
       const s = await cleanApply(selectedRepos);
       result =
-        `Cleaned ${s.repos} repo(s): ${s.applied} action(s) applied` +
+        `Cleaned ${s.repos} ${plural(s.repos, "repo", "repos")}: ${s.applied} ${plural(s.applied, "action", "actions")} applied` +
         (s.skipped.length ? `, ${s.skipped.length} skipped` : "") +
+        (manualCount ? `. ${manualCount} ${plural(manualCount, "item", "items")} still need manual review` : "") +
         (s.backups.length ? `. Backup at ${s.backups[0]}` : "");
       await preview();
     } catch (e) {
       fail(e);
     } finally {
       busy = false;
+      busyKind = "";
     }
   }
 
   async function doRestore() {
+    restoreConfirm = false;
     busy = true;
+    busyKind = "restore";
     result = "";
     clearErrors();
     try {
       const s = await restore(dirs);
-      result = `Restored ${s.restored} file(s) across ${s.repos} repo(s).`;
+      result =
+        s.restored > 0
+          ? `Restored ${s.restored} ${plural(s.restored, "file", "files")} across ${s.repos} ${plural(s.repos, "repo", "repos")}.`
+          : "No backup found to restore.";
+      // Reflect the re-introduced (or unchanged) tree in the plan list.
+      await preview();
     } catch (e) {
       fail(e);
     } finally {
       busy = false;
+      busyKind = "";
     }
   }
 
@@ -105,6 +121,7 @@
       const sel: Record<string, boolean> = {};
       for (const b of branchPlans) sel[branchKey(b)] = true;
       branchSel = sel;
+      branchesScanned = true;
     } catch (e) {
       fail(e);
     } finally {
@@ -121,6 +138,7 @@
   async function applyBranches() {
     confirmingBranches = false;
     busy = true;
+    busyKind = "branches";
     branchSummary = "";
     clearErrors();
     try {
@@ -136,6 +154,7 @@
       fail(e);
     } finally {
       busy = false;
+      busyKind = "";
     }
   }
 
@@ -159,19 +178,30 @@
     <div class="row">
       <button class="btn" onclick={preview} disabled={loading || busy}>Refresh</button>
       <button class="btn primary" onclick={() => (confirming = true)} disabled={busy || nothingToApply}>
-        Apply &amp; fix…
+        {#if busyKind === "apply"}<span class="spinner"></span>Applying…{:else}Apply &amp; fix…{/if}
       </button>
-      <button class="btn" onclick={doRestore} disabled={busy}>Restore last backup</button>
+      <button class="btn" onclick={() => (restoreConfirm = true)} disabled={busy}>
+        {#if busyKind === "restore"}<span class="spinner"></span>Restoring…{:else}Restore last backup{/if}
+      </button>
     </div>
     {#if result}<p class="ok-text small">{result}</p>{/if}
   </section>
 
   {#if loading}
     <div class="card"><div class="row"><span class="spinner"></span><span class="muted small">Scanning…</span></div></div>
-  {:else if plans.length === 0}
-    <div class="card"><p class="muted small">Nothing to clean.</p></div>
+  {:else if applicable.length === 0 && manualCount === 0}
+    <div class="card ok">
+      <div class="state ok">
+        <div class="glyph">✓</div>
+        <h2>Working tree is clean</h2>
+        <p class="muted micro">
+          No payloads, dropped artifacts, or injected <code>.gitignore</code> entries in the current
+          checkout.
+        </p>
+      </div>
+    </div>
   {:else}
-    {#each plans as p, i}
+    {#each plans.filter((p) => p.actions.length || p.manual.length) as p, i (p.repo)}
       <section class="card reveal" style="animation-delay: {Math.min(i, 12) * 25}ms">
         {#if p.actions.length}
           <label class="switch">
@@ -182,12 +212,29 @@
         {:else}
           <h3 class="mono small">{p.repo}</h3>
         {/if}
-        {#each p.actions as a}<div class="action"><span class="tick">✓</span> {describe(a)}</div>{/each}
-        {#each p.manual as m}
-          <div class="muted small">
-            manual: {m.campaign} — {m.file ?? "-"}{m.git_ref ? ` (branch: ${m.git_ref})` : ""} — {m.evidence}
-          </div>
+        {#each p.actions as a, ai (ai)}
+          <div class="action"><span class="will" aria-hidden="true">→</span> {describe(a)}</div>
         {/each}
+        {#if p.manual.length}
+          <div class="manual-block">
+            <div class="manual-head">
+              Needs manual review
+              <span class="count warnc">{p.manual.length}</span>
+            </div>
+            {#each p.manual as m, mi (mi)}
+              <div class="manual-item">
+                <span class="pill {m.severity}">{m.severity}</span>
+                <div class="stack" style="min-width: 0; flex: 1">
+                  <div class="path">
+                    {#if m.file}{m.file}{:else}<span class="muted">repository-level</span>{/if}
+                    {#if m.git_ref}<span class="chip">branch: {m.git_ref}</span>{/if}
+                  </div>
+                  <div class="muted micro">{m.campaign} — {m.evidence}</div>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
       </section>
     {/each}
   {/if}
@@ -201,14 +248,14 @@
     </p>
     <div class="row">
       <button class="btn" onclick={previewBranches} disabled={branchLoading || busy}>
-        {branchLoading ? "Scanning branches…" : "Scan other branches"}
+        {#if branchLoading}<span class="spinner"></span>Scanning branches…{:else}Scan other branches{/if}
       </button>
       <button
         class="btn primary"
         onclick={() => (confirmingBranches = true)}
         disabled={busy || selectedBranches.length === 0}
       >
-        Clean selected branches…
+        {#if busyKind === "branches"}<span class="spinner"></span>Cleaning branches…{:else}Clean selected branches…{/if}
       </button>
     </div>
     <label class="switch">
@@ -218,29 +265,32 @@
     </label>
     {#if branchSummary}<p class="ok-text small">{branchSummary}</p>{/if}
 
-    {#if branchLoading}
-      <div class="row"><span class="spinner"></span><span class="muted small">Scanning branch tips…</span></div>
-    {:else if branchPlans.length === 0}
-      <p class="muted small">No infected branch tips found (run a scan).</p>
+    {#if branchPlans.length === 0}
+      {#if branchesScanned}
+        <div class="state ok"><div class="glyph">✓</div><p>No infected branch tips found.</p></div>
+      {:else if !branchLoading}
+        <p class="muted micro">Scan other branches to check every branch tip.</p>
+      {/if}
     {:else}
-      {#each branchPlans as b}
+      {#each branchPlans as b (branchKey(b))}
         <label class="switch item">
           <input type="checkbox" bind:checked={branchSel[branchKey(b)]} />
           <span class="track"></span>
           <span class="lbl small">
             <span class="mono">{b.repo}</span>
             <span class="chip">branch: {b.branch}</span>
-            <span class="muted">— {b.action_count} action(s)</span>
+            <span class="muted">— {b.action_count} {plural(b.action_count, "action", "actions")}</span>
           </span>
         </label>
       {/each}
     {/if}
 
     {#if branchResults.length}
-      <div class="stack" style="margin-top:4px">
-        {#each branchResults as r}
-          <div class="small {r.status === 'failed' ? 'crit' : 'muted'}">
-            {r.branch}: {r.status}{r.pushed ? " (pushed)" : ""}{r.message ? ` — ${r.message}` : ""}
+      <div class="stack" style="margin-top: 4px">
+        {#each branchResults as r, i (i)}
+          <div class="branch-res {r.status}">
+            <span class="dot" aria-hidden="true"></span>
+            <span class="mono">{r.branch}</span> — {r.status}{r.pushed ? " (pushed)" : ""}{#if r.message} — {r.message}{/if}
           </div>
         {/each}
       </div>
@@ -248,14 +298,31 @@
   </section>
 </div>
 
+{#if restoreConfirm}
+  <div class="modal-backdrop">
+    <div class="modal" role="dialog" aria-modal="true" tabindex="-1" use:dialog={() => (restoreConfirm = false)}>
+      <h3>Restore the last backup?</h3>
+      <p class="crit small">
+        <strong>This re-writes the backed-up originals over the current files</strong> — including
+        the detected malware that was cleaned. Only do this if a clean went wrong.
+      </p>
+      <p class="muted small">If no backup exists, nothing is changed.</p>
+      <div class="row">
+        <button class="btn ghost" onclick={() => (restoreConfirm = false)}>Cancel</button>
+        <button class="btn danger" onclick={doRestore}>Restore &amp; re-introduce</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if confirming}
   <div class="modal-backdrop">
     <div class="modal" role="dialog" aria-modal="true" tabindex="-1" use:dialog={() => (confirming = false)}>
       <h3>Apply changes?</h3>
       <p class="lede">
-        This modifies files in the working tree of {selectedRepos.length} selected repo(s)
-        (originals are backed up under <code>.wormward-backup/</code>). It does not touch git
-        history or push anything.
+        This modifies files in the working tree of {selectedRepos.length} selected
+        {plural(selectedRepos.length, "repository", "repositories")} (originals are backed up under
+        <code>.wormward-backup/</code>). It does not touch git history or push anything.
       </p>
       <div class="row">
         <button class="btn ghost" onclick={() => (confirming = false)}>Cancel</button>
@@ -294,3 +361,47 @@
     </div>
   </div>
 {/if}
+
+<style>
+  /* Pending actions read as "will do", not done (the global .action is green). */
+  .action { color: var(--fg); }
+  .will { flex: none; color: var(--accent); font-weight: 700; }
+
+  .manual-block {
+    margin-top: 10px;
+    padding: 11px 13px;
+    background: var(--surface-warn);
+    border-radius: var(--radius-sm);
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+  .manual-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--warn);
+    font-weight: 600;
+    font-size: 13px;
+  }
+  .manual-item { display: flex; gap: 10px; align-items: flex-start; }
+  .count.warnc { background: var(--warn-tint); color: var(--warn); }
+  .path {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--fg);
+    word-break: break-all;
+  }
+
+  .branch-res { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .branch-res .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .branch-res.cleaned { color: var(--ok); }
+  .branch-res.cleaned .dot { background: var(--ok); }
+  .branch-res.skipped .dot { background: var(--warn); }
+  .branch-res.failed { color: var(--danger); }
+  .branch-res.failed .dot { background: var(--danger); }
+  .branch-res.planned .dot { background: var(--accent); }
+</style>
