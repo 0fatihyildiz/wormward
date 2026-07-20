@@ -130,8 +130,20 @@ lazy_re!(
     js_tokens_re,
     r"\brequire\s*\(|\beval\s*\(|\bglobal\b|fromCharCode|\bfunction\b|module\.exports"
 );
+/// ASCII-representable asset magic signatures. A real font/image that survives the text read (no
+/// NUL byte in its head, so it reached the capability scorer at all) still begins with its format
+/// magic; a payload-carrying fake asset (whitespace + obfuscated JS) does not. Requiring the magic
+/// to be ABSENT before firing spares a real asset whose bytes incidentally contain a code token.
+fn starts_with_asset_magic(content: &str) -> bool {
+    const MAGICS: &[&str] =
+        &["wOF2", "wOFF", "OTTO", "ttcf", "true", "typ1", "GIF87a", "GIF89a", "RIFF"];
+    MAGICS.iter().any(|m| content.starts_with(m))
+}
+
 fn magic_mismatch(content: &str, surface: Surface) -> bool {
-    matches!(surface, Surface::BinaryAsset) && js_tokens_re().is_match(content)
+    matches!(surface, Surface::BinaryAsset)
+        && js_tokens_re().is_match(content)
+        && !starts_with_asset_magic(content)
 }
 
 // --- DownloadExec ---
@@ -583,6 +595,14 @@ mod tests {
     fn process_spawn_detected() {
         assert!(score("child_process.spawn('node',['-e',code])", Surface::DerivedScript).process_spawn);
     }
+    #[test]
+    fn magic_mismatch_spares_real_asset_magic() {
+        // A real asset header (valid magic) with an incidental code token must NOT fire.
+        assert!(!score("wOF2 mock font bytes with a require( token", Surface::BinaryAsset).magic_mismatch);
+        // A payload-carrying fake asset (no magic + code) fires.
+        assert!(score("   \n  var _$_1e42=require('x')", Surface::BinaryAsset).magic_mismatch);
+    }
+
     #[test]
     fn magic_mismatch_only_on_binary_asset() {
         assert!(score("var x=require('fs');eval(y)", Surface::BinaryAsset).magic_mismatch);
