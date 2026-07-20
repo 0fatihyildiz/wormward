@@ -20,8 +20,16 @@ fn marker_re() -> &'static Regex {
 
 fn decoder_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    // Family decoder-name pattern: `_$_1e42`, `_$_8e2c`, …
-    RE.get_or_init(|| Regex::new(r"_\$_[0-9a-f]{4,}").unwrap())
+    // The string-shuffle decoder matched as a DEFINED JS identifier — never a bare substring.
+    // `_$_xxxx` cannot occur in base64 (base64 has no `$`), so the family name is matched directly
+    // (word-bounded). `MDy` is only THREE base64-alphabet chars, so it must appear as a `function`
+    // or `const`/`var`/`let` DEFINITION — otherwise it false-positives inside base64 / WASM-glue
+    // blobs (`...ApMDyAL...` in @rive-app/* Emscripten output, where the file is real JS but "MDy"
+    // is just encoded WASM data). Matching `MDy` as raw text is a supply-chain-wide FP time bomb.
+    RE.get_or_init(|| {
+        Regex::new(r"\b_\$_[0-9a-f]{4,}\b|\bfunction\s+MDy\s*\(|\b(?:var|let|const)\s+MDy\s*=")
+            .unwrap()
+    })
 }
 
 /// A shuffle SEED bound to its structure: a string literal, then the seed, then the closing paren
@@ -108,12 +116,12 @@ impl PolinriderAnalyzer {
             return None;
         }
         let has_marker = marker_re().is_match(content);
-        // The actual string-shuffle decoder. These are obfuscation tells with no legitimate use:
-        // the `_$_xxxx` family name, the MDy sentinel, or the String.fromCharCode(127) shuffle
-        // (present even when the decoder is renamed).
-        let strong_decoder = decoder_re().is_match(content)
-            || content.contains("MDy")
-            || content.contains("String.fromCharCode(127)");
+        // The actual string-shuffle decoder, matched as a DEFINED identifier (see `decoder_re`) —
+        // the `_$_xxxx` family name or a `MDy` function/var definition — or the
+        // String.fromCharCode(127) shuffle (present even when the decoder is renamed). A bare `MDy`
+        // substring is deliberately NOT a decoder: it collides with base64 / WASM-glue content.
+        let strong_decoder =
+            decoder_re().is_match(content) || content.contains("String.fromCharCode(127)");
         // The ESM re-entry shim PolinRider injects so its payload can call require(). This is
         // ALSO a legitimate CJS/ESM interop pattern in normal bundles, so it only counts toward
         // confirmation alongside an injection marker — never on its own, and never as the
@@ -258,6 +266,39 @@ mod tests {
     #[test]
     fn no_finding_on_clean_file() {
         assert!(PolinriderAnalyzer.analyze(&scanned("export default { plugins: {} };")).is_empty());
+    }
+
+    #[test]
+    fn no_finding_on_wasm_glue_with_incidental_mdy_in_base64() {
+        // @rive-app/canvas-advanced-single: legitimate Emscripten/WASM glue. "MDy" (three
+        // base64-alphabet chars) appears by chance INSIDE a base64-encoded WASM blob
+        // (`...pMDyAL...`). The file is real JS (passes the code-token veto) and has a
+        // `"name",<digits>)` call, but there is NO decoder DEFINITION (`function MDy` / `var _$_…`)
+        // and no shuffle IIFE. It must NOT confirm — a bare "MDy" substring is not a decoder.
+        let glue = "var Module=(function(){\
+             var wasmBinary='AGFzbQEAAAABpMDyALhgAX8Bf2AC0AOtAq4CVwCxAiQAkQOSA1gAWQ';\
+             var draw=function(name,idx){return name;};\
+             draw(\"shape\",1234567);\
+             return Module;})();";
+        assert!(
+            PolinriderAnalyzer.analyze(&scanned(glue)).is_empty(),
+            "WASM glue with incidental 'MDy' in base64 must not confirm"
+        );
+    }
+
+    #[test]
+    fn true_positive_v2_mdy_function_definition_preserved() {
+        // Real v2: `MDy` DEFINED as the decoder function (not a substring) + a shuffle IIFE seed.
+        let payload = "function MDy(f){var s=f.length;return f}\
+             var x=(function(a,b){return a})(\"Cot%3t=shtP\",1111436);";
+        assert_eq!(PolinriderAnalyzer.analyze(&scanned(payload)).len(), 1);
+    }
+
+    #[test]
+    fn true_positive_v2_mdy_var_definition_preserved() {
+        // `MDy` assigned as a const/var decoder is also a genuine definition.
+        let payload = "const MDy=(function(a,y){var p=a.length;return a})(\"Cot%3t=shtP\",3896884);";
+        assert_eq!(PolinriderAnalyzer.analyze(&scanned(payload)).len(), 1);
     }
 
     #[test]
