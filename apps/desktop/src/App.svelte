@@ -2,10 +2,10 @@
   import { app, dismiss, notify, go } from "./lib/state.svelte";
   import type { View } from "./lib/state.svelte";
   import Home from "./routes/Home.svelte";
-  import Workspace from "./routes/Workspace.svelte";
+  import RepositoriesDetail from "./routes/RepositoriesDetail.svelte";
   import ScanFlow from "./routes/ScanFlow.svelte";
   import Advanced from "./routes/Advanced.svelte";
-  import Doctor from "./routes/Doctor.svelte";
+  import MachineDetail from "./routes/MachineDetail.svelte";
   import Settings from "./routes/Settings.svelte";
   import { fly } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
@@ -20,8 +20,8 @@
   const views: Record<View, Component> = {
     home: Home,
     flow: ScanFlow,
-    machine: Doctor,
-    repos: Workspace,
+    machine: MachineDetail,
+    repos: RepositoriesDetail,
     advanced: Advanced,
     settings: Settings,
   };
