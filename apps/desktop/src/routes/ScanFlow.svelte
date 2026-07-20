@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app, fail, clearErrors, go } from "../lib/state.svelte";
-  import { scan, doctor, cancelScan, cleanPreview } from "../lib/api";
+  import { scan, doctor, cancelScan, cleanPreview, cleanApply } from "../lib/api";
   import { listen } from "@tauri-apps/api/event";
   import GuidedProgress from "../lib/components/GuidedProgress.svelte";
-  import type { ScanProgress, RepoPlan } from "../lib/types";
+  import FindingCard from "../lib/components/FindingCard.svelte";
+  import type { ScanProgress, Finding, RepoPlan } from "../lib/types";
 
   const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
 
@@ -29,6 +30,22 @@
   const cancelled = $derived(report?.cancelled ?? false);
   const removable = $derived(findings.filter((f) => f.remediable).length);
   const manual = $derived(total - removable);
+
+  const SEV_RANK: Record<string, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+  const rank = (s: string) => SEV_RANK[s] ?? 0;
+  const grouped = $derived.by(() => {
+    const map = new Map<string, Finding[]>();
+    for (const f of findings) {
+      if (!map.has(f.campaign)) map.set(f.campaign, []);
+      map.get(f.campaign)!.push(f);
+    }
+    for (const list of map.values()) list.sort((a, b) => rank(b.severity) - rank(a.severity));
+    return [...map.entries()].sort(
+      (a, b) => rank(b[1][0].severity) - rank(a[1][0].severity) || b[1].length - a[1].length,
+    );
+  });
+  const applicable = $derived(plans.filter((p) => p.actions.length));
+  const fixableRepos = $derived(applicable.map((p) => p.repo));
 
   async function runScan() {
     clearErrors();
@@ -81,6 +98,27 @@
   function backHome() {
     app.flow = null;
     go("home");
+  }
+
+  async function removeThreats() {
+    app.flow = "cleaning";
+    clearErrors();
+    try {
+      const s = await cleanApply(fixableRepos);
+      // Re-scan so app.report reflects the cleaned tree — Home's shield and the
+      // Repositories detail must NOT keep showing threats we just removed (honest state,
+      // mirrors Workspace.apply()'s re-run). scan() is already imported (Task 3.3).
+      const osmToken = localStorage.getItem("osm_token") || undefined;
+      app.report = await scan(app.dirs, false, !!osmToken, osmToken);
+      app.lastScanAt = Date.now();
+      removedSummary =
+        `Removed ${s.applied} ${plural(s.applied, "threat", "threats")} across ${s.repos} ${plural(s.repos, "place", "places")}.` +
+        (s.backups.length ? " A backup was saved." : "");
+      app.flow = "clean";
+    } catch (e) {
+      fail(e);
+      app.flow = "results";
+    }
   }
 
   onMount(runScan);
@@ -140,11 +178,46 @@
   {#if app.flow === "results"}
     <section class="flow-step">
       <h1 class="flow-title" tabindex="-1" bind:this={stepHeadingEl}>Scan complete</h1>
-      {#if total === 0}
-        <p class="flow-summary">{cancelled ? "Scan stopped early — nothing checked was infected, but the check is incomplete." : "No threats found."}</p>
-      {:else}
-        <p class="flow-summary">{total} {plural(total, "threat", "threats")} found. {removable} can be removed safely and automatically; {manual} need your review.</p>
+
+      {#if cancelled}
+        <div class="card danger" role="alert">
+          <p class="danger-text"><strong>Scan stopped early — results are incomplete.</strong></p>
+          <p class="muted small">Anything after the stop point wasn't checked. Run a Full Scan again for a complete picture.</p>
+        </div>
       {/if}
+
+      {#if total === 0}
+        <div class="card {cancelled ? '' : 'ok'}">
+          <div class="state {cancelled ? '' : 'ok'}">
+            <div class="glyph" aria-hidden="true">{cancelled ? "◔" : "✓"}</div>
+            <h2>{cancelled ? "Nothing infected so far" : "No threats found"}</h2>
+            <p class="muted micro">{cancelled ? "The parts checked were clean, but the scan didn't finish." : `Checked ${report?.repos_scanned ?? 0} ${plural(report?.repos_scanned ?? 0, "place", "places")} — everything looks clean.`}</p>
+          </div>
+        </div>
+      {:else}
+        <p class="flow-summary"><strong>{total} {plural(total, "threat", "threats")} found.</strong> {removable} can be removed safely and automatically; {manual} need your review.</p>
+
+        {#if applicable.length}
+          <div class="flow-actions">
+            <button class="btn primary" onclick={removeThreats}>Remove threats safely</button>
+          </div>
+        {/if}
+
+        {#each grouped as [campaign, list] (campaign)}
+          <div class="camp">
+            <div class="camp-head">
+              <h2>{campaign}</h2>
+              <span class="count sev-{list[0].severity}" aria-label="{list.length} {plural(list.length, 'threat', 'threats')} in this group">{list.length}</span>
+            </div>
+            <ul class="finding-list">
+              {#each list as f, i (f.repo + (f.file ?? "") + f.signature_id + i)}
+                <li><FindingCard finding={f} /></li>
+              {/each}
+            </ul>
+          </div>
+        {/each}
+      {/if}
+
       <div class="flow-actions">
         <button class="btn ghost" onclick={backHome}>Back to Home</button>
       </div>
@@ -205,4 +278,12 @@
   .crit { flex: none; color: var(--danger); }
   .dim .tag { color: var(--faint); }
   .line.hit { background: var(--surface-danger); margin: 0 -6px; padding: 2px 6px; border-radius: 5px; }
+
+  .camp { display: flex; flex-direction: column; gap: 8px; }
+  .camp-head { display: flex; align-items: center; justify-content: space-between; }
+  .camp-head h2 { font-size: 13.5px; }
+  .finding-list { display: flex; flex-direction: column; gap: 8px; list-style: none; margin: 0; padding: 0; }
+  .count.sev-critical { background: var(--danger); color: #150a0b; }
+  .count.sev-high { background: var(--danger-tint); color: var(--danger); }
+  .count.sev-medium { background: var(--warn-tint); color: var(--warn); }
 </style>
