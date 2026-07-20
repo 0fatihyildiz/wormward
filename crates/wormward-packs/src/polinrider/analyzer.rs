@@ -36,17 +36,22 @@ impl PolinriderAnalyzer {
     /// specific decoder name / seed — so new variants are caught, not just known literals.
     fn confirm(content: &str) -> Option<String> {
         let has_marker = marker_re().is_match(content);
-        let has_decoder = decoder_re().is_match(content)
+        // The actual string-shuffle decoder. These are obfuscation tells with no legitimate use:
+        // the `_$_xxxx` family name, the MDy sentinel, or the String.fromCharCode(127) shuffle
+        // (present even when the decoder is renamed).
+        let strong_decoder = decoder_re().is_match(content)
             || content.contains("MDy")
-            || content.contains("createRequire(import.meta.url")
-            // Structural string-shuffle tell: the decoder builds strings via a
-            // String.fromCharCode(127) sentinel, present even when the decoder is renamed.
             || content.contains("String.fromCharCode(127)");
+        // The ESM re-entry shim PolinRider injects so its payload can call require(). This is
+        // ALSO a legitimate CJS/ESM interop pattern in normal bundles, so it only counts toward
+        // confirmation alongside an injection marker — never on its own, and never as the
+        // "decoder" in the marker-less branch (that FP'd on legit npx-cached bundles).
+        let has_shim = content.contains("createRequire(import.meta.url");
         let has_seed = seed_re().is_match(content);
-        if has_marker && has_decoder {
+        if has_marker && (strong_decoder || has_shim) {
             return Some("obfuscation: injection marker + decoder".to_string());
         }
-        if has_decoder && has_seed {
+        if strong_decoder && has_seed {
             return Some("obfuscation: decoder + shuffle seed".to_string());
         }
         None
@@ -156,5 +161,19 @@ mod tests {
     #[test]
     fn no_finding_on_clean_file() {
         assert!(PolinriderAnalyzer.analyze(&scanned("export default { plugins: {} };")).is_empty());
+    }
+
+    #[test]
+    fn does_not_confirm_legit_esm_createrequire_bundle() {
+        // Regression (found by dogfooding `doctor` on the npx cache): a legit ESM bundle commonly
+        // does createRequire(import.meta.url) for CJS interop and carries large numeric constants.
+        // Without an injection marker OR a real string-shuffle decoder, the createRequire shim
+        // alone must NOT confirm — it is a legitimate pattern, not obfuscation.
+        let out = PolinriderAnalyzer.analyze(&scanned(
+            "import { createRequire } from 'module';\n\
+             const require = createRequire(import.meta.url);\n\
+             const BUILD = 1234567;\nexport default {};",
+        ));
+        assert!(out.is_empty(), "createRequire + a numeric constant is not an infection: {out:?}");
     }
 }
