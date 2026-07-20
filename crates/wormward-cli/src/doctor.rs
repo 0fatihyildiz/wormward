@@ -39,6 +39,13 @@ pub fn render_text(r: &DoctorReport) -> String {
         );
     }
 
+    if !r.machine.is_empty() {
+        out.push_str("\nMachine hygiene (active-compromise indicators)\n");
+        for h in &r.machine {
+            out.push_str(&format!("  ✗ [{}] {} — {}\n", h.category, h.target, h.reason));
+        }
+    }
+
     out.push_str("\nTrigger paths (how the worm re-runs)\n");
     if r.triggers.is_empty() {
         out.push_str("  · no trigger checks available on this platform\n");
