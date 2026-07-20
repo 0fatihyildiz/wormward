@@ -505,6 +505,12 @@ fn scan_tree_inner(
     let mut findings = scan_files_inner(repo, files, packs, cancel);
     findings.extend(scan_capabilities_inner(repo, files, cancel));
     dedup_capability_against_packs(&mut findings);
+    // Capability findings default to non-remediable, but a few (e.g. a malicious .vscode/tasks.json)
+    // now map to a delete action. Re-stamp uniformly so the `remediable` flag tracks the single
+    // action_for source of truth for every finding kind, not just the pack-pass ones.
+    for f in &mut findings {
+        f.remediable = crate::remediate::action_for(f, packs).is_some();
+    }
     findings
 }
 

@@ -63,6 +63,15 @@ pub fn action_for(finding: &Finding, packs: &[Pack]) -> Option<RemediationAction
                 strip_lines: cfg.strip_lines.clone(),
             })
         }
+        // A confirmed-malicious `.vscode/tasks.json` (it only reaches a Capability finding via the
+        // folder-open + download/exec gate) is safely removable — deleting the weaponized editor
+        // task file is the correct fix, mirroring the whole-`.vscode` removal other tools do.
+        FindingKind::Capability
+            if file.file_name().and_then(|n| n.to_str()) == Some("tasks.json")
+                && file.components().any(|c| c.as_os_str() == ".vscode") =>
+        {
+            Some(RemediationAction::DeleteFile { file })
+        }
         _ => None,
     }
 }
