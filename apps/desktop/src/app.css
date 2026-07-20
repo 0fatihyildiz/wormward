@@ -351,6 +351,37 @@ input:focus:not(:focus-visible) { background: #101217; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes indet { 0% { transform: translateX(-120%); } 100% { transform: translateX(320%); } }
 
+/* ---------- hero / shield (Home status) ---------- */
+:root { --gap-hero: 24px; }
+.sr {
+  position: absolute; width: 1px; height: 1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+.hero {
+  max-width: var(--content);
+  margin: 0 auto;
+  padding: 52px 24px 44px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--gap-hero);
+}
+.shield {
+  width: 128px; height: 128px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--surface-2); color: var(--muted);
+  transition: background var(--med) var(--ease), color var(--med) var(--ease);
+}
+.shield-glyph { font-size: 54px; line-height: 1; font-weight: 700; }
+.shield.protected { background: var(--ok-tint); color: var(--ok); }
+.shield.attention { background: var(--warn-tint); color: var(--warn); }
+.shield.threat { background: var(--danger-tint); color: var(--danger); }
+.shield.unknown { background: var(--surface-2); color: var(--muted); }
+.shield-heading { font-size: 25px; letter-spacing: -0.03em; font-weight: 600; }
+.shield-sub { color: var(--muted); font-size: 13.5px; line-height: 1.6; max-width: 44ch; }
+.btn.cta, button.cta { font-size: 14.5px; padding: 13px 32px; border-radius: var(--radius); }
+
 /* ---------- reduced motion ---------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

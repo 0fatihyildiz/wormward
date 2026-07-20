@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { app, dismiss, notify } from "./lib/state.svelte";
+  import { app, dismiss, notify, go } from "./lib/state.svelte";
+  import type { View } from "./lib/state.svelte";
+  import Home from "./routes/Home.svelte";
   import Workspace from "./routes/Workspace.svelte";
   import GitHub from "./routes/GitHub.svelte";
   import Doctor from "./routes/Doctor.svelte";
@@ -10,14 +12,20 @@
   import { isTauri } from "./lib/env";
   import type { Component } from "svelte";
 
-  const tabs = [
-    ["scan", "Scan"],
-    ["github", "GitHub"],
-    ["doctor", "Doctor"],
-    ["settings", "Settings"],
-  ] as const;
+  // Canonical view router. Later phases swap INDIVIDUAL entries for the real component
+  // (flow→ScanFlow, machine→MachineDetail, repos→RepositoriesDetail, advanced→Advanced);
+  // never re-typedef this map or convert it to an {#if} chain. The temporary entries keep
+  // every current capability reachable so nothing is lost this phase.
+  const views: Record<View, Component> = {
+    home: Home,
+    flow: Workspace,
+    machine: Doctor,
+    repos: Workspace,
+    advanced: GitHub,
+    settings: Settings,
+  };
 
-  // Respect the user's motion preference for the JS-driven route transitions (CSS media
+  // Respect the user's motion preference for the JS-driven toast transitions (CSS media
   // queries can't reach Svelte transitions). Reactive, so toggling the OS setting mid-session
   // applies immediately and stays in sync with the CSS @media block.
   let reduce = $state(
@@ -31,43 +39,53 @@
     return () => mq.removeEventListener("change", on);
   });
 
-  // Keep each screen mounted after its first visit so its local state (scan results, live log,
-  // clean plans, form inputs) survives tab switches — only the active one is shown. Lazy, so an
-  // unvisited tab runs no work at startup.
-  const screens: Record<string, Component> = {
-    scan: Workspace,
-    github: GitHub,
-    doctor: Doctor,
-    settings: Settings,
-  };
-  let visited = $state<Record<string, boolean>>({});
+  // Move keyboard/screen-reader focus to the freshly-rendered view on every view change so
+  // focus lands on the new content instead of document.body. Skip the very first run — on
+  // initial load focus belongs to the page as delivered.
+  let mainEl = $state<HTMLElement | undefined>();
+  let firstView = true;
   $effect(() => {
-    visited[app.screen] = true;
+    app.view;
+    if (firstView) {
+      firstView = false;
+      return;
+    }
+    queueMicrotask(() => mainEl?.focus());
   });
 
-  // Sliding active-tab indicator: measure the active button and move a single bar.
-  let navEl: HTMLElement | undefined = $state();
-  let ind = $state({ left: 0, width: 0, ready: false });
-  function place() {
-    const btn = navEl?.querySelector<HTMLElement>("button.active");
-    if (btn) ind = { left: btn.offsetLeft, width: btn.offsetWidth, ready: true };
+  // ⚙ menu: PLAIN buttons in a labelled container. We deliberately do NOT use
+  // role=menu/menuitem (that advertises arrow-key semantics we don't implement). Escape and
+  // any outside click close it. On close via Escape/outside-click we return focus to the gear
+  // trigger (C4) so keyboard focus doesn't fall to document.body.
+  let menuOpen = $state(false);
+  let menuWrap = $state<HTMLElement | undefined>();
+  let gearEl = $state<HTMLButtonElement | undefined>();
+  $effect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (menuWrap && !menuWrap.contains(e.target as Node)) {
+        menuOpen = false;
+        gearEl?.focus();
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        menuOpen = false;
+        gearEl?.focus();
+      }
+    };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  });
+  function pick(view: View) {
+    menuOpen = false;
+    go(view);
   }
-  // Reposition whenever the active screen changes (runs after the DOM updates).
-  $effect(() => {
-    app.screen;
-    place();
-  });
-  $effect(() => {
-    const on = () => place();
-    window.addEventListener("resize", on);
-    return () => window.removeEventListener("resize", on);
-  });
-  // Re-align the pill once web fonts settle — button widths can shift after first paint.
-  $effect(() => {
-    if (typeof document !== "undefined" && document.fonts) document.fonts.ready.then(place);
-  });
 
-  // Notifications: failures persist until dismissed; non-error notices auto-clear (see notify()).
   // Surface any uncaught JS error / rejection instead of failing silently. De-duped and
   // guarded to script errors so a repeated error can't spin up a toast loop.
   $effect(() => {
@@ -96,17 +114,23 @@
   <div class="brand">
     <img class="logo" src={logo} alt="Wormward" width="46" height="46" />
   </div>
-  <nav bind:this={navEl} aria-label="Primary">
-    {#if ind.ready}
-      <span class="indicator" style="transform: translateX({ind.left}px); width: {ind.width}px;"></span>
+  <div class="spacer"></div>
+  <div class="menu-wrap" bind:this={menuWrap}>
+    <button
+      class="gear"
+      bind:this={gearEl}
+      aria-label="More options"
+      aria-expanded={menuOpen}
+      aria-controls={menuOpen ? "app-menu" : undefined}
+      onclick={() => (menuOpen = !menuOpen)}>⚙</button
+    >
+    {#if menuOpen}
+      <div id="app-menu" class="menu" role="group" aria-label="More options">
+        <button onclick={() => pick("advanced")}>Advanced</button>
+        <button onclick={() => pick("settings")}>Settings</button>
+      </div>
     {/if}
-    {#each tabs as [id, label]}
-      <button
-        class:active={app.screen === id}
-        aria-current={app.screen === id ? "page" : undefined}
-        onclick={() => (app.screen = id)}>{label}</button>
-    {/each}
-  </nav>
+  </div>
 </header>
 
 {#if !isTauri}
@@ -136,17 +160,11 @@
   </div>
 {/if}
 
-<main id="main" tabindex="-1">
-  {#each tabs as [id]}
-    <div class="screen" style:display={app.screen === id ? "block" : "none"}>
-      {#if visited[id]}
-        {@const Screen = screens[id]}
-        <div in:fly={{ y: reduce ? 0 : 8, duration: reduce ? 0 : 200, easing: cubicOut }}>
-          <Screen />
-        </div>
-      {/if}
-    </div>
-  {/each}
+<main id="main" tabindex="-1" bind:this={mainEl}>
+  {#key app.view}
+    {@const Current = views[app.view]}
+    <Current />
+  {/key}
 </main>
 
 <style>
@@ -157,7 +175,7 @@
     height: var(--topbar-h);
     display: flex;
     align-items: center;
-    gap: 22px;
+    gap: 14px;
     padding: 0 24px;
     background: rgba(10, 10, 12, 0.7);
     backdrop-filter: blur(12px);
@@ -179,32 +197,41 @@
   }
   .skip:focus { top: 10px; }
   main:focus { outline: none; }
-  nav { position: relative; display: flex; gap: 2px; }
-  nav button {
-    position: relative;
-    z-index: 1; /* text rides above the sliding pill */
+  main { min-height: calc(100vh - var(--topbar-h)); }
+
+  .menu-wrap { position: relative; }
+  .gear {
     background: transparent;
-    border: none;
     color: var(--muted);
-    padding: 7px 13px;
-    border-radius: 9px;
-    font-size: 13px;
-    font-weight: 500;
-    transition: color var(--fast) var(--ease);
+    font-size: 18px;
+    line-height: 1;
+    padding: 6px 10px;
+    border-radius: var(--radius-sm);
   }
-  nav button:hover { color: var(--fg); background: transparent; }
-  nav button.active { color: var(--fg); }
-  /* Rounded pill that slides BEHIND the active tab's text. */
-  nav .indicator {
+  .gear:hover { color: var(--fg); background: var(--surface-2); }
+  .menu {
     position: absolute;
-    top: 0;
-    left: 0;
-    height: 100%;
+    right: 0;
+    top: calc(100% + 6px);
+    z-index: 30;
+    min-width: 168px;
     background: var(--surface-2);
-    border-radius: 9px;
-    z-index: 0;
-    transition: transform var(--med) var(--ease), width var(--med) var(--ease);
+    border-radius: var(--radius-sm);
+    padding: 5px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
+  .menu button {
+    background: transparent;
+    color: var(--fg);
+    justify-content: flex-start;
+    width: 100%;
+    padding: 8px 12px;
+    font-weight: 500;
+  }
+  .menu button:hover { background: var(--surface-3); }
+
   .env-banner {
     padding: 9px 24px;
     background: var(--surface-warn);
@@ -212,5 +239,4 @@
     font-size: 12.5px;
     line-height: 1.5;
   }
-  main { min-height: calc(100vh - var(--topbar-h)); }
 </style>
