@@ -80,7 +80,10 @@
       app.machineReport = machine;
       app.report = repos;
       app.lastScanAt = Date.now();
-      plans = await cleanPreview(app.dirs);
+      // cleanPreview re-scans every repo (uncancellable). On a cancelled/partial scan, skip it so
+      // Stop lands on the partial results at once instead of grinding through a full second scan —
+      // and a one-click clean shouldn't be offered on partial data anyway.
+      plans = repos.cancelled ? [] : await cleanPreview(app.dirs);
       app.flow = "results";
     } catch (e) {
       fail(e);
