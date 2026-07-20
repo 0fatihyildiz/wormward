@@ -163,6 +163,15 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
+    /// Prevention: harden this machine against supply-chain worms. Dry-run unless --apply; even
+    /// with --apply, only SAFE user-local changes are made automatically (the pre-commit hook and
+    /// npm/pnpm ignore-scripts). System/global steps (/etc/hosts sinkhole, enabling the global
+    /// hooks path) are always PRINTED for you to run yourself — never executed silently.
+    Harden {
+        /// Apply the safe local changes (install the hook file, set ignore-scripts).
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, ValueEnum)]
@@ -932,6 +941,43 @@ fn main() -> ExitCode {
                 ExitCode::from(u8::from(ever))
             }
         },
+        Command::Harden { apply } => {
+            println!("== npm/pnpm ignore-scripts (blocks postinstall malware) ==");
+            if apply {
+                let applied = doctor::fix_triggers();
+                if applied.is_empty() {
+                    println!("  (nothing changed — already set, or npm/pnpm not found)");
+                }
+                for msg in applied {
+                    println!("  applied: {msg}");
+                }
+            } else {
+                println!("  would run: npm config set ignore-scripts true  (+ pnpm if present)");
+            }
+
+            println!("\n== global pre-commit guard (blocks committing payloads) ==");
+            if apply {
+                match doctor::install_pre_commit_hook() {
+                    Ok(p) => {
+                        println!("  installed hook: {}", p.display());
+                        println!("  ENABLE globally (opt-in, review first):");
+                        println!("      git config --global core.hooksPath ~/.git-hooks");
+                    }
+                    Err(e) => eprintln!("  failed to install hook: {e}"),
+                }
+            } else {
+                println!("  would install ~/.git-hooks/pre-commit and print the command to enable it");
+            }
+
+            println!("\n== /etc/hosts C2 sinkhole (apply yourself with sudo) ==");
+            print!("{}", doctor::hosts_sinkhole_block(&doctor::sinkhole_domains()));
+            println!("  Apply: append the block above to /etc/hosts (needs sudo), then flush DNS:");
+            println!("      sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder");
+            if !apply {
+                println!("\n(dry-run — re-run `wormward harden --apply` to make the safe local changes)");
+            }
+            ExitCode::from(0)
+        }
     }
 }
 

@@ -419,6 +419,88 @@ pub fn fix_triggers() -> Vec<String> {
     done
 }
 
+// ---- prevention (harden) ----
+
+/// The `/etc/hosts` C2-sinkhole block for the given C2 domains, delimited so it can be removed
+/// exactly on unharden. Pure/testable. Points each C2 domain at 0.0.0.0.
+pub fn hosts_sinkhole_block(domains: &[String]) -> String {
+    let mut s = String::from("# >>> wormward C2 sinkhole >>>\n");
+    for d in domains {
+        s.push_str(&format!("0.0.0.0 {d}\n"));
+    }
+    s.push_str("# <<< wormward C2 sinkhole <<<\n");
+    s
+}
+
+/// A global pre-commit hook that blocks committing supply-chain payloads: staged content carrying
+/// an injection marker, a forbidden dropper filename, or a staged `.env`. Pure/testable.
+pub fn pre_commit_hook(markers: &[String]) -> String {
+    let mut s = String::from(
+        "#!/bin/sh\n# wormward pre-commit guard — blocks committing supply-chain payloads.\n\
+         blocked=0\n\
+         staged=$(git diff --cached --name-only --diff-filter=ACM)\n\
+         for f in $staged; do\n\
+         \x20 case \"$f\" in\n\
+         \x20   config.bat|temp_auto_push.bat|temp_interactive_push.bat|branch_structure.json)\n\
+         \x20     echo \"wormward: forbidden dropper file staged: $f\"; blocked=1 ;;\n\
+         \x20   .env|.env.*) echo \"wormward: refusing to commit a secrets file: $f\"; blocked=1 ;;\n\
+         \x20 esac\n\
+         done\n\
+         diff=$(git diff --cached)\n",
+    );
+    for m in markers {
+        let esc = m.replace('\'', "'\\''");
+        s.push_str(&format!(
+            "printf '%s' \"$diff\" | grep -qF -- '{esc}' && {{ echo 'wormward: injection marker in staged change'; blocked=1; }}\n"
+        ));
+    }
+    s.push_str(
+        "if [ \"$blocked\" -ne 0 ]; then\n\
+         \x20 echo 'Commit blocked by wormward. Bypass (NOT recommended): git commit --no-verify'\n\
+         \x20 exit 1\n\
+         fi\n\
+         exit 0\n",
+    );
+    s
+}
+
+/// Vendor C2 domains to sinkhole (from the pack — never the community-tier or RPC hosts).
+pub fn sinkhole_domains() -> Vec<String> {
+    polinrider_pack().manifest.ioc_domains.clone()
+}
+
+/// The injection markers the pre-commit hook greps for (the specific composite markers, not the
+/// FP-prone bare decoder name).
+pub fn hook_markers() -> Vec<String> {
+    let pack = polinrider_pack();
+    ["primary", "secondary", "variant-april"]
+        .iter()
+        .filter_map(|id| {
+            pack.manifest
+                .content_signatures
+                .iter()
+                .find(|s| s.id == *id)
+                .map(|s| s.value.clone())
+        })
+        .collect()
+}
+
+/// Install the global pre-commit hook to `~/.git-hooks/pre-commit` (user-writable). Deliberately
+/// does NOT set `core.hooksPath` — the caller prints that step so the user opts in explicitly
+/// rather than having wormward silently override an existing global hooks path. Returns the path.
+pub fn install_pre_commit_hook() -> Result<PathBuf, String> {
+    let dir = home_dir().join(".git-hooks");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("pre-commit");
+    std::fs::write(&path, pre_commit_hook(&hook_markers())).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(path)
+}
+
 // ---- deep machine hygiene (persistence, network, shell-rc, global packages, keychain) ----
 
 const KNOWN_MALICIOUS_PLISTS: &[&str] = &["com.bablu.helper"];
@@ -744,6 +826,30 @@ mod tests {
         assert!(root.exists(), "the package root itself must be preserved");
         assert!(clean.exists(), "clean global-package files must be preserved");
         assert!(!tainted.exists(), "the tainted dropped file must be removed");
+    }
+
+    #[test]
+    fn hosts_block_is_delimited_and_sinkholes() {
+        let b = hosts_sinkhole_block(&["evil.vercel.app".into()]);
+        assert!(b.contains("# >>> wormward C2 sinkhole >>>"));
+        assert!(b.contains("0.0.0.0 evil.vercel.app"));
+        assert!(b.contains("# <<< wormward C2 sinkhole <<<"));
+    }
+
+    #[test]
+    fn pre_commit_hook_blocks_markers_and_env() {
+        let h = pre_commit_hook(&["rmcej%otb%".into()]);
+        assert!(h.starts_with("#!/bin/sh"));
+        assert!(h.contains("grep -qF -- 'rmcej%otb%'"));
+        assert!(h.contains(".env"));
+        assert!(h.contains("temp_auto_push.bat"));
+        assert!(h.contains("exit 1"));
+    }
+
+    #[test]
+    fn hook_markers_and_sinkhole_domains_from_pack() {
+        assert!(hook_markers().iter().any(|m| m.contains("rmcej%otb%")));
+        assert!(sinkhole_domains().iter().any(|d| d.ends_with(".vercel.app")));
     }
 
     #[test]
