@@ -154,10 +154,12 @@ enum Command {
     },
 }
 
-#[derive(Copy, Clone, ValueEnum)]
+#[derive(Copy, Clone, PartialEq, ValueEnum)]
 enum OutputFormat {
     Text,
     Json,
+    /// SARIF 2.1.0 (for the GitHub Security tab / code scanning upload). Primary on `scan`.
+    Sarif,
 }
 
 fn osm_base_url() -> String {
@@ -283,6 +285,9 @@ fn main() -> ExitCode {
             match format {
                 OutputFormat::Text => print!("{}", report::render_text(&report)),
                 OutputFormat::Json => println!("{}", report::render_json(&report)),
+                OutputFormat::Sarif => {
+                    println!("{}", wormward_core::to_sarif(&report.findings))
+                }
             }
             if report.findings.is_empty() {
                 ExitCode::from(0)
@@ -755,7 +760,7 @@ fn main() -> ExitCode {
             let selected: Option<HashSet<String>> = if writes && fixable.len() >= 2 {
                 let sel_opts = select::SelectOpts {
                     bypass: all,
-                    non_interactive: matches!(format, OutputFormat::Json) || !select::stdio_is_tty(),
+                    non_interactive: matches!(format, OutputFormat::Json | OutputFormat::Sarif) || !select::stdio_is_tty(),
                 };
                 match select::select_repos(fixable, sel_opts, |n| n.clone()) {
                     Some(sel) => Some(sel.into_iter().collect()),
@@ -786,7 +791,7 @@ fn main() -> ExitCode {
                         print!("{}", report::render_audit_text(&a.findings));
                     }
                 }
-                OutputFormat::Json => match &account_audit {
+                OutputFormat::Json | OutputFormat::Sarif => match &account_audit {
                     Some(a) => {
                         let v = serde_json::json!({ "repos": &outcomes, "account_audit": &a.findings });
                         println!("{}", serde_json::to_string_pretty(&v).unwrap());
@@ -802,7 +807,9 @@ fn main() -> ExitCode {
                 let report = doctor::check();
                 match format {
                     OutputFormat::Text => print!("{}", doctor::render_text(&report)),
-                    OutputFormat::Json => println!("{}", doctor::render_json(&report)),
+                    OutputFormat::Json | OutputFormat::Sarif => {
+                        println!("{}", doctor::render_json(&report))
+                    }
                 }
                 if fix {
                     for dir in report.cache_dirs.clone() {
