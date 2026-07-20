@@ -68,6 +68,15 @@
     sel = {};
   }
 
+  function allOrgs() {
+    const s: Record<string, boolean> = {};
+    for (const o of orgs) s[o] = true;
+    selectedOrgs = s;
+  }
+  function noOrgs() {
+    selectedOrgs = {};
+  }
+
   async function scan() {
     scanning = true;
     clearErrors();
@@ -149,11 +158,17 @@
 
     {#if orgs.length}
       <div class="stack">
-        <p class="muted small">
-          Choose which organizations to scan. <strong>Your own repos are always scanned.</strong>
-        </p>
-        <div class="row" style="gap:14px 18px">
-          {#each orgs as o}
+        <div class="row between">
+          <p class="muted small">
+            Choose organizations to scan. <strong>Your own repos are always scanned.</strong>
+          </p>
+          <div class="row" style="gap: 6px">
+            <button class="btn ghost sm" onclick={allOrgs}>All</button>
+            <button class="btn ghost sm" onclick={noOrgs}>None</button>
+          </div>
+        </div>
+        <div class="row" style="gap: 14px 18px">
+          {#each orgs as o (o)}
             <label class="switch">
               <input type="checkbox" bind:checked={selectedOrgs[o]} />
               <span class="track"></span>
@@ -180,8 +195,17 @@
     </div>
 
     {#if scanning}
-      <div class="stack">
-        <div class="progress" class:indet={!progress}><span style="width: {progress ? pct : 35}%"></span></div>
+      <div class="stack" role="status" aria-live="polite">
+        <div
+          class="progress"
+          class:indet={!progress}
+          role="progressbar"
+          aria-valuemin="0"
+          aria-valuemax={progress?.total ?? 0}
+          aria-valuenow={progress?.done ?? 0}
+        >
+          <span style="width: {progress ? pct : 35}%"></span>
+        </div>
         <p class="muted small">
           {#if progress}
             <span class="mono">{progress.repo}</span> — {progress.done} of {progress.total}

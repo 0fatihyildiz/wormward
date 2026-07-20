@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { listPacks } from "../lib/api";
+  import { listPacks, githubOrgs } from "../lib/api";
   import type { PackInfo } from "../lib/types";
 
   let packs = $state<PackInfo[]>([]);
@@ -39,6 +39,7 @@
   }
   function saveGh() {
     save("github_token", gh);
+    ghTest = "idle";
     ghSaved = true;
     clearTimeout(ghTimer);
     ghTimer = setTimeout(() => (ghSaved = false), 1600);
@@ -49,6 +50,18 @@
   const ghBad = $derived(
     gh.trim().length > 0 && !/^(ghp_|github_pat_|gho_|ghs_)/.test(gh.trim()),
   );
+
+  // Verify the GitHub token actually works by listing the orgs it can see.
+  let ghTest = $state<"idle" | "testing" | "ok" | "fail">("idle");
+  async function testGh() {
+    ghTest = "testing";
+    try {
+      await githubOrgs(gh.trim() || undefined);
+      ghTest = "ok";
+    } catch {
+      ghTest = "fail";
+    }
+  }
 </script>
 
 <div class="page">
@@ -109,9 +122,14 @@
       <button class="btn ghost sm" type="button" onclick={() => (showGh = !showGh)}>
         {showGh ? "Hide" : "Show"}
       </button>
+      <button class="btn sm" type="button" onclick={testGh} disabled={ghTest === "testing"}>
+        {ghTest === "testing" ? "Testing…" : "Test"}
+      </button>
     </div>
     <div class="tk-status">
       {#if ghBad}<span class="warn-txt">Doesn't look like a GitHub token (expected ghp_… / github_pat_…).</span>
+      {:else if ghTest === "ok"}<span class="ok-txt">Token works ✓</span>
+      {:else if ghTest === "fail"}<span class="warn-txt">Token didn't work — check it's valid and has repo scope.</span>
       {:else if ghSaved}<span class="ok-txt">Saved ✓</span>{/if}
     </div>
     <p class="muted micro fallback">
