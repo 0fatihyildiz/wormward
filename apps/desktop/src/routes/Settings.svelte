@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { listPacks, githubOrgs } from "../lib/api";
+  import { app, fail } from "../lib/state.svelte";
+  import { listPacks, githubOrgs, pickDirs } from "../lib/api";
+  import { saveLocations } from "../lib/locations";
   import type { PackInfo } from "../lib/types";
 
   let packs = $state<PackInfo[]>([]);
@@ -25,6 +27,25 @@
       .finally(() => (packsLoading = false));
   }
   onMount(loadPacks);
+
+  // Protected locations are the folders a Full Scan targets. `app.dirs` is the live source
+  // (hydrated from loadLocations() on state init); every edit persists via saveLocations.
+  async function addLocations() {
+    try {
+      const picked = await pickDirs();
+      if (!picked.length) return;
+      const merged = [...app.dirs];
+      for (const d of picked) if (!merged.includes(d)) merged.push(d);
+      app.dirs = merged;
+      saveLocations(app.dirs);
+    } catch (e) {
+      fail(e);
+    }
+  }
+  function removeLocation(dir: string) {
+    app.dirs = app.dirs.filter((d) => d !== dir);
+    saveLocations(app.dirs);
+  }
 
   function save(key: string, value: string) {
     const v = value.trim();
@@ -72,6 +93,29 @@
       minimum-scope token.
     </p>
   </div>
+
+  <section class="card">
+    <h2>Protected locations</h2>
+    <p class="lede">
+      The folders a Full Scan checks. Add the folders where you keep your code — Wormward scans them
+      and everything inside.
+    </p>
+    {#if app.dirs.length}
+      <ul class="loc-list">
+        {#each app.dirs as d (d)}
+          <li class="loc">
+            <span class="loc-path mono" title={d}>{d}</span>
+            <button class="btn ghost sm" aria-label="Remove {d}" onclick={() => removeLocation(d)}>Remove</button>
+          </li>
+        {/each}
+      </ul>
+    {:else}
+      <p class="muted small">No locations yet — add the folder where you keep your code.</p>
+    {/if}
+    <div class="row" style="margin-top: 10px">
+      <button class="btn sm" onclick={addLocations}>Add folder…</button>
+    </div>
+  </section>
 
   <section class="card">
     <h2>OpenSourceMalware token</h2>
@@ -166,6 +210,11 @@
       </ul>
     {/if}
   </section>
+
+  <section class="card">
+    <h2>Appearance</h2>
+    <p class="lede">Wormward uses a dark theme for now. A light theme may come later.</p>
+  </section>
 </div>
 
 <style>
@@ -182,4 +231,7 @@
   }
   .packs { display: flex; flex-direction: column; gap: 12px; list-style: none; }
   .pack { display: flex; flex-direction: column; gap: 3px; }
+  .loc-list { display: flex; flex-direction: column; gap: 6px; list-style: none; }
+  .loc { display: flex; align-items: center; gap: 8px; background: var(--inset); border-radius: var(--radius-sm); padding: 6px 6px 6px 12px; }
+  .loc-path { flex: 1; min-width: 0; font-size: 12px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
