@@ -560,7 +560,31 @@ fn doctor_clear_cache(dir: String) -> Result<(), String> {
     if !wormward_doctor::cache_targets().contains(&path) {
         return Err("refusing to delete a directory that is not a known toolchain cache".into());
     }
-    std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
+    // Regenerable caches are removed whole; global `node_modules` roots keep the user's packages
+    // and only shed the tainted dropped files. Anything the app can't delete (e.g. a root-owned
+    // /usr/local path) is reported with an actionable message instead of a raw errno.
+    match wormward_doctor::clear_cache_dir(&path) {
+        Ok(unremovable) if unremovable.is_empty() => Ok(()),
+        Ok(unremovable) => {
+            let paths = unremovable
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Err(format!(
+                "Removed what I could, but {} tainted file(s) under {} are owned by the system and \
+                 need elevated permissions. Remove them with: sudo rm -f {paths}",
+                unremovable.len(),
+                path.display(),
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(format!(
+            "Can't remove {p} — it's owned by another user (likely root). Remove it manually with: \
+             sudo rm -rf {p}",
+            p = path.display(),
+        )),
+        Err(e) => Err(format!("Couldn't clean {}: {e}", path.display())),
+    }
 }
 
 /// Apply the safe trigger hardening (npm/pnpm ignore-scripts=true). Returns a line per fix applied.

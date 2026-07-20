@@ -251,6 +251,42 @@ pub fn scan_caches() -> Vec<CacheHit> {
     cache_targets().iter().flat_map(|d| scan_cache_dir(d)).collect()
 }
 
+/// A [`cache_targets`] entry that holds installed *global packages* (a `node_modules` root)
+/// rather than a regenerable cache. These must never be wiped wholesale: doing so would delete
+/// the user's globally-installed CLIs, which — unlike the npx/TypeScript/pnpm caches — do not
+/// regenerate. Covers `/opt/homebrew/lib/node_modules`, `/usr/local/lib/node_modules`, etc.
+pub fn is_package_root(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n == "node_modules")
+}
+
+/// Remove worm-dropped artifacts from a known cache/target dir.
+///
+/// - Regenerable caches (npx / node-gyp / TypeScript / yarn / pnpm store): the whole dir is
+///   removed — it regenerates cleanly on next use.
+/// - Package roots (global `node_modules`, see [`is_package_root`]): only the fingerprinted
+///   tainted files are removed, so the user's real global packages are preserved.
+///
+/// Returns the tainted files that could NOT be removed (e.g. system/root-owned) so the caller can
+/// tell the user to remove them manually, instead of surfacing a raw errno. A file that vanished
+/// between scan and removal (`NotFound`) counts as success. A whole-dir removal that fails (rare
+/// for a user-owned cache) propagates as `Err`.
+pub fn clear_cache_dir(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    if is_package_root(dir) {
+        let mut unremovable = Vec::new();
+        for hit in scan_cache_dir(dir) {
+            match std::fs::remove_file(&hit.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => unremovable.push(hit.path),
+            }
+        }
+        Ok(unremovable)
+    } else {
+        std::fs::remove_dir_all(dir)?;
+        Ok(Vec::new())
+    }
+}
+
 // ---- trigger paths (how the worm re-runs) ----
 
 /// True if `npm/pnpm config get ignore-scripts` reports scripts are blocked.
@@ -669,6 +705,45 @@ mod tests {
         let hits = scan_contents(&files);
         assert_eq!(hits.len(), 1, "only the tainted cache file should match, got {hits:?}");
         assert_eq!(hits[0].path, PathBuf::from("_npx/evil/postinstall.js"));
+    }
+
+    #[test]
+    fn package_root_detected_by_node_modules_name() {
+        assert!(is_package_root(std::path::Path::new("/usr/local/lib/node_modules")));
+        assert!(is_package_root(std::path::Path::new("/opt/homebrew/lib/node_modules")));
+        assert!(!is_package_root(std::path::Path::new("/Users/x/.npm/_npx")));
+        assert!(!is_package_root(std::path::Path::new("/Users/x/Library/Caches/typescript")));
+    }
+
+    #[test]
+    fn clear_regenerable_cache_removes_whole_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("_npx");
+        std::fs::create_dir_all(cache.join("sub")).unwrap();
+        std::fs::write(cache.join("sub/x.js"), "module.exports = 1;").unwrap();
+        // Not a node_modules root → the whole cache dir is removed.
+        let unremovable = clear_cache_dir(&cache).unwrap();
+        assert!(unremovable.is_empty());
+        assert!(!cache.exists(), "a regenerable cache dir should be fully removed");
+    }
+
+    #[test]
+    fn clear_package_root_removes_only_tainted_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("node_modules");
+        let pkg = root.join("some-pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let clean = pkg.join("index.js");
+        let tainted = pkg.join("postinstall.js");
+        std::fs::write(&clean, "module.exports = { hello: 1 };").unwrap();
+        // The same PolinRider loader fingerprint the cache scan flags.
+        std::fs::write(&tainted, "global.i='5-3-168';var _$_8e2c=(function(r,i){return r})('x',7);")
+            .unwrap();
+        let unremovable = clear_cache_dir(&root).unwrap();
+        assert!(unremovable.is_empty(), "user-owned tainted files should be removed");
+        assert!(root.exists(), "the package root itself must be preserved");
+        assert!(clean.exists(), "clean global-package files must be preserved");
+        assert!(!tainted.exists(), "the tainted dropped file must be removed");
     }
 
     #[test]
