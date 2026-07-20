@@ -182,6 +182,7 @@ mod tests {
             artifacts: vec![],
             gitignore_injections: vec![],
             bad_npm_packages: vec![],
+            bad_packages: Default::default(),
             ioc_domains: vec![],
             analyzer: None,
             remediation: None,

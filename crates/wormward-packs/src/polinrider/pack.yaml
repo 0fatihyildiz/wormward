@@ -175,6 +175,36 @@ ioc_domains:
   - cloudflare-protection.vercel.app
   - locate-my-ip.vercel.app
 
+# Version-aware, cross-ecosystem malicious packages (consumed by lockfile + node_modules scans).
+# `versions: []` (omitted) = any version. `confidence: community` downgrades a match to advisory so
+# a single-source lead never produces a hard "infected" verdict.
+bad_packages:
+  npm:
+    - {name: "@common-stack/generate-plugin", versions: ["9.0.2-alpha.21", "9.0.2-alpha.22"]}
+    - {name: tailwindcss-style-animate, versions: ["1.1.6"]}
+    - {name: tailwind-mainanimation, versions: ["2.3.3"]}
+    - {name: tailwind-autoanimation, versions: ["2.3.6"]}
+    - {name: tailwindcss-typography-style, versions: ["0.8.2"]}
+    - {name: tailwindcss-style-modify, versions: ["0.8.3"]}
+    - {name: tailwindcss-animate-style, versions: ["1.2.5"]}
+    - {name: tailwind-animationbased}
+    - {name: tailwind-stylecss}
+    - {name: plain-crypto-js, versions: ["4.2.1"], confidence: community}
+  pypi:
+    - {name: graphalgo, confidence: community}
+    - {name: bignum, confidence: community}
+  composer:
+    - {name: "thiio/kubernetes-php-sdk"}
+    - {name: "sevenspan/laravel-whatsapp"}
+    - {name: "sevenspan/code-generator"}
+    - {name: "sevenspan/laravel-chat"}
+    - {name: "roberts/leads"}
+    - {name: "lambda-platform/moqup"}
+    - {name: "adxio/twig-hmvc"}
+    - {name: "olc/olc-php"}
+    - {name: "arsl/optima-class"}
+    - {name: "plusinfolab/logstation"}
+
 analyzer: polinrider
 
 remediation:
