@@ -28,7 +28,9 @@
       case "threat":
         return "Threat found";
       default:
-        return "Not scanned yet";
+        // Reached only when scanned=true (see !scanned guard above) — a scan ran but a
+        // surface came back unknown (e.g. cancelled). Distinct from the true pre-scan text.
+        return "Scan incomplete";
     }
   });
   // Spec Screen 2: once scanned, the sub line also carries the last-scan time.
