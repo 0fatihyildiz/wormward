@@ -67,6 +67,27 @@ content_signatures:
   - id: staking-uuid
     kind: literal
     value: "e9b53a7c-2342-4b15-b02d-bd8b8f6a03f9"
+  # Additional hardcoded C2 constants (base58 wallets / literal IPs are effectively never in
+  # legit source, mirroring c2-ethereum-ip). Blockchain RPC *hosts* (trongrid/aptos/bsc/solana)
+  # are deliberately NOT literals here — they are legit endpoints for real dApps and are caught
+  # only in combination (rpc + xor + eval) by the capability engine's on-chain-resolve detector.
+  - id: c2-tron-tertiary
+    kind: literal
+    value: "TA48dct6rFW8BXsiLAtjFaVFoSuryMjD3v"
+  - id: c2-tron-quaternary
+    kind: literal
+    value: "TLmj13VL4p6NQ7jpxz8d9uYY6FUKCYatSe"
+  - id: c2-exfil-ip-primary
+    kind: literal
+    value: "136.0.9.8"
+  - id: c2-exfil-ip-secondary
+    kind: literal
+    value: "166.88.54.158"
+  # TasksJacker bootstrap URL shape. Anchored on the /settings/<os>?flag= path so a bare
+  # vercel.app reference in legitimate code cannot match.
+  - id: c2-vercel-settings-url
+    kind: regex
+    value: 'vercel\.app/settings/(mac|linux|win)\?flag='
   # Structural / family signatures — catch new variants (e.g. dot-notation) too.
   - id: decoder-pattern
     kind: regex
@@ -90,11 +111,18 @@ content_signatures:
 artifacts:
   - path: "temp_auto_push.bat"
     label: "Propagation script"
+  - path: "temp_interactive_push.bat"
+    label: "Interactive propagation script"
   - path: "config.bat"
     label: "Hidden orchestrator"
+  - path: "branch_structure.json"
+    label: "Propagation branch map"
 
 gitignore_injections:
   - "config.bat"
+  - "temp_auto_push.bat"
+  - "temp_interactive_push.bat"
+  - "branch_structure.json"
 
 bad_npm_packages:
   - tailwindcss-style-animate
@@ -104,6 +132,7 @@ bad_npm_packages:
   - tailwindcss-typography-style
   - tailwindcss-style-modify
   - tailwindcss-animate-style
+  - tailwind-stylecss
 
 ioc_domains:
   - default-configuration.vercel.app
@@ -112,6 +141,12 @@ ioc_domains:
   - vscode-bootstrapper.vercel.app
   - vscode-load-config.vercel.app
   - 260120.vercel.app
+  - auth-con-firm.vercel.app
+  - auth-rho-dun.vercel.app
+  - coingecko-liard.vercel.app
+  - chalk-logger.vercel.app
+  - cloudflare-protection.vercel.app
+  - locate-my-ip.vercel.app
 
 analyzer: polinrider
 
