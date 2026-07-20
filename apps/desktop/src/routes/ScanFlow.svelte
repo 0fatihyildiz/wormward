@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app, fail, clearErrors, go } from "../lib/state.svelte";
+  import { app, fail, clearErrors, go, notify } from "../lib/state.svelte";
   import { scan, doctor, cancelScan, cleanPreview, cleanApply } from "../lib/api";
   import { listen } from "@tauri-apps/api/event";
   import GuidedProgress from "../lib/components/GuidedProgress.svelte";
@@ -70,20 +70,29 @@
     });
     try {
       const osmToken = localStorage.getItem("osm_token") || undefined;
+      // Online cross-check is opt-in (app.online) AND needs a token; without one, fall back to an
+      // offline scan and tell the user rather than erroring or silently ignoring the choice.
+      const online = app.online && !!osmToken;
+      if (app.online && !osmToken) {
+        notify("warn", "Scanned offline — add an OpenSourceMalware token in Settings to check packages online.");
+      }
+      // Full Scan covers the surfaces the user chose (both on by default). An excluded surface keeps
+      // its previous result rather than being re-checked. Deep is always on: it also checks the
+      // latest commit on every branch (worms hide on non-default branches); branch-tip findings
+      // surface with git_ref set and are cleaned from Advanced, not the "Remove threats" button.
       const [machine, repos] = await Promise.all([
-        doctor(),
-        // Full Scan is thorough: deep=true also checks the latest commit on every branch
-        // (worms hide on non-default branches). Branch-tip findings surface with git_ref set
-        // and are cleaned from the Advanced area, not the working-tree "Remove threats" button.
-        scan(app.dirs, true, !!osmToken, osmToken),
+        app.scanMac ? doctor() : Promise.resolve(app.machineReport),
+        app.scanRepos
+          ? scan(app.dirs, true, online, osmToken, app.history, app.community, app.osv)
+          : Promise.resolve(app.report),
       ]);
       app.machineReport = machine;
       app.report = repos;
       app.lastScanAt = Date.now();
-      // cleanPreview re-scans every repo (uncancellable). On a cancelled/partial scan, skip it so
-      // Stop lands on the partial results at once instead of grinding through a full second scan —
-      // and a one-click clean shouldn't be offered on partial data anyway.
-      plans = repos.cancelled ? [] : await cleanPreview(app.dirs);
+      // cleanPreview re-scans every repo (uncancellable). Skip it when code wasn't scanned, or the
+      // run was cancelled/partial — Stop/partial should land on results at once, and a one-click
+      // clean shouldn't be offered on partial or stale data.
+      plans = app.scanRepos && !repos?.cancelled ? await cleanPreview(app.dirs) : [];
       app.flow = "results";
     } catch (e) {
       fail(e);
@@ -120,7 +129,7 @@
       // Repositories detail must NOT keep showing threats we just removed (honest state,
       // mirrors Workspace.apply()'s re-run). scan() is already imported (Task 3.3).
       const osmToken = localStorage.getItem("osm_token") || undefined;
-      app.report = await scan(app.dirs, true, !!osmToken, osmToken);
+      app.report = await scan(app.dirs, true, app.online && !!osmToken, osmToken, app.history, app.community, app.osv);
       app.lastScanAt = Date.now();
       removedSummary =
         `Removed ${s.applied} ${plural(s.applied, "threat", "threats")} across ${s.repos} ${plural(s.repos, "place", "places")}.` +

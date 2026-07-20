@@ -120,6 +120,9 @@ async fn scan(
     deep: bool,
     online: bool,
     token: Option<String>,
+    history: bool,
+    include_community: bool,
+    osv: bool,
     window: tauri::Window,
     cancel: tauri::State<'_, ScanCancel>,
 ) -> Result<ScanResult, String> {
@@ -133,32 +136,84 @@ async fn scan(
     // can't run concurrently — the Stop button would set the flag only after the scan finished.
     let scan_flag = flag.clone();
     let scan_window = window.clone();
-    let mut report = tauri::async_runtime::spawn_blocking(move || {
+    let (mut report, osv_skipped) = tauri::async_runtime::spawn_blocking(move || {
         let packs = builtin_packs();
         // Parallel, cancellable scan: emit a "scanning" event when a repo starts and a
         // "scanned" event (with its finding count) when it finishes, for the live log.
-        scan_streaming(&paths, &packs, deep, &scan_flag, &|e: wormward_core::RepoScanEvent| {
-            let phase = match e.phase {
-                wormward_core::ScanPhase::Scanning => "scanning",
-                wormward_core::ScanPhase::Scanned => "scanned",
-            };
-            let _ = scan_window.emit(
-                "local-scan-progress",
-                ScanProgress {
-                    phase,
-                    done: e.done,
-                    total: e.total,
-                    repo: e.repo.display().to_string(),
-                    findings: e.findings,
-                },
-            );
-        })
+        let mut report =
+            scan_streaming(&paths, &packs, deep, &scan_flag, &|e: wormward_core::RepoScanEvent| {
+                let phase = match e.phase {
+                    wormward_core::ScanPhase::Scanning => "scanning",
+                    wormward_core::ScanPhase::Scanned => "scanned",
+                };
+                let _ = scan_window.emit(
+                    "local-scan-progress",
+                    ScanProgress {
+                        phase,
+                        done: e.done,
+                        total: e.total,
+                        repo: e.repo.display().to_string(),
+                        findings: e.findings,
+                    },
+                );
+            });
+        // Opt-in extra passes (mirror the CLI's `--history`/`--osv`/`--include-community`). Skip
+        // when the user has already cancelled the main scan, and poll the flag between repos so a
+        // long history pickaxe still honors Stop.
+        if history && !scan_flag.load(Ordering::Relaxed) {
+            for dir in &paths {
+                for repo in discover_repos(dir) {
+                    if scan_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    report.findings.extend(wormward_core::scan_history(&repo, &packs));
+                    report.findings.extend(wormward_core::scan_date_skew(&repo));
+                }
+            }
+        }
+        // Community-sourced leads carry a `pkg-community:` id and are low-confidence; drop them
+        // unless the user opted in, so a single-source list never inflates the default verdict.
+        if !include_community {
+            report.findings.retain(|f| !f.signature_id.starts_with("pkg-community:"));
+        }
+        // OSV lockfile gating via the external `osv-scanner`, when requested and installed.
+        let mut osv_skipped = false;
+        if osv && !scan_flag.load(Ordering::Relaxed) {
+            if wormward_core::osv_available() {
+                for dir in &paths {
+                    for hit in wormward_core::osv_scan(dir) {
+                        report.findings.push(wormward_core::Finding {
+                            campaign: "osv".into(),
+                            severity: wormward_core::Severity::High,
+                            repo: dir.clone(),
+                            file: None,
+                            signature_id: format!("osv:{}", hit.advisory),
+                            kind: wormward_core::FindingKind::NpmPackage,
+                            evidence: format!(
+                                "OSV malicious-package advisory {} for '{}'",
+                                hit.advisory, hit.package
+                            ),
+                            remediable: false,
+                            online: None,
+                            git_ref: None,
+                        });
+                    }
+                }
+            } else {
+                osv_skipped = true;
+            }
+        }
+        (report, osv_skipped)
     })
     .await
     .map_err(|e| e.to_string())?;
 
     let cancelled = flag.load(Ordering::Relaxed);
     let mut warnings = Vec::new();
+    if osv_skipped {
+        warnings
+            .push("osv-scanner is not installed — lockfile (OSV) checks were skipped.".to_string());
+    }
     if online {
         // Mirror the CLI: an online scan with no resolvable token is a hard error, not a
         // silent offline scan presented to the user as a completed online lookup.

@@ -14,8 +14,24 @@ import type {
   DoctorReport,
 } from "./types";
 
-export const scan = (dirs: string[], deep: boolean, online: boolean, token?: string) =>
-  invoke<ScanReport>("scan", { dirs, deep, online, token: token ?? null });
+export const scan = (
+  dirs: string[],
+  deep: boolean,
+  online: boolean,
+  token?: string,
+  history = false,
+  includeCommunity = false,
+  osv = false,
+) =>
+  invoke<ScanReport>("scan", {
+    dirs,
+    deep,
+    online,
+    token: token ?? null,
+    history,
+    includeCommunity,
+    osv,
+  });
 
 export const cancelScan = () => invoke<void>("cancel_scan");
 

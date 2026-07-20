@@ -83,6 +83,20 @@
   function fullScan() {
     app.view = "flow";
   }
+
+  // Full Scan online cross-check (OpenSourceMalware) — opt-in, persisted. Re-reads the token when
+  // toggled (and on each Home mount, since the router remounts views) so the hint stays honest.
+  const osmToken = $derived.by(() => {
+    void app.online;
+    return localStorage.getItem("osm_token");
+  });
+  function persistOnline() {
+    localStorage.setItem("online_scan", app.online ? "1" : "0");
+  }
+  // Persist the remaining scan options + surfaces (each mirrors a CLI flag or an old scan toggle).
+  const persist = (key: string, on: boolean) => localStorage.setItem(key, on ? "1" : "0");
+  // A Full Scan needs at least one surface selected.
+  const noSurface = $derived(!app.scanMac && !app.scanRepos);
 </script>
 
 {#if firstRun}
@@ -102,7 +116,51 @@
 {:else}
   <section class="hero">
     <ShieldStatus level={overall} {heading} {sub} />
-    <button class="btn primary cta" onclick={fullScan}>Full Scan</button>
+    <button class="btn primary cta" onclick={fullScan} disabled={noSurface}>Full Scan</button>
+    {#if noSurface}<p class="scan-opt-hint">Pick at least one thing to scan below.</p>{/if}
+    <div class="scan-opts">
+      <span class="scan-opts-title">What to scan</span>
+      <label class="switch">
+        <input type="checkbox" bind:checked={app.scanMac} onchange={() => persist("scan_mac", app.scanMac)} />
+        <span class="track"></span>
+        <span class="lbl">This Mac <span class="muted">— running threats, infected caches, risky settings</span></span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" bind:checked={app.scanRepos} onchange={() => persist("scan_repos", app.scanRepos)} />
+        <span class="track"></span>
+        <span class="lbl">My code <span class="muted">— every git repo in your protected folders (all branches)</span></span>
+      </label>
+
+      <span class="scan-opts-title">Deeper checks</span>
+      <label class="switch">
+        <input type="checkbox" bind:checked={app.online} onchange={persistOnline} />
+        <span class="track"></span>
+        <span class="lbl">Check online <span class="muted">— cross-check packages against OpenSourceMalware</span></span>
+      </label>
+      {#if app.online && !osmToken}
+        <p class="scan-opt-hint">
+          Online checks need an OpenSourceMalware token.
+          <button class="linklike" onclick={() => go("settings")}>Add one in Settings →</button>
+        </p>
+      {/if}
+      <label class="switch">
+        <input type="checkbox" bind:checked={app.history} onchange={() => persist("scan_history", app.history)} />
+        <span class="track"></span>
+        <span class="lbl">Search git history <span class="muted">— find payloads scrubbed from files but still reachable (slower)</span></span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" bind:checked={app.osv} onchange={() => persist("scan_osv", app.osv)} />
+        <span class="track"></span>
+        <span class="lbl">Check lockfiles (OSV) <span class="muted">— gate lockfiles via osv-scanner (must be installed)</span></span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" bind:checked={app.community} onchange={() => persist("scan_community", app.community)} />
+        <span class="track"></span>
+        <span class="lbl">Include community leads <span class="muted">— show lower-confidence, community-sourced flags</span></span>
+      </label>
+
+      <button class="linklike gh-link" onclick={() => go("advanced")}>Scan my GitHub account →</button>
+    </div>
     <div class="chips-row">
       <HealthChip label="This Mac" status={machine} onclick={() => go("machine")} />
       <HealthChip label="Repositories" status={repos} onclick={() => go("repos")} />
@@ -123,4 +181,27 @@
     flex-wrap: wrap;
     justify-content: center;
   }
+  .scan-opts {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    text-align: left;
+    padding: 14px 18px;
+    background: var(--surface);
+    border-radius: var(--radius);
+  }
+  .scan-opts-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--faint);
+    margin-bottom: 2px;
+  }
+  .scan-opts-title:not(:first-child) { margin-top: 8px; }
+  .scan-opt-hint { font-size: 12px; color: var(--warn); }
+  .linklike { background: none; padding: 0; color: var(--accent); font: inherit; }
+  .linklike:hover { background: none; color: var(--accent-hi); text-decoration: underline; }
+  .gh-link { margin-top: 8px; }
 </style>
