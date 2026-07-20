@@ -2,11 +2,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::finding::{Finding, FindingKind};
-use crate::pack::Pack;
+use crate::pack::{Pack, PayloadStrip};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum RemediationAction {
-    StripPayload { file: PathBuf, markers: Vec<String> },
+    StripPayload { file: PathBuf, markers: Vec<String>, strip_lines: Vec<String> },
     DeleteFile { file: PathBuf },
     RemoveGitignoreLine { file: PathBuf, line: String },
 }
@@ -26,11 +26,11 @@ pub struct RemediationPlan {
     pub manual: Vec<Finding>,
 }
 
-fn strip_markers<'a>(campaign: &str, packs: &'a [Pack]) -> Option<&'a Vec<String>> {
+fn strip_config<'a>(campaign: &str, packs: &'a [Pack]) -> Option<&'a PayloadStrip> {
     let pack = packs.iter().find(|p| p.manifest.id == campaign)?;
     let payload = pack.manifest.remediation.as_ref()?.config_payload.as_ref()?;
     if payload.strategy == "strip_after_marker" && !payload.markers.is_empty() {
-        Some(&payload.markers)
+        Some(payload)
     } else {
         None
     }
@@ -56,8 +56,12 @@ pub fn action_for(finding: &Finding, packs: &[Pack]) -> Option<RemediationAction
             Some(RemediationAction::RemoveGitignoreLine { file, line })
         }
         FindingKind::ContentSignature | FindingKind::Analyzer => {
-            let markers = strip_markers(&finding.campaign, packs)?;
-            Some(RemediationAction::StripPayload { file, markers: markers.clone() })
+            let cfg = strip_config(&finding.campaign, packs)?;
+            Some(RemediationAction::StripPayload {
+                file,
+                markers: cfg.markers.clone(),
+                strip_lines: cfg.strip_lines.clone(),
+            })
         }
         _ => None,
     }
@@ -125,6 +129,28 @@ pub fn strip_marker_matches(content: &str, markers: &[String]) -> bool {
     earliest_marker(content, markers).is_some()
 }
 
+/// Delete whole lines matching any `patterns` entry, used to excise injected lines the payload
+/// cut leaves behind (e.g. the PolinRider `createRequire` ESM shim at the top of the file). Each
+/// pattern is a `re:` regex or a literal substring, matched against the line; an invalid regex
+/// never matches. A no-op when `patterns` is empty.
+fn remove_matching_lines(content: &str, patterns: &[String]) -> String {
+    if patterns.is_empty() {
+        return content.to_string();
+    }
+    let matches = |line: &str| {
+        patterns.iter().any(|p| match p.strip_prefix("re:") {
+            Some(pat) => regex::Regex::new(pat).map(|re| re.is_match(line)).unwrap_or(false),
+            None => line.contains(p.as_str()),
+        })
+    };
+    let kept: Vec<&str> = content.lines().filter(|l| !matches(l)).collect();
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 /// Apply actions in the working tree, backing up each target first (unless disabled).
 pub fn apply(repo: &Path, actions: &[RemediationAction], backup: bool) -> RemediationResult {
     let backup_dir = if backup && !actions.is_empty() {
@@ -150,12 +176,15 @@ pub fn apply(repo: &Path, actions: &[RemediationAction], backup: bool) -> Remedi
             RemediationAction::DeleteFile { file } => {
                 std::fs::remove_file(repo.join(file)).map_err(|e| e.to_string())
             }
-            RemediationAction::StripPayload { file, markers } => {
+            RemediationAction::StripPayload { file, markers, strip_lines } => {
                 let path = repo.join(file);
                 match std::fs::read_to_string(&path) {
                     Ok(content) => match earliest_marker(&content, markers) {
                         Some(idx) => {
-                            let cleaned = format!("{}\n", content[..idx].trim_end());
+                            // Cut the appended payload at the earliest marker, then excise any
+                            // injected lines (e.g. the createRequire shim) left in the prefix.
+                            let prefix = format!("{}\n", content[..idx].trim_end());
+                            let cleaned = remove_matching_lines(&prefix, strip_lines);
                             std::fs::write(&path, cleaned).map_err(|e| e.to_string())
                         }
                         None => Err("no strip marker found in file".to_string()),
@@ -274,7 +303,7 @@ mod tests {
                 config_payload: Some(PayloadStrip {
                     strategy: "strip_after_marker".into(),
                     markers: vec!["global['!']=".into()],
-                }),
+                    strip_lines: vec![],                }),
             }),
         };
         Pack { manifest, analyzer: None }
@@ -340,7 +369,7 @@ mod tests {
             vec![RemediationAction::StripPayload {
                 file: PathBuf::from("postcss.config.mjs"),
                 markers: vec!["global['!']=".into()],
-            }]
+                strip_lines: vec![],            }]
         );
     }
 
@@ -392,10 +421,48 @@ mod tests {
         let a = RemediationAction::StripPayload {
             file: PathBuf::from("postcss.config.mjs"),
             markers: vec!["global['!']=".into()],
-        };
+            strip_lines: vec![],        };
         let r = apply(repo, &[a], false);
         assert_eq!(r.applied.len(), 1);
         assert_eq!(fs::read_to_string(repo.join("postcss.config.mjs")).unwrap(), "export default {};\n");
+    }
+
+    #[test]
+    fn strip_removes_payload_and_injected_shim() {
+        // Multi-point injection: the createRequire ESM shim at the top AND the appended payload
+        // at the bottom. strip_after_marker only cuts the bottom; strip_lines must also excise
+        // the injected shim, leaving the legit config pristine.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let padding = " ".repeat(240);
+        let content = format!(
+            "import path from 'path';\n\
+             import {{ createRequire }} from 'module';\n\
+             const require = createRequire(import.meta.url);\n\
+             const nextConfig = {{ output: 'standalone' }};\n\
+             export default nextConfig;{padding}global.i='5-3-168';var _$_46e0=[];global[_$_46e0[0]]=require;"
+        );
+        fs::write(repo.join("next.config.mjs"), &content).unwrap();
+        let a = RemediationAction::StripPayload {
+            file: PathBuf::from("next.config.mjs"),
+            markers: vec![r"re:\x20{200,}".into(), "global['!']=".into()],
+            strip_lines: vec![
+                "import { createRequire } from 'module'".into(),
+                "createRequire(import.meta.url)".into(),
+            ],
+        };
+        let r = apply(repo, &[a], false);
+        assert_eq!(r.applied.len(), 1);
+        let cleaned = fs::read_to_string(repo.join("next.config.mjs")).unwrap();
+        // Payload cut:
+        assert!(!cleaned.contains("_$_46e0"), "payload must be gone:\n{cleaned}");
+        assert!(!cleaned.contains("global.i="), "version marker must be gone:\n{cleaned}");
+        // Injected shim removed:
+        assert!(!cleaned.contains("createRequire"), "injected shim must be gone:\n{cleaned}");
+        // Legit config preserved:
+        assert!(cleaned.contains("import path from 'path';"));
+        assert!(cleaned.contains("const nextConfig = { output: 'standalone' };"));
+        assert!(cleaned.contains("export default nextConfig;"));
     }
 
     #[test]
@@ -406,7 +473,7 @@ mod tests {
         let a = RemediationAction::StripPayload {
             file: PathBuf::from("f.mjs"),
             markers: vec!["global['!']=".into()],
-        };
+            strip_lines: vec![],        };
         let r = apply(repo, &[a], false);
         assert_eq!(r.skipped.len(), 1);
         assert_eq!(fs::read_to_string(repo.join("f.mjs")).unwrap(), "var q='rmcej%otb%';");
@@ -450,7 +517,7 @@ mod tests {
             RemediationAction::StripPayload {
                 file: PathBuf::from("postcss.config.mjs"),
                 markers: vec!["global['!']=".into()],
-            },
+                strip_lines: vec![],            },
         ];
         apply(repo, &actions, true);
         assert!(!repo.join("temp_auto_push.bat").exists());

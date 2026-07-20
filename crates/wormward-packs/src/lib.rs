@@ -365,4 +365,41 @@ mod tests {
             "no signature may survive the strip"
         );
     }
+
+    #[test]
+    fn injected_esm_shim_is_stripped_with_payload() {
+        // PolinRider injects a `createRequire` ESM shim at the TOP of .mjs configs (so its
+        // payload can call require) AND appends the obfuscated payload at the bottom. The marker
+        // cut removes the bottom payload; the pack's strip_lines must also excise the top shim,
+        // leaving a pristine config — matching a from-history restore.
+        use wormward_core::plan_remediation;
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let legit =
+            "import path from 'path';\nconst nextConfig = { output: 'standalone' };\nexport default nextConfig;";
+        let shim =
+            "import { createRequire } from 'module';\nconst require = createRequire(import.meta.url);\n";
+        let payload =
+            "global.i='5-3-168';var _$_46e0=(function(r,i){return r})('ABCD',7);global[_$_46e0[0]]=require;";
+        let infected = format!(
+            "import path from 'path';\n{shim}const nextConfig = {{ output: 'standalone' }};\nexport default nextConfig;{}{payload}",
+            " ".repeat(260)
+        );
+        fs::write(repo.join("next.config.mjs"), &infected).unwrap();
+
+        let packs = builtin_packs();
+        assert!(!scan_repo(&repo, &packs).is_empty(), "infection must be detected");
+
+        let plan = plan_remediation(&scan_repo(&repo, &packs), &packs);
+        assert!(!plan.actions.is_empty(), "must be auto-fixable");
+        let res = wormward_core::apply(&repo, &plan.actions, false);
+        assert!(!res.applied.is_empty(), "strip must apply");
+
+        let cleaned = fs::read_to_string(repo.join("next.config.mjs")).unwrap();
+        assert!(!cleaned.contains("_$_46e0"), "payload must be gone:\n{cleaned}");
+        assert!(!cleaned.contains("createRequire"), "injected shim must be gone:\n{cleaned}");
+        assert_eq!(cleaned, format!("{legit}\n"), "file reduced to the legit config");
+        assert!(scan_repo(&repo, &packs).is_empty(), "no signature may survive the strip");
+    }
 }

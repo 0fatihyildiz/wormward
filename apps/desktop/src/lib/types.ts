@@ -37,7 +37,7 @@ export interface PackInfo {
 }
 
 export type RemediationAction =
-  | { StripPayload: { file: string; markers: string[] } }
+  | { StripPayload: { file: string; markers: string[]; strip_lines: string[] } }
   | { DeleteFile: { file: string } }
   | { RemoveGitignoreLine: { file: string; line: string } };
 

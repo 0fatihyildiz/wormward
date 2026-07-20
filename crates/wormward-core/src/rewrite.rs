@@ -352,7 +352,7 @@ mod tests {
                 config_payload: Some(PayloadStrip {
                     strategy: "strip_after_marker".into(),
                     markers: vec!["global['!']=".into()],
-                }),
+                    strip_lines: vec![],                }),
             }),
         };
         Pack { manifest, analyzer: None }
@@ -402,7 +402,7 @@ mod tests {
             vec![RemediationAction::StripPayload {
                 file: PathBuf::from("postcss.config.mjs"),
                 markers: vec!["global['!']=".into()],
-            }]
+                strip_lines: vec![],            }]
         );
         let nasty = plans.iter().find(|p| p.branch == "nasty").unwrap();
         assert_eq!(nasty.backup_ref, "refs/wormward-backup/nasty-99");
@@ -616,7 +616,7 @@ mod tests {
             actions: vec![RemediationAction::StripPayload {
                 file: PathBuf::from("postcss.config.mjs"),
                 markers: vec!["global['!']=".into()],
-            }],
+                strip_lines: vec![],            }],
         }];
         let outcomes = apply_branch_cleans(&plans, false, true);
         assert!(
@@ -673,7 +673,7 @@ mod tests {
             actions: vec![RemediationAction::StripPayload {
                 file: PathBuf::from("postcss.config.mjs"),
                 markers: vec!["global['!']=".into()],
-            }],
+                strip_lines: vec![],            }],
         }];
         let outcomes = apply_branch_cleans(&plans, false, false);
         assert!(

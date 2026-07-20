@@ -142,3 +142,11 @@ remediation:
       # Decoder IIFE definition (`var _$_46e0=(function`). Last-resort cut if a variant
       # ships neither padding nor a version tag; the decoder is never legitimate.
       - 're:_\$_[0-9a-f]{4,}=\(function'
+    # Injected lines to delete from the surviving prefix after the payload is cut. PolinRider
+    # adds an ESM re-entry shim to the TOP of `.mjs` configs so its appended payload can call
+    # require(); the marker-based cut only removes the bottom blob, so strip these two lines to
+    # leave a pristine config. Only applied to already-confirmed-infected files, so removing a
+    # `createRequire` line here cannot harm a legitimately clean config.
+    strip_lines:
+      - "import { createRequire } from 'module'"
+      - "createRequire(import.meta.url)"

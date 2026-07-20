@@ -147,7 +147,7 @@ fn is_auto_fixable(findings: &[Finding], packs: &[Pack], read: impl Fn(&Path) ->
         .iter()
         .filter(|f| f.git_ref.is_none())
         .any(|f| match action_for(f, packs) {
-            Some(RemediationAction::StripPayload { file, markers }) => {
+            Some(RemediationAction::StripPayload { file, markers, .. }) => {
                 read(&file).is_some_and(|c| strip_marker_matches(&c, &markers))
             }
             Some(_) => true,

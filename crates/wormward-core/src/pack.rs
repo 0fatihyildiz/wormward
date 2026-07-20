@@ -17,6 +17,11 @@ pub struct PayloadStrip {
     pub strategy: String,
     #[serde(default)]
     pub markers: Vec<String>,
+    /// Injected lines to delete from the surviving prefix after the payload is cut (e.g. the
+    /// PolinRider `createRequire` ESM shim added at the top of the file). Each entry is a `re:`
+    /// regex or a literal substring matched against a whole line. Empty by default.
+    #[serde(default)]
+    pub strip_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]

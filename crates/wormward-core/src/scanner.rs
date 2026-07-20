@@ -1268,7 +1268,7 @@ mod tests {
             config_payload: Some(crate::pack::PayloadStrip {
                 strategy: "strip_after_marker".into(),
                 markers: vec!["rmcej".into()],
-            }),
+                strip_lines: vec![],            }),
         });
         let with_strip = scan_repo(&repo, &[pack]);
         let cs2 = with_strip.iter().find(|f| f.kind == FindingKind::ContentSignature).unwrap();
@@ -1361,7 +1361,7 @@ mod tests {
             config_payload: Some(crate::pack::PayloadStrip {
                 strategy: "strip_after_marker".into(),
                 markers: vec!["global['!']=".into()],
-            }),
+                strip_lines: vec![],            }),
         });
         fs::write(
             repo.join("postcss.config.mjs"),
