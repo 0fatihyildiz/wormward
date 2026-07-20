@@ -295,6 +295,11 @@ input:focus { outline: 2px solid var(--accent-ring); outline-offset: 1px; backgr
   border: 2px solid var(--accent-tint); border-top-color: var(--accent);
   border-radius: 50%; animation: spin 0.7s linear infinite;
 }
+/* On the accent-filled primary button the accent-tinted spinner is invisible; match the
+   button's dark label color (#0a0a12) so the spinner reads as one foreground with the text. */
+.btn.primary .spinner, button.primary .spinner {
+  border-color: rgba(10, 10, 18, 0.28); border-top-color: #0a0a12;
+}
 
 /* ---------- modal (lifted surface on a blurred backdrop, no border/shadow) ---------- */
 .modal-backdrop {

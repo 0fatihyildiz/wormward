@@ -90,16 +90,20 @@ pub struct ScanResult {
     cancelled: bool,
 }
 
-/// Per-repo progress emitted on the `local-scan-progress` event as a scan runs.
+/// Per-repo progress emitted on the `local-scan-progress` event as a scan runs. `phase` is
+/// "scanning" (a repo just started) or "scanned" (finished; `findings` is its result count).
 #[derive(Serialize, Clone)]
 pub struct ScanProgress {
+    phase: &'static str,
     done: usize,
     total: usize,
     repo: String,
+    findings: usize,
 }
 
 /// Cross-command cancel flag for the running local scan. `cancel_scan` sets it; the `scan`
-/// command clears it at the start of each run and checks it between repos.
+/// command clears it at the start of each run. It is polled between repos and per file within
+/// a repo, so Stop is honored even in the middle of one large repository.
 type ScanCancel = Arc<AtomicBool>;
 
 #[tauri::command]
@@ -112,17 +116,39 @@ async fn scan(
     cancel: tauri::State<'_, ScanCancel>,
 ) -> Result<ScanResult, String> {
     let paths = to_paths(dirs);
-    let packs = builtin_packs();
     // Fresh run: clear any stale cancel request from a previous scan.
     cancel.store(false, Ordering::Relaxed);
-    let flag: &AtomicBool = &cancel;
-    // Sequential, cancellable scan: emit one progress event per repo for the live log.
-    let mut report = scan_streaming(&paths, &packs, deep, flag, &|done, total, repo| {
-        let _ = window.emit(
-            "local-scan-progress",
-            ScanProgress { done, total, repo: repo.display().to_string() },
-        );
-    });
+    let flag = cancel.inner().clone(); // Arc<AtomicBool> shared with `cancel_scan`
+
+    // Run the CPU-bound scan on a BLOCKING thread so this async command yields the executor.
+    // Otherwise the synchronous scan loop pins the async worker and the `cancel_scan` command
+    // can't run concurrently — the Stop button would set the flag only after the scan finished.
+    let scan_flag = flag.clone();
+    let scan_window = window.clone();
+    let mut report = tauri::async_runtime::spawn_blocking(move || {
+        let packs = builtin_packs();
+        // Parallel, cancellable scan: emit a "scanning" event when a repo starts and a
+        // "scanned" event (with its finding count) when it finishes, for the live log.
+        scan_streaming(&paths, &packs, deep, &scan_flag, &|e: wormward_core::RepoScanEvent| {
+            let phase = match e.phase {
+                wormward_core::ScanPhase::Scanning => "scanning",
+                wormward_core::ScanPhase::Scanned => "scanned",
+            };
+            let _ = scan_window.emit(
+                "local-scan-progress",
+                ScanProgress {
+                    phase,
+                    done: e.done,
+                    total: e.total,
+                    repo: e.repo.display().to_string(),
+                    findings: e.findings,
+                },
+            );
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
     let cancelled = flag.load(Ordering::Relaxed);
     let mut warnings = Vec::new();
     if online {
@@ -145,7 +171,7 @@ async fn scan(
 }
 
 /// Request cancellation of the running local scan. Cooperative: the `scan` loop stops at the
-/// next repo boundary and returns a partial report with `cancelled = true`.
+/// next file (or repo boundary) and returns a partial report with `cancelled = true`.
 #[tauri::command]
 fn cancel_scan(cancel: tauri::State<'_, ScanCancel>) {
     cancel.store(true, Ordering::Relaxed);

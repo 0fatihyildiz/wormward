@@ -105,4 +105,10 @@ export interface GithubFixView {
   manual_review: boolean;
 }
 
-export type ScanProgress = { done: number; total: number; repo: string };
+export type ScanProgress = {
+  phase: "scanning" | "scanned";
+  done: number;
+  total: number;
+  repo: string;
+  findings: number;
+};

@@ -6,7 +6,8 @@
 
   let deep = $state(false);
   let online = $state(false);
-  let log = $state<string[]>([]);
+  // One entry per repo, upserted as it moves scanning → scanned (with its finding count).
+  let repoLog = $state<ScanProgress[]>([]);
   let progress = $state<ScanProgress | null>(null);
 
   async function choose() {
@@ -21,14 +22,17 @@
   async function run() {
     app.error = "";
     app.scanning = true;
-    log = [];
+    repoLog = [];
     progress = null;
     // Register BEFORE invoking so no early event is missed.
     const unlisten = await listen<ScanProgress>("local-scan-progress", (e) => {
       const p = e.payload;
-      // Events arrive in order; never roll the counter backwards.
+      // `done` only advances on "scanned"; never roll the counter backwards.
       if (!progress || p.done > progress.done) progress = p;
-      log = [...log, `✓ ${p.repo}`];
+      // Upsert by repo so each row transitions scanning → scanned in place.
+      const idx = repoLog.findIndex((r) => r.repo === p.repo);
+      if (idx >= 0) repoLog[idx] = p;
+      else repoLog = [...repoLog, p];
     });
     try {
       const token = localStorage.getItem("osm_token") || undefined;
@@ -52,6 +56,14 @@
   }
 
   const pct = $derived(progress && progress.total ? (progress.done / progress.total) * 100 : 0);
+
+  // Keep the log pinned to its latest line as repos start/finish.
+  let bodyEl = $state<HTMLDivElement | null>(null);
+  $effect(() => {
+    void progress;
+    void repoLog.length;
+    if (bodyEl) bodyEl.scrollTop = bodyEl.scrollHeight;
+  });
 </script>
 
 <div class="page">
@@ -103,15 +115,29 @@
     {/if}
   </section>
 
-  {#if app.scanning || log.length}
-    <section class="card">
-      <div class="row between">
-        <h2>Progress</h2>
-        {#if progress}<span class="count">{progress.done}/{progress.total}</span>{/if}
-      </div>
-      <div class="scanlog stack">
-        {#each log as line}<div class="mono micro muted">{line}</div>{/each}
-        {#if !log.length}<div class="muted small">Discovering repositories…</div>{/if}
+  {#if app.scanning || repoLog.length}
+    <section class="terminal">
+      <div class="term-body" bind:this={bodyEl}>
+        {#each repoLog as r (r.repo)}
+          {#if r.phase === "scanning"}
+            <div class="line scanning">
+              <span class="spinner"></span>
+              <span class="tag">scanning</span>
+              <span class="repo">{r.repo}</span>
+            </div>
+          {:else}
+            <div class="line" class:hit={r.findings}>
+              <span class="mark {r.findings ? 'hit' : 'ok'}">{r.findings ? "✗" : "✓"}</span>
+              <span class="repo">{r.repo}</span>
+              {#if r.findings}<span class="crit"
+                  >{r.findings} finding{r.findings === 1 ? "" : "s"}</span
+                >{/if}
+            </div>
+          {/if}
+        {/each}
+        {#if !repoLog.length}
+          <div class="line dim"><span class="tag">discovering repositories…</span></div>
+        {/if}
       </div>
     </section>
   {/if}
@@ -130,4 +156,34 @@
     word-break: break-all;
   }
   .opts { display: flex; flex-direction: column; gap: 4px; padding: 2px 0; }
+
+  /* ---- terminal-styled progress log ---- */
+  .terminal {
+    background: var(--inset);
+    border-radius: var(--radius);
+    overflow: hidden;
+    font-family: var(--mono);
+  }
+  .term-body {
+    padding: 14px;
+    max-height: 320px;
+    overflow-y: auto;
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--fg);
+    scroll-behavior: smooth;
+  }
+  .line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .line .spinner {
+    width: 11px; height: 11px; flex: none;
+    border-color: var(--ok-tint); border-top-color: var(--ok);
+  }
+  .tag { flex: none; color: var(--faint); }
+  .repo { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+  .scanning .repo { color: var(--muted); }
+  .mark { flex: none; font-weight: 700; }
+  .mark.ok { color: var(--ok); }
+  .mark.hit { color: var(--danger); }
+  .crit { flex: none; color: var(--danger); }
+  .dim .tag { color: var(--faint); }
 </style>
