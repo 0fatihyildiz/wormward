@@ -212,6 +212,11 @@ pub struct ScanProgress {
 fn clone_repo(repo: &RepoRef, dest: &Path, token: &str) -> Result<(), String> {
     let out = Command::new("git")
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Ignore a hostile /etc/gitconfig (it could set a global hooksPath or url-insteadOf).
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // Belt-and-suspenders with --template=: no hook can run against OUR temp clone.
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
         // --template= (empty): machine-level git templates would otherwise copy their
         // hooks into OUR temp clone, and the local re-scan would flag those hooks as
         // findings about the repo. Hooks are local artifacts, never repo content.

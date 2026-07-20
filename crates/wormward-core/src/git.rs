@@ -21,10 +21,16 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
+        // Hardening: disable repo hooks so a malicious hook planted in a scanned repo cannot
+        // execute when wormward stages/commits/pushes its remediation. `-c` must precede the
+        // subcommand. Paired with GIT_CONFIG_NOSYSTEM below (ignore a hostile /etc/gitconfig).
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
         .args(args)
         // Never block on an interactive credential prompt (e.g. force-push to a private
         // remote without cached auth); fail fast with an error instead.
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "wormward")
         .env("GIT_AUTHOR_EMAIL", "wormward@localhost")
         .env("GIT_COMMITTER_NAME", "wormward")
@@ -52,7 +58,7 @@ fn stage_paths(repo: &Path, paths: &[PathBuf]) {
 /// Stage the given remediation paths and commit them.
 pub fn commit_paths(repo: &Path, message: &str, paths: &[PathBuf]) -> Result<(), String> {
     stage_paths(repo, paths);
-    run_git(repo, &["commit", "-m", message])
+    run_git(repo, &["commit", "--no-verify", "-m", message])
 }
 
 /// Stage the given remediation paths and amend HEAD — rewrites the latest commit in place
@@ -61,17 +67,17 @@ pub fn commit_paths(repo: &Path, message: &str, paths: &[PathBuf]) -> Result<(),
 /// forensic record of who introduced the commit is not lost.
 pub fn amend_head(repo: &Path, paths: &[PathBuf]) -> Result<(), String> {
     stage_paths(repo, paths);
-    run_git(repo, &["commit", "--amend", "--no-edit"])
+    run_git(repo, &["commit", "--amend", "--no-edit", "--no-verify"])
 }
 
 /// `git push`.
 pub fn push(repo: &Path) -> Result<(), String> {
-    run_git(repo, &["push"])
+    run_git(repo, &["push", "--no-verify"])
 }
 
 /// `git push --force-with-lease` (safe force-push; fails if the remote moved).
 pub fn force_push_with_lease(repo: &Path) -> Result<(), String> {
-    run_git(repo, &["push", "--force-with-lease"])
+    run_git(repo, &["push", "--force-with-lease", "--no-verify"])
 }
 
 /// `git push --force-with-lease <remote> <branch>` — a force-push scoped to exactly one
@@ -79,7 +85,7 @@ pub fn force_push_with_lease(repo: &Path) -> Result<(), String> {
 /// worktree's local branch has no upstream configured for a bare `push`.
 pub fn force_push_with_lease_to(repo: &Path, remote: &str, branch: &str) -> Result<(), String> {
     // `--` ends option parsing so a refspec/branch beginning with `-` cannot be read as a flag.
-    run_git(repo, &["push", "--force-with-lease", remote, "--", branch])
+    run_git(repo, &["push", "--force-with-lease", "--no-verify", remote, "--", branch])
 }
 
 /// Run git and capture trimmed stdout on success.
