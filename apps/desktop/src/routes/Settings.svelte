@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app, fail } from "../lib/state.svelte";
+  import { app, fail, go } from "../lib/state.svelte";
   import { listPacks, githubOrgs, pickDirs } from "../lib/api";
   import { saveLocations } from "../lib/locations";
   import type { PackInfo } from "../lib/types";
@@ -86,6 +86,7 @@
 </script>
 
 <div class="page">
+  <button class="back" onclick={() => go("home")}>← Home</button>
   <div class="page-head">
     <h1>Settings</h1>
     <p class="lede">
@@ -218,6 +219,14 @@
 </div>
 
 <style>
+  .back {
+    align-self: flex-start;
+    background: none;
+    color: var(--muted);
+    font-size: 13px;
+    padding: 4px 0;
+  }
+  .back:hover { color: var(--fg); background: none; }
   .tk-label { font-size: 12px; color: var(--muted); font-weight: 500; display: block; margin-bottom: 5px; }
   .tk-row { display: flex; gap: 8px; align-items: stretch; }
   .tk-row input { flex: 1; }
