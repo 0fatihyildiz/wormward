@@ -327,8 +327,8 @@
     {/if}
   </section>
 
-  <!-- 2 · Live log -->
-  {#if app.scanning || repoLog.length}
+  <!-- 2 · Live log (only while scanning; findings replace it when done) -->
+  {#if app.scanning}
     <section class="terminal">
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div class="term-body" bind:this={bodyEl} tabindex="0" role="log" aria-label="Scan progress log">
@@ -550,8 +550,8 @@
   .scan-status strong { font-variant-numeric: tabular-nums; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 
-  .terminal { background: var(--inset); border-radius: var(--radius); overflow: hidden; font-family: var(--mono); }
-  .term-body { padding: 14px; max-height: 300px; overflow-y: auto; font-size: 12px; line-height: 1.7; color: var(--fg); scroll-behavior: smooth; }
+  .terminal { flex: none; background: var(--inset); border-radius: var(--radius); overflow: hidden; font-family: var(--mono); }
+  .term-body { padding: 12px 14px; max-height: 220px; overflow-y: auto; font-size: 12px; line-height: 1.6; color: var(--fg); scroll-behavior: smooth; }
   .line { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .line .spinner { width: 11px; height: 11px; flex: none; border-color: var(--ok-tint); border-top-color: var(--ok); }
   .tag { flex: none; color: var(--faint); }
