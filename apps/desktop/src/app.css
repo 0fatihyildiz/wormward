@@ -52,7 +52,7 @@
   --pad-card: 18px 20px;
   --gap-card: 13px;
   --gap-page: 14px;
-  --content: 860px;
+  --content: 800px;
   --topbar-h: 54px;
 }
 
@@ -132,12 +132,12 @@ code {
 .page {
   max-width: var(--content);
   margin: 0 auto;
-  padding: 26px 24px 72px;
+  padding: 22px 24px 40px;
   display: flex;
   flex-direction: column;
   gap: var(--gap-page);
 }
-.page-head { display: flex; flex-direction: column; gap: 5px; margin-bottom: 4px; }
+.page-head { display: flex; flex-direction: column; gap: 4px; margin-bottom: 2px; }
 .page-head h1 { font-size: 19px; letter-spacing: -0.025em; }
 
 /* ---------- card (borderless, color-elevated) ---------- */

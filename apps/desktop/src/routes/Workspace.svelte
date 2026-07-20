@@ -319,6 +319,12 @@
         <span style="width: {progress ? pct : 35}%"></span>
       </div>
     {/if}
+    {#if !scanned && !app.scanning}
+      <p class="intro muted micro">
+        Read-only until you choose to clean. Deep scan checks every branch tip; online cross-check
+        verifies packages against OpenSourceMalware.
+      </p>
+    {/if}
   </section>
 
   <!-- 2 · Live log -->
@@ -369,10 +375,10 @@
         </div>
       </div>
     {:else}
-      <!-- summary + one-click clean -->
+      <!-- findings + one-click clean, all in one card -->
       <section class="card">
         <div class="row between">
-          <div class="stack" style="gap: 4px">
+          <div class="stack" style="gap: 3px">
             <h2>{total} {plural(total, "finding", "findings")} in {affected} of {report?.repos_scanned ?? 0} {plural(report?.repos_scanned ?? 0, "repository", "repositories")}</h2>
             <div class="sev-summary">{#each sevCounts as s (s.sev)}<span class="sev-chip {s.sev}">{s.n} {s.sev}</span>{/each}</div>
           </div>
@@ -387,37 +393,37 @@
           <p class="manual-note">⚠ {manualCount} {plural(manualCount, "finding", "findings")} need manual review — they can't be removed automatically.</p>
         {/if}
         {#if cleanResult}<p class="ok-text small">{cleanResult}</p>{/if}
-      </section>
 
-      {#each grouped as [campaign, list] (campaign)}
-        <section class="card">
-          <div class="row between">
-            <h2>{campaign}</h2>
-            <span class="count sev-{list[0].severity}" aria-label="{list.length} findings">{list.length}</span>
-          </div>
-          <ul class="findings">
-            {#each list as f, i (f.repo + (f.file ?? "") + f.signature_id + i)}
-              <li class="finding">
-                <span class="pill {f.severity}">{f.severity}</span>
-                <div class="stack" style="min-width: 0; flex: 1">
-                  <div class="repo-name mono">{f.repo}</div>
-                  <div class="path">
-                    {#if f.file}{f.file}{:else}<span class="muted">repository-level</span>{/if}
-                    {#if f.git_ref}<span class="chip">branch: {f.git_ref}</span>{/if}
-                    <span class="tag2 {f.remediable ? 'fixable' : 'manual'}">{f.remediable ? "Auto-fixable" : "Manual review"}</span>
-                  </div>
-                  <code class="evidence mono">{f.evidence}</code>
-                  {#if f.online}
-                    <div class="micro {f.online.malicious ? 'crit' : 'muted'}">
-                      OpenSourceMalware: {f.online.malicious ? "flagged as malicious" : "not flagged"}{#if f.online.message} — {f.online.message}{/if}{#if f.online.osm_url} · <a href={f.online.osm_url} target="_blank" rel="noreferrer noopener">View advisory ↗</a>{/if}
+        {#each grouped as [campaign, list] (campaign)}
+          <div class="camp">
+            <div class="camp-head">
+              <h3>{campaign}</h3>
+              <span class="count sev-{list[0].severity}" aria-label="{list.length} findings">{list.length}</span>
+            </div>
+            <ul class="findings">
+              {#each list as f, i (f.repo + (f.file ?? "") + f.signature_id + i)}
+                <li class="finding">
+                  <span class="pill {f.severity}">{f.severity}</span>
+                  <div class="stack" style="min-width: 0; flex: 1; gap: 2px">
+                    <div class="path">
+                      <span class="repo-name mono">{f.repo}</span>
+                      {#if f.file}<span class="fpath mono">{f.file}</span>{:else}<span class="muted">repository-level</span>{/if}
+                      {#if f.git_ref}<span class="chip">branch: {f.git_ref}</span>{/if}
+                      <span class="tag2 {f.remediable ? 'fixable' : 'manual'}">{f.remediable ? "Auto-fixable" : "Manual review"}</span>
                     </div>
-                  {/if}
-                </div>
-              </li>
-            {/each}
-          </ul>
-        </section>
-      {/each}
+                    <code class="evidence mono">{f.evidence}</code>
+                    {#if f.online}
+                      <div class="micro {f.online.malicious ? 'crit' : 'muted'}">
+                        OpenSourceMalware: {f.online.malicious ? "flagged as malicious" : "not flagged"}{#if f.online.message} — {f.online.message}{/if}{#if f.online.osm_url} · <a href={f.online.osm_url} target="_blank" rel="noreferrer noopener">View advisory ↗</a>{/if}
+                      </div>
+                    {/if}
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {/each}
+      </section>
     {/if}
 
     <!-- Advanced -->
@@ -572,10 +578,15 @@
   .danger-text { color: var(--danger); }
   .notes { display: flex; flex-direction: column; gap: 4px; list-style: none; }
 
-  .findings { display: flex; flex-direction: column; gap: 10px; list-style: none; }
-  .finding { display: flex; gap: 11px; align-items: flex-start; }
-  .repo-name { font-size: 12px; color: var(--fg); word-break: break-all; }
-  .path { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+  .camp { padding-top: 11px; border-top: 1px solid var(--surface-3); }
+  .camp:first-of-type { border-top: 0; padding-top: 2px; }
+  .camp-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; }
+  .camp-head h3 { font-size: 13px; color: var(--fg); }
+  .findings { display: flex; flex-direction: column; gap: 7px; list-style: none; }
+  .finding { display: flex; gap: 9px; align-items: flex-start; }
+  .repo-name { font-size: 12px; color: var(--fg); font-weight: 600; word-break: break-all; }
+  .fpath { color: var(--muted); word-break: break-all; }
+  .path { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
   .chip { font-size: 10.5px; color: var(--faint); background: var(--surface-2); padding: 1px 7px; border-radius: 999px; }
   .tag2 { font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 999px; }
   .tag2.fixable { background: var(--ok-tint); color: var(--ok); }
