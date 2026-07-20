@@ -3,6 +3,7 @@
   import type { View } from "./lib/state.svelte";
   import Home from "./routes/Home.svelte";
   import Workspace from "./routes/Workspace.svelte";
+  import ScanFlow from "./routes/ScanFlow.svelte";
   import GitHub from "./routes/GitHub.svelte";
   import Doctor from "./routes/Doctor.svelte";
   import Settings from "./routes/Settings.svelte";
@@ -18,7 +19,7 @@
   // every current capability reachable so nothing is lost this phase.
   const views: Record<View, Component> = {
     home: Home,
-    flow: Workspace,
+    flow: ScanFlow,
     machine: Doctor,
     repos: Workspace,
     advanced: GitHub,
