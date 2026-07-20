@@ -1,7 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ignore::{WalkBuilder, WalkState};
+
+/// A never-set cancel flag, so the non-cancellable public walkers can delegate to the
+/// cancellable ones without every caller threading a flag.
+static NEVER: AtomicBool = AtomicBool::new(false);
 
 fn is_pruned_dir(name: &str) -> bool {
     // `.wormward-backup` holds pristine copies of removed payloads — never rescan it,
@@ -24,6 +29,14 @@ fn base_builder(root: &Path) -> WalkBuilder {
 }
 
 pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
+    discover_repos_cancellable(root, &NEVER)
+}
+
+/// Cancellable variant of [`discover_repos`]. The parallel walk quits as soon as `cancel` is
+/// set, so a Stop during the discovery phase — which descends into node_modules and can be the
+/// slowest part of scanning a large monorepo — is honored instead of running the whole tree to
+/// completion first.
+pub fn discover_repos_cancellable(root: &Path, cancel: &AtomicBool) -> Vec<PathBuf> {
     let found = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
     let b = base_builder(root);
     // Descend everywhere (including node_modules): the worm can vendor an infected
@@ -32,6 +45,9 @@ pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
     b.build_parallel().run(|| {
         let found = Arc::clone(&found);
         Box::new(move |res| {
+            if cancel.load(Ordering::Relaxed) {
+                return WalkState::Quit; // Stop requested: abandon the whole walk.
+            }
             if let Ok(entry) = res {
                 let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 if is_dir && entry.file_name() == ".git" {
@@ -51,8 +67,19 @@ pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
 }
 
 pub fn walk_repo_files(repo: &Path) -> Vec<PathBuf> {
+    walk_repo_files_cancellable(repo, &NEVER)
+}
+
+/// Cancellable variant of [`walk_repo_files`]. Quits the parallel walk as soon as `cancel` is
+/// set, so a Stop lands even before the per-file scan loop starts on a huge working tree.
+pub fn walk_repo_files_cancellable(repo: &Path, cancel: &AtomicBool) -> Vec<PathBuf> {
     let files = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
     let mut b = base_builder(repo);
+    // The per-repo scan runs under an outer rayon parallelism across repos, and the scan itself
+    // is sequential per repo — so a multi-threaded walk here only oversubscribes the CPU (up to
+    // cores² threads, which thrashes and heats). One walker thread per repo keeps total threads
+    // ≈ cores. Discovery stays parallel: it runs standalone, before the repo loop.
+    b.threads(1);
     b.filter_entry(|e| {
         let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
         !(is_dir && e.depth() > 0 && is_pruned_dir(&e.file_name().to_string_lossy()))
@@ -60,6 +87,9 @@ pub fn walk_repo_files(repo: &Path) -> Vec<PathBuf> {
     b.build_parallel().run(|| {
         let files = Arc::clone(&files);
         Box::new(move |res| {
+            if cancel.load(Ordering::Relaxed) {
+                return WalkState::Quit; // Stop requested: abandon the walk.
+            }
             if let Ok(entry) = res {
                 if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     files.lock().unwrap().push(entry.into_path());
@@ -99,6 +129,36 @@ mod tests {
         let mut repos = discover_repos(root);
         repos.sort();
         assert_eq!(repos, vec![root.join("a"), root.join("b/c")]);
+    }
+
+    #[test]
+    fn discover_repos_cancellable_bails_when_flag_set() {
+        use std::sync::atomic::AtomicBool;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("a/.git")).unwrap();
+        // Not cancelled: finds the repo.
+        let live = discover_repos_cancellable(root, &AtomicBool::new(false));
+        assert!(live.contains(&root.join("a")));
+        // Pre-cancelled: the parallel walk quits before discovering anything, so a Stop during
+        // the discovery phase is honored instead of running the whole tree to completion.
+        let cancelled = discover_repos_cancellable(root, &AtomicBool::new(true));
+        assert!(cancelled.is_empty(), "cancelled discovery must return no repos, got {cancelled:?}");
+    }
+
+    #[test]
+    fn walk_repo_files_cancellable_bails_when_flag_set() {
+        use std::sync::atomic::AtomicBool;
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        touch(&repo.join("src/a.rs"));
+        touch(&repo.join("src/b.rs"));
+        // Not cancelled: walks the files.
+        let live = walk_repo_files_cancellable(repo, &AtomicBool::new(false));
+        assert!(!live.is_empty());
+        // Pre-cancelled: the walk quits immediately.
+        let cancelled = walk_repo_files_cancellable(repo, &AtomicBool::new(true));
+        assert!(cancelled.is_empty(), "cancelled walk must return no files, got {cancelled:?}");
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub use rewrite::{
 };
 pub use scanner::{
     deep_scan_repo, scan, scan_capabilities, scan_deep, scan_files, scan_repo, scan_streaming,
-    scan_tree, ScanReport,
+    scan_tree, RepoScanEvent, ScanPhase, ScanReport,
 };
-pub use walk::{discover_repos, walk_repo_files};
+pub use walk::{
+    discover_repos, discover_repos_cancellable, walk_repo_files, walk_repo_files_cancellable,
+};

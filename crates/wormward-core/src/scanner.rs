@@ -1,6 +1,11 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// A never-set cancel flag, so the non-cancellable public entry points can delegate to the
+/// cancellable internals without every caller threading a flag.
+static NEVER: AtomicBool = AtomicBool::new(false);
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
@@ -12,7 +17,7 @@ use crate::git::reflog_has_amend;
 use crate::pack::{Pack, ScannedFile};
 use crate::repo_files::{GitTree, RepoFiles, WorkingTree};
 use crate::surface::{classify, derived_targets, is_excluded_path, lifecycle_scripts, Surface};
-use crate::walk::discover_repos;
+use crate::walk::{discover_repos, discover_repos_cancellable};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanReport {
@@ -137,6 +142,17 @@ fn looks_binary(content: &str) -> bool {
 /// Apply all file-based pack checks to a file source. Findings have git_ref = None;
 /// the deep-scan caller stamps the branch ref afterward.
 pub fn scan_files(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Finding> {
+    scan_files_inner(repo, files, packs, &NEVER)
+}
+
+/// Cancellable core of [`scan_files`]. The `cancel` flag is polled per file so a big repo can be
+/// stopped mid-scan; a broken-off scan returns whatever findings it accumulated so far.
+fn scan_files_inner(
+    repo: &Path,
+    files: &dyn RepoFiles,
+    packs: &[Pack],
+    cancel: &AtomicBool,
+) -> Vec<Finding> {
     let engine = SignatureEngine::build(packs);
     // Per-pack target globsets, indexed alongside `packs`.
     let globsets: Vec<GlobSet> =
@@ -145,6 +161,9 @@ pub fn scan_files(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Fin
     let mut findings = Vec::new();
 
     for rel in files.paths() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         // Build-output dirs and minified bundles carry legitimately obfuscated/high-entropy
         // code; exclude them here so the pack pass matches the capability pass and does not
         // fire (e.g. entropy-tail) on benign minified output.
@@ -308,6 +327,12 @@ fn expand_derived(
 /// `RepoFiles` (working tree or a branch tip). The physical `.git/hooks` pass
 /// is separate (`scan_git_hooks`) because it applies only to the working tree.
 pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
+    scan_capabilities_inner(repo, files, &NEVER)
+}
+
+/// Cancellable core of [`scan_capabilities`]. Both file passes poll `cancel` per file so a large
+/// working tree can be stopped mid-scan.
+fn scan_capabilities_inner(repo: &Path, files: &dyn RepoFiles, cancel: &AtomicBool) -> Vec<Finding> {
     let mut findings = Vec::new();
     // Real file paths already scored under some surface — prevents a reachable
     // DerivedScript that is also a classified ConfigFile from double-reporting.
@@ -321,6 +346,9 @@ pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
     // and folder-open tasks.json bodies); their local `node ./X.js` targets are promoted
     // to DerivedScript and scored first.
     for rel in files.paths() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if is_excluded_path(rel) {
             continue;
         }
@@ -356,6 +384,9 @@ pub fn scan_capabilities(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
 
     // --- Pass 1: classify each file, score lifecycle scripts, check exfil-staging. ---
     for rel in files.paths() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if is_excluded_path(rel) {
             continue;
         }
@@ -459,19 +490,36 @@ fn dedup_capability_against_packs(findings: &mut Vec<Finding>) {
 /// The physical `.git/hooks` pass and the reflog heuristic are working-tree-only and are
 /// applied separately by `scan_repo`; they cannot run over a non-working-tree source.
 pub fn scan_tree(repo: &Path, files: &dyn RepoFiles, packs: &[Pack]) -> Vec<Finding> {
-    let mut findings = scan_files(repo, files, packs);
-    findings.extend(scan_capabilities(repo, files));
+    scan_tree_inner(repo, files, packs, &NEVER)
+}
+
+/// Cancellable core of [`scan_tree`]. Both file passes poll `cancel`, so a big single repo
+/// (e.g. a monorepo working tree) can be stopped mid-scan rather than only between repos.
+fn scan_tree_inner(
+    repo: &Path,
+    files: &dyn RepoFiles,
+    packs: &[Pack],
+    cancel: &AtomicBool,
+) -> Vec<Finding> {
+    let mut findings = scan_files_inner(repo, files, packs, cancel);
+    findings.extend(scan_capabilities_inner(repo, files, cancel));
     dedup_capability_against_packs(&mut findings);
     findings
 }
 
 pub fn scan_repo(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
-    let working = WorkingTree::new(repo);
-    let mut findings = scan_tree(repo, &working, packs);
+    scan_repo_inner(repo, packs, &NEVER)
+}
+
+/// Cancellable core of [`scan_repo`]. Threads `cancel` into the working-tree pass so a Stop
+/// request lands mid-repo; the reflog heuristic is skipped once cancelled.
+fn scan_repo_inner(repo: &Path, packs: &[Pack], cancel: &AtomicBool) -> Vec<Finding> {
+    let working = WorkingTree::new_cancellable(repo, cancel);
+    let mut findings = scan_tree_inner(repo, &working, packs, cancel);
     // .git/hooks is a working-tree-only surface (absent from a GitTree / ApiTree).
     findings.extend(scan_git_hooks(repo));
 
-    if !findings.is_empty() && reflog_has_amend(repo) {
+    if !cancel.load(Ordering::Relaxed) && !findings.is_empty() && reflog_has_amend(repo) {
         // Attribute the reflog corroboration to a campaign (pack) finding when one
         // exists; fall back to "generic" only if every finding is capability-only.
         let campaign = findings
@@ -586,7 +634,7 @@ pub fn deep_scan_repo_cancellable(
             Some(t) => t,
             None => continue,
         };
-        let mut tree_findings = scan_tree(repo, &tree, packs);
+        let mut tree_findings = scan_tree_inner(repo, &tree, packs, cancel);
         for f in &mut tree_findings {
             f.git_ref = Some(name.clone());
         }
@@ -615,42 +663,91 @@ pub fn scan_deep(roots: &[PathBuf], packs: &[Pack]) -> ScanReport {
     ScanReport { findings, repos_scanned: repos.len() }
 }
 
-/// Sequential, cancellable scan with per-repo progress. Discovers repos under `roots`,
-/// scans each (`deep` = also branch tips), and calls `on_repo(done, total, repo)` after each.
-/// Checks `cancel` before each repo and stops early with a partial report when set. Runs
-/// sequentially (unlike the parallel `scan`/`scan_deep`) so progress order and cancellation
-/// are deterministic and immediate at repo boundaries — the GUI drives it for a live log and
-/// a Stop button.
+/// Which phase a per-repo [`RepoScanEvent`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPhase {
+    /// The repo's scan has just started (in progress).
+    Scanning,
+    /// The repo's scan finished; `findings` is its result count.
+    Scanned,
+}
+
+/// A live progress event emitted for one repo during [`scan_streaming`].
+pub struct RepoScanEvent<'a> {
+    pub phase: ScanPhase,
+    /// Repos fully scanned so far (excludes the in-progress one on `Scanning`).
+    pub done: usize,
+    pub total: usize,
+    pub repo: &'a Path,
+    /// Findings in this repo — only meaningful on `Scanned` (0 on `Scanning`).
+    pub findings: usize,
+}
+
+/// Cancellable scan with live per-repo progress. Discovers repos under `roots`, scans each in
+/// parallel (`deep` = also branch tips), and calls `on_event` with a `Scanning` event when a
+/// repo starts and a `Scanned` event (with its finding count) when it finishes. The `cancel`
+/// flag is cooperative and threaded into the per-file loops, so a Stop request lands mid-repo,
+/// not just at repo boundaries; a cancelled run returns a partial report. The GUI drives this
+/// for its live log and Stop button.
 pub fn scan_streaming(
     roots: &[PathBuf],
     packs: &[Pack],
     deep: bool,
     cancel: &std::sync::atomic::AtomicBool,
-    on_repo: &dyn Fn(usize, usize, &Path),
+    on_event: &(dyn Fn(RepoScanEvent) + Sync),
 ) -> ScanReport {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let mut repos: Vec<PathBuf> = Vec::new();
+    // Discovery descends into node_modules and is often the slowest phase on a large tree; make
+    // it cancellable so Stop is honored during "discovering repositories…", not only afterward.
     for root in roots {
-        repos.extend(discover_repos(root));
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        repos.extend(discover_repos_cancellable(root, cancel));
     }
     repos.sort();
     repos.dedup();
     let total = repos.len();
+    let done = AtomicUsize::new(0);
 
-    let mut findings = Vec::new();
-    let mut scanned = 0usize;
-    for repo in &repos {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
-        findings.extend(scan_repo(repo, packs));
-        if deep {
-            // Cancellable between branch tips so Stop is honored even mid-repo.
-            findings.extend(deep_scan_repo_cancellable(repo, packs, cancel));
-        }
-        scanned += 1;
-        on_repo(scanned, total, repo);
-    }
-    ScanReport { findings, repos_scanned: scanned }
+    // Parallel across repos (rayon) for speed. Each repo emits a `Scanning` event when it
+    // starts and a `Scanned` event (with its finding count) when it finishes — events arrive
+    // in real completion order, not input order. Cancellation is a cooperative flag threaded
+    // all the way into the per-file loops (`scan_repo_inner`) and, for deep scans, between
+    // branch tips — so an in-flight repo stops mid-file rather than running to completion, and
+    // the remaining repos are skipped. Stop is honored even inside one large repository.
+    let findings: Vec<Finding> = repos
+        .par_iter()
+        .flat_map(|repo| {
+            if cancel.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            on_event(RepoScanEvent {
+                phase: ScanPhase::Scanning,
+                done: done.load(Ordering::Relaxed),
+                total,
+                repo,
+                findings: 0,
+            });
+            let mut f = scan_repo_inner(repo, packs, cancel);
+            if deep {
+                f.extend(deep_scan_repo_cancellable(repo, packs, cancel));
+            }
+            let count = f.len();
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            on_event(RepoScanEvent {
+                phase: ScanPhase::Scanned,
+                done: n,
+                total,
+                repo,
+                findings: count,
+            });
+            f
+        })
+        .collect();
+
+    ScanReport { findings, repos_scanned: done.load(Ordering::Relaxed) }
 }
 
 #[cfg(test)]
@@ -852,6 +949,76 @@ mod tests {
     }
 
     #[test]
+    fn scan_stops_mid_repo_when_cancelled_during_iteration() {
+        // A single big repo must be stoppable mid-scan, not only between repos: the file loop
+        // polls `cancel` per file. Here the flag flips while the FIRST config file is read, so
+        // the loop must break before the second file — proving Stop lands inside one repo.
+        struct Files<'a> {
+            paths: Vec<PathBuf>,
+            body: String,
+            // When armed, read() flips `cancel` the first time a file is read.
+            arm: bool,
+            cancel: &'a AtomicBool,
+        }
+        impl RepoFiles for Files<'_> {
+            fn paths(&self) -> &[PathBuf] {
+                &self.paths
+            }
+            fn read(&self, _rel: &Path) -> Option<String> {
+                if self.arm {
+                    self.cancel.store(true, Ordering::Relaxed);
+                }
+                Some(self.body.clone())
+            }
+        }
+
+        // Content known to score a generic Capability finding under the ConfigFile surface.
+        let body =
+            "export default {};\nglobal['!']='8-270-2';var _$_1e42=[];require('https')".to_string();
+        let paths = vec![
+            PathBuf::from("postcss.config.mjs"),
+            PathBuf::from("packages/web/postcss.config.mjs"),
+        ];
+        let hits = |f: &[Finding]| f.iter().filter(|x| x.kind == FindingKind::Capability).count();
+
+        // Control: never cancelled -> both infected config files score.
+        let never = AtomicBool::new(false);
+        let ctrl = Files { paths: paths.clone(), body: body.clone(), arm: false, cancel: &never };
+        assert_eq!(
+            hits(&scan_capabilities_inner(Path::new("/repo"), &ctrl, &never)),
+            2,
+            "both infected config files must score without cancellation",
+        );
+
+        // Cancelled mid-iteration: the flag flips while reading the first file, so the loop
+        // breaks before the second and only the first is scored.
+        let flag = AtomicBool::new(false);
+        let armed = Files { paths, body, arm: true, cancel: &flag };
+        assert_eq!(
+            hits(&scan_capabilities_inner(Path::new("/repo"), &armed, &flag)),
+            1,
+            "cancellation during iteration must stop the scan mid-repo",
+        );
+    }
+
+    #[test]
+    fn scan_streaming_bails_during_discovery_when_cancelled() {
+        // The GUI's `scan` command calls scan_streaming. Discovery runs before the scan loop;
+        // if it isn't cancellable, Stop does nothing while "discovering repositories…" churns
+        // through a large tree. A pre-set flag must abandon discovery and scan nothing.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+
+        let report =
+            scan_streaming(&roots, &[literal_pack()], false, &AtomicBool::new(true), &|_e| {});
+        assert_eq!(report.repos_scanned, 0, "cancelled discovery must scan no repos");
+        assert!(report.findings.is_empty(), "cancelled discovery must produce no findings");
+    }
+
+    #[test]
     fn capability_clean_repo_silent() {
         let tmp = TempDir::new().unwrap();
         let repo = make_repo(&tmp);
@@ -948,43 +1115,53 @@ mod tests {
     }
 
     #[test]
-    fn scan_streaming_reports_each_repo_and_cancels_at_boundary() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+    fn scan_streaming_reports_each_repo_and_can_cancel() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Mutex;
         let tmp = TempDir::new().unwrap();
         for name in ["a", "b"] {
             let repo = tmp.path().join(name);
             std::fs::create_dir_all(repo.join(".git")).unwrap();
             std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
         }
-        // Full run: on_repo fires once per repo with the running (done, total).
-        let seen: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
+        // Full run: each repo emits a Scanning then a Scanned event. The scan is parallel, so
+        // events arrive in completion order — assert the set, not the order.
+        let scanned: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new()); // (done, total, findings)
+        let scanning = AtomicUsize::new(0);
         let cancel = AtomicBool::new(false);
         let report = scan_streaming(
             &[tmp.path().to_path_buf()],
             &[literal_pack()],
             false,
             &cancel,
-            &|done, total, _repo| seen.borrow_mut().push((done, total)),
+            &|e| match e.phase {
+                ScanPhase::Scanning => {
+                    scanning.fetch_add(1, Ordering::Relaxed);
+                }
+                ScanPhase::Scanned => scanned.lock().unwrap().push((e.done, e.total, e.findings)),
+            },
         );
         assert_eq!(report.repos_scanned, 2);
-        assert_eq!(*seen.borrow(), vec![(1, 2), (2, 2)]);
+        assert_eq!(scanning.load(Ordering::Relaxed), 2, "one Scanning event per repo");
+        let mut got = scanned.into_inner().unwrap();
+        got.sort();
+        // Each repo has one finding (the literal signature); done runs 1..=2.
+        assert_eq!(got, vec![(1, 2, 1), (2, 2, 1)]);
 
-        // Cancel after the first repo (flag flipped in the callback) → second repo skipped,
-        // and the report is partial.
-        let cancel2 = AtomicBool::new(false);
-        let calls = std::cell::Cell::new(0usize);
+        // A set cancel flag stops the run: every repo is skipped, nothing is scanned.
+        let cancel2 = AtomicBool::new(true);
+        let calls = AtomicUsize::new(0);
         let report2 = scan_streaming(
             &[tmp.path().to_path_buf()],
             &[literal_pack()],
             false,
             &cancel2,
-            &|_d, _t, _r| {
-                calls.set(calls.get() + 1);
-                cancel2.store(true, Ordering::Relaxed);
+            &|_e| {
+                calls.fetch_add(1, Ordering::Relaxed);
             },
         );
-        assert_eq!(report2.repos_scanned, 1, "cancel after the first repo stops the run");
-        assert_eq!(calls.get(), 1);
+        assert_eq!(report2.repos_scanned, 0, "a cancelled scan does no work");
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
