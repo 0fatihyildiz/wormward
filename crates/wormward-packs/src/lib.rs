@@ -488,6 +488,27 @@ mod tests {
     }
 
     #[test]
+    fn catalog_carries_stage_payload_hashes() {
+        // The engine's whole-file sha256 match is covered in engine.rs; here we assert the pack
+        // actually carries the known stage hashes (parsed as Sha256, not silently dropped). A
+        // real-payload detection test would require shipping the sample bytes, which we don't.
+        use wormward_core::SignatureKind;
+        let pack = polinrider_pack();
+        let sha_sigs: Vec<&str> = pack
+            .manifest
+            .content_signatures
+            .iter()
+            .filter(|s| s.kind == SignatureKind::Sha256)
+            .map(|s| s.value.as_str())
+            .collect();
+        assert!(sha_sigs.len() >= 8, "expected >=8 sha256 stage hashes, got {}", sha_sigs.len());
+        assert!(
+            sha_sigs.contains(&"d4e269df0f50998c7ebf2bf56945d3d615fd6516702b1da8ac030ffcba735263"),
+            "missing Stage-4 BeaverTail hash"
+        );
+    }
+
+    #[test]
     fn legit_solana_and_bsc_rpc_not_flagged() {
         // FP guard: legit dApps reference these RPC hosts. They are deliberately NOT literal
         // IOCs — only the capability engine flags them in combination with xor + eval. A plain

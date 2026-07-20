@@ -107,6 +107,33 @@ content_signatures:
   - id: entropy-tail
     kind: entropy-over
     value: "7.0"
+  # Known payload SHA256s (rr-research, byte-exact against published samples). Whole-file digest
+  # match — survives any string/marker rotation, and cannot false-positive (a clean file never
+  # collides with a payload hash). Text stages only; binary Stage-4 hash kept for cache/history use.
+  - id: hash-stage1-loader
+    kind: sha256
+    value: "7488bc6b91a32c02fcfa17c80c9fd297d638e6d548a0fc0d8ea43d08da0bacb1"
+  - id: hash-stage1-ref
+    kind: sha256
+    value: "904afe0337fbbd79def403b3204f75b4c5fbe4e2271252d22c0307f9cbd14646"
+  - id: hash-stage3-recursive
+    kind: sha256
+    value: "11e87f7f27b3cf1a51e0b4b3903decd8945b5959eedf3cbc6be1920dab3c8823"
+  - id: hash-stage3-eval
+    kind: sha256
+    value: "f9bb6118d7e9d2024dcb6a453f27c4ee33d12dbf7c659748bb6d9f816514a904"
+  - id: hash-stage4-beavertail
+    kind: sha256
+    value: "d4e269df0f50998c7ebf2bf56945d3d615fd6516702b1da8ac030ffcba735263"
+  - id: hash-stage3-var-a
+    kind: sha256
+    value: "32af4c538e484bb0c3d2a7e8967728ab3f73e7e605c00281561ecc24d99ef11c"
+  - id: hash-stage3-var-b
+    kind: sha256
+    value: "6ab500ef10c246f595e3ff48a54df276b884ce11088e0a50ac1385ccf8225e1a"
+  - id: hash-stage3-var-c
+    kind: sha256
+    value: "9ce4e50f0cb2b400153a4b32af4a6a8357bd0160fada71dd5f115b66303f220d"
 
 artifacts:
   - path: "temp_auto_push.bat"
