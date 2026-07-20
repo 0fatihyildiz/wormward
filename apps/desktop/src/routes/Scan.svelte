@@ -81,12 +81,31 @@
   <section class="card">
     <div class="field">
       <div class="row between">
-        <span class="field-label">Target folders</span>
-        <button class="btn sm" onclick={choose} disabled={app.scanning}>Choose folders…</button>
+        <span class="field-label">Target folders {#if app.dirs.length}<span class="muted">({app.dirs.length})</span>{/if}</span>
+        <div class="row" style="gap: 6px">
+          {#if app.dirs.length}
+            <button class="btn ghost sm" onclick={() => (app.dirs = [])} disabled={app.scanning}>Clear</button>
+          {/if}
+          <button class="btn sm" onclick={choose} disabled={app.scanning}>Choose folders…</button>
+        </div>
       </div>
-      <p class="path-preview mono" class:empty={!app.dirs.length}>
-        {app.dirs.length ? app.dirs.join("  ·  ") : "No folder chosen — pick one to scan."}
-      </p>
+      {#if app.dirs.length}
+        <div class="chips">
+          {#each app.dirs as d (d)}
+            <span class="folder-chip mono" title={d}>
+              <span class="fc-path">{d}</span>
+              <button
+                class="fc-x"
+                aria-label="Remove {d}"
+                disabled={app.scanning}
+                onclick={() => (app.dirs = app.dirs.filter((x) => x !== d))}>×</button
+              >
+            </span>
+          {/each}
+        </div>
+      {:else}
+        <p class="path-preview mono empty">No folder chosen — pick one to scan.</p>
+      {/if}
     </div>
 
     <fieldset class="opts">
@@ -187,6 +206,29 @@
     word-break: break-all;
   }
   .path-preview.empty { color: var(--faint); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .folder-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    font-size: 11.5px;
+    color: var(--fg);
+    background: var(--inset);
+    border-radius: var(--radius-sm);
+    padding: 4px 4px 4px 10px;
+  }
+  .fc-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fc-x {
+    flex: none;
+    background: none;
+    color: var(--faint);
+    font-size: 15px;
+    line-height: 1;
+    padding: 0 5px;
+    border-radius: 4px;
+  }
+  .fc-x:hover:not(:disabled) { color: var(--danger); background: var(--danger-tint); }
   .opts { display: flex; flex-direction: column; gap: 4px; padding: 2px 0; margin: 0; border: 0; min-width: 0; }
   .opt-note {
     font-size: 11.5px;
