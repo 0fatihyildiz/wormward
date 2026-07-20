@@ -77,9 +77,15 @@ content_signatures:
   - id: padding-run
     kind: regex
     value: '\x20{200,}'
+  # Last-512-byte tail entropy. Ordinary dense source (an Express index.js, a Next
+  # config) sits around 5.1-5.4 bits/byte, so a 5.0 threshold false-flagged clean
+  # files as critical infections. Raised to 7.0 so ONLY genuinely near-random content
+  # (encrypted/compressed/binary blobs smuggled into a config) fires — text payloads,
+  # including base64 (~6.0 ceiling), are caught structurally by decoder-pattern /
+  # padding-run / the analyzer, not by entropy.
   - id: entropy-tail
     kind: entropy-over
-    value: "5.0"
+    value: "7.0"
 
 artifacts:
   - path: "temp_auto_push.bat"
@@ -122,3 +128,17 @@ remediation:
       # Single-quoted YAML: '' -> ' and backslashes are literal, so this loads as
       # exactly re:global\[('|\x22)[^'\x22]+('|\x22)\]\s*= (see the pack round-trip test).
       - 're:global\[(''|\x22)[^''\x22]+(''|\x22)\]\s*='
+      # Appended-payload structure: a long space-padding run precedes the obfuscated
+      # blob. Stripping from the first 200+ space run removes the padding AND everything
+      # after it (dot/variable-key globals, decoder IIFE, payload) in one cut. A run this
+      # long is already a critical detection signature (padding-run), never legit source.
+      - 're:\x20{200,}'
+      # Dot-notation version tag (`global.i='5-3-168'`, `global.o='5-3-235-du'`). Bracket
+      # markers above miss this variant, and a variable-key `global[_$_46e0[0]]=` shim
+      # cannot be matched by a quoted-key regex. Assigning a digit-dash version string to
+      # a global via dot-notation is a worm tell, not legitimate config code. Fallback cut
+      # for a no-padding variant; harmless when the padding run matches earlier.
+      - 're:global\.[A-Za-z_$][\w$]*=(''|\x22)[0-9]+-[0-9]'
+      # Decoder IIFE definition (`var _$_46e0=(function`). Last-resort cut if a variant
+      # ships neither padding nor a version tag; the decoder is never legitimate.
+      - 're:_\$_[0-9a-f]{4,}=\(function'

@@ -308,4 +308,61 @@ mod tests {
         .unwrap();
         assert!(scan_repo(&repo, &builtin_packs()).is_empty());
     }
+
+    #[test]
+    fn clean_dense_source_not_flagged_by_entropy_tail() {
+        // Regression: ordinary, dense source files (an Express server index.js, a
+        // Next.js config) have a last-512-byte tail entropy of ~5.1-5.4. The old
+        // entropy-tail threshold of 5.0 false-flagged them as CRITICAL polinrider
+        // infections even though they carry no decoder, padding, marker, or C2. With
+        // no strippable action, they surfaced as "not auto-fixable" noise on clean
+        // repos. Real payloads are still caught by decoder-pattern / padding-run.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("clean");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let dense = "#!/usr/bin/env node\nconst express = require('express');\nconst app = express();\napp.get('/', (req, res) => {\n  res.json({\n    name: 'demo', version: '0.1.0',\n    features: ['No Code Required', 'Lightning Fast', 'AI-Powered', 'Universal Compatibility'],\n    endpoints: { 'POST /api/generate': 'Generate', 'GET /api/health': 'Health check' },\n  });\n});\napp.listen(3000, () => { console.log(`Server running on port 3000 for API info & docs.`); });\nmodule.exports = app;\n";
+        fs::write(repo.join("index.js"), dense).unwrap();
+        assert!(
+            scan_repo(&repo, &builtin_packs()).is_empty(),
+            "dense but clean source must not be flagged by the entropy-tail signature"
+        );
+    }
+
+    #[test]
+    fn padding_and_dot_notation_variant_is_auto_fixable() {
+        // The real-world variant seen on infected repos: a legitimate config, then a
+        // long space-padding run, then a dot-notation `global.i='<version>'` tag and an
+        // `_$_xxxx` decoder IIFE. The configured strip markers deliberately excluded
+        // dot-notation and could not match the variable-key `global[_$_...]=` shim, so
+        // the payload was detected but not auto-strippable. It must now strip cleanly.
+        use wormward_core::plan_remediation;
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let legit = "export default { plugins: { tailwindcss: {}, autoprefixer: {} } };";
+        let payload = "global.i='5-3-168';var _$_46e0=(function(r,i){return r})('ABCD',7);global[_$_46e0[0]]=1;var q='rmcej%otb%';";
+        let infected = format!("{legit}{}{payload}", " ".repeat(260));
+        fs::write(repo.join("postcss.config.mjs"), &infected).unwrap();
+
+        let packs = builtin_packs();
+        let findings = scan_repo(&repo, &packs);
+        assert!(!findings.is_empty(), "variant must still be detected");
+
+        let plan = plan_remediation(&findings, &packs);
+        assert!(
+            !plan.actions.is_empty(),
+            "variant must now map to a strip action (auto-fixable)"
+        );
+        let res = wormward_core::apply(&repo, &plan.actions, false);
+        assert!(!res.applied.is_empty(), "strip must actually apply");
+
+        // The file is reduced to exactly the legitimate config prefix...
+        let cleaned = fs::read_to_string(repo.join("postcss.config.mjs")).unwrap();
+        assert_eq!(cleaned, format!("{legit}\n"));
+        // ...and a re-scan finds nothing (verify-after-strip would pass).
+        assert!(
+            scan_repo(&repo, &packs).is_empty(),
+            "no signature may survive the strip"
+        );
+    }
 }
