@@ -77,6 +77,14 @@ impl CampaignAnalyzer for PolinriderAnalyzer {
     }
 }
 
+/// The PolinRider obfuscation fingerprint as a reusable predicate over arbitrary text — a
+/// process command line, a cache file, a config blob — returning the confirmation reason or
+/// `None`. Shared with the file analyzer (`PolinriderAnalyzer::analyze`) so machine-level checks
+/// (`wormward doctor`) can never drift from the repo scanner's detection.
+pub fn polinrider_fingerprint(text: &str) -> Option<String> {
+    PolinriderAnalyzer::confirm(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

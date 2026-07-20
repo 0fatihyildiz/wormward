@@ -1,6 +1,6 @@
 mod analyzer;
 
-pub use analyzer::PolinriderAnalyzer;
+pub use analyzer::{polinrider_fingerprint, PolinriderAnalyzer};
 
 use wormward_core::{Pack, PackManifest};
 

@@ -1,3 +1,4 @@
+mod doctor;
 mod report;
 mod select;
 
@@ -124,6 +125,17 @@ enum Command {
         /// rotate-first gate that otherwise refuses to push when the audit flags a persistence risk.
         #[arg(long = "i-rotated")]
         i_rotated: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    /// Machine-level PolinRider check (macOS): running loader processes (and later tainted
+    /// caches + trigger paths). Complements the repo scan; read-only. Reuses the same
+    /// obfuscation fingerprint as the file analyzer.
+    Doctor {
+        /// Poll for this many seconds (every 5s) to catch a loader that only respawns on a
+        /// trigger — open your editor/projects during the window. Omit for a single snapshot.
+        #[arg(long)]
+        watch: Option<u64>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -733,6 +745,37 @@ fn main() -> ExitCode {
             let audit_blocked = account_audit.as_ref().is_some_and(|a| a.blocked);
             ExitCode::from(github_exit_code(&outcomes).max(u8::from(audit_blocked)))
         }
+        Command::Doctor { watch, format } => match watch {
+            None => {
+                let report = doctor::check();
+                match format {
+                    OutputFormat::Text => print!("{}", doctor::render_text(&report)),
+                    OutputFormat::Json => println!("{}", doctor::render_json(&report)),
+                }
+                ExitCode::from(u8::from(report.has_findings()))
+            }
+            Some(secs) => {
+                // Poll across the window so a loader that only fires on a trigger is caught.
+                let interval = 5u64;
+                let iters = (secs / interval).max(1);
+                let mut ever = false;
+                for i in 0..iters {
+                    let report = doctor::check();
+                    ever |= report.has_findings();
+                    println!("poll {}/{}: {} loader process(es)", i + 1, iters, report.processes.len());
+                    for h in &report.processes {
+                        println!("  ✗ pid {} — {}", h.pid, h.reason);
+                    }
+                    if i + 1 < iters {
+                        std::thread::sleep(std::time::Duration::from_secs(interval));
+                    }
+                }
+                if !ever {
+                    println!("✓ no loader seen across the {secs}s watch window");
+                }
+                ExitCode::from(u8::from(ever))
+            }
+        },
     }
 }
 

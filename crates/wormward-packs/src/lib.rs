@@ -1,7 +1,7 @@
 mod polinrider;
 mod shai_hulud;
 
-pub use polinrider::polinrider_pack;
+pub use polinrider::{polinrider_fingerprint, polinrider_pack};
 pub use shai_hulud::shai_hulud_pack;
 
 use wormward_core::Pack;
