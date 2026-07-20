@@ -72,14 +72,19 @@ pub fn is_excluded_path(path: &Path) -> bool {
     {
         return true;
     }
-    let path_str = path.to_string_lossy().replace('\\', "/");
-    // Content-addressed package-manager stores/caches: blob stores + `*-index.json` metadata. These
-    // are noise (not an install tree, pruned so paths go stale, blobs not executed) — meaningful
-    // detection is a package INSTALLED into a project, not a cache blob.
+    // Content-addressed package-manager stores/caches (pnpm / npm / bun / yarn-berry): blob stores +
+    // metadata. Not an install tree — pruned, stale, and NOT executed; scanning them only produced
+    // noise and FPs (e.g. legit `@babel/parser` and `node-fetch` under `.bun/install/cache/` tripped
+    // the capability engine's `.exec(`/network/trailing-code on ordinary library bundles). Meaningful
+    // detection is a package INSTALLED into a project, not a cache blob. The leading-slash prefix
+    // normalizes the check so a cache dir at the repo ROOT (`.bun/…`) matches like a nested one.
+    let path_str = format!("/{}", path.to_string_lossy().replace('\\', "/"));
     if path_str.contains("/.pnpm/")
         || path_str.contains("/pnpm/store/")
-        || path_str.contains("Library/pnpm/store/")
         || path_str.contains("/.npm/_cacache/")
+        || path_str.contains("/.bun/install/cache/")
+        || path_str.contains("/.yarn/cache/")
+        || path_str.contains("/.yarn/unplugged/")
     {
         return true;
     }
@@ -213,6 +218,12 @@ mod tests {
             "/Users/me/Library/pnpm/store/v3/files/ab/cdef-index.json"
         )));
         assert!(is_excluded_path(Path::new("/Users/me/.npm/_cacache/content-v2/x")));
+        // Package-manager caches at the repo ROOT (bun / yarn-berry) — the @rive/@babel/node-fetch
+        // FP class: legit library bundles in a CAS cache must not be content-scanned.
+        assert!(is_excluded_path(Path::new(".bun/install/cache/@babel/parser@7.29.3@@@1/lib/index.js")));
+        assert!(is_excluded_path(Path::new("ws/.bun/install/cache/node-fetch@2.7.0@@@1/lib/index.js")));
+        assert!(is_excluded_path(Path::new(".yarn/cache/lodash-npm-4.17.21.zip")));
+        assert!(is_excluded_path(Path::new(".yarn/unplugged/sharp/node/index.js")));
         // Real source is NOT excluded.
         assert!(!is_excluded_path(Path::new("postcss.config.mjs")));
         assert!(!is_excluded_path(Path::new("src/index.js")));

@@ -46,9 +46,16 @@ contain executable JS.
 2. **Surface exclusions** — these paths are never content-scanned
    (`crates/wormward-core/src/surface.rs` `is_excluded_path`):
    - lockfiles: `yarn.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `*.lock`
-   - CAS stores: `**/.pnpm/**`, `**/pnpm/store/**`, `Library/pnpm/store/**`, `**/.npm/_cacache/**`
+   - CAS stores: `**/.pnpm/**`, `**/pnpm/store/**`, `**/.npm/_cacache/**`, `**/.bun/install/cache/**`,
+     `**/.yarn/cache/**`, `**/.yarn/unplugged/**` (every package-manager blob cache)
    - Lockfiles are still **parsed by name** for malicious package versions in `check_lockfiles` —
      that path is unaffected; only *content-scanning them for obfuscation* is suppressed.
+
+   Real case: legit `@babel/parser` and `node-fetch` bundles under `.bun/install/cache/` tripped the
+   **capability engine** (`network-egress` / `.exec(` matching a regex `.exec()` read as
+   `process-spawn` / `trailing-code` on the bundle's `exports.x = y` tail). Both scan passes honor
+   `is_excluded_path` (`scanner.rs`), so excluding the cache dir suppresses it in both — the CAS
+   store is not an install tree, so a library bundle there is never a meaningful detection.
 3. **`doctor` cache targets drop the CAS blob stores** (`crates/wormward-doctor/src/lib.rs`
    `candidate_cache_dirs`): only exec/install trees are scanned (npx exec cache, node-gyp, TS ATA
    cache, global `node_modules`) — not the pnpm/yarn tarball caches. Plus an `is_metadata_file`
