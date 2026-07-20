@@ -863,6 +863,65 @@ pub fn scan_history(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
     findings
 }
 
+/// Author↔committer timestamp gap (seconds) above which a commit is flagged as anti-dated. A
+/// normal rebase keeps the two within minutes/hours; a clock-rewound `--amend` (temp_auto_push.bat)
+/// or a deliberately anti-dated commit opens a large gap. 24h keeps benign rebases quiet.
+const DATE_SKEW_THRESHOLD_SECS: i64 = 24 * 3600;
+
+/// Cap on date-skew findings per repo.
+const MAX_DATE_SKEW_HITS: usize = 100;
+
+/// Opt-in git-forensic scan: flag commits whose author and committer timestamps diverge by more
+/// than [`DATE_SKEW_THRESHOLD_SECS`] — a tell of anti-dated / clock-manipulated commits. Advisory
+/// (Medium, non-remediable); a large gap can also be a legitimate long-delayed rebase, so the
+/// evidence says so. Campaign-agnostic (no pack needed).
+pub fn scan_date_skew(repo: &Path) -> Vec<Finding> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "--all", "--no-show-signature", "--format=%H%x1f%at%x1f%ct%x1f%an"])
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let mut findings = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if findings.len() >= MAX_DATE_SKEW_HITS {
+            break;
+        }
+        let mut p = line.split('\u{1f}');
+        let (Some(sha), Some(at), Some(ct), author) =
+            (p.next(), p.next(), p.next(), p.next().unwrap_or(""))
+        else {
+            continue;
+        };
+        let (Ok(at), Ok(ct)) = (at.parse::<i64>(), ct.parse::<i64>()) else {
+            continue;
+        };
+        let gap = (at - ct).abs();
+        if gap > DATE_SKEW_THRESHOLD_SECS {
+            let short = sha.chars().take(12).collect::<String>();
+            let days = gap / 86_400;
+            findings.push(Finding {
+                campaign: "generic".into(),
+                severity: Severity::Medium,
+                repo: repo.to_path_buf(),
+                file: None,
+                signature_id: "git-date-skew".into(),
+                kind: FindingKind::DateSkew,
+                evidence: format!(
+                    "commit {short} ({author}) author/committer dates differ by ~{days}d — possible anti-dated commit (or a long-delayed rebase)"
+                ),
+                remediable: false,
+                online: None,
+                git_ref: Some(short),
+            });
+        }
+    }
+    findings
+}
+
 pub fn scan_deep(roots: &[PathBuf], packs: &[Pack]) -> ScanReport {
     let mut repos: Vec<PathBuf> = Vec::new();
     for root in roots {

@@ -230,6 +230,7 @@ fn main() -> ExitCode {
                 for dir in &dirs {
                     for repo in discover_repos(dir) {
                         report.findings.extend(scan_history(&repo, &packs));
+                        report.findings.extend(wormward_core::scan_date_skew(&repo));
                     }
                 }
             }

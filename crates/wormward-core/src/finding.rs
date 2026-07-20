@@ -23,6 +23,9 @@ pub enum FindingKind {
     /// A payload marker found in a past commit via `git log --all -S` — the working tree/tips are
     /// clean but the infection is still reachable via `git checkout`. Advisory, non-remediable.
     HistoryHit,
+    /// A commit whose author and committer timestamps diverge far beyond a normal rebase — a tell
+    /// of anti-dated / clock-manipulated commits (e.g. `temp_auto_push.bat`). Advisory.
+    DateSkew,
     Analyzer,
     Capability,
     /// A GitHub account-persistence finding (over-privileged token, injected SSH key, rogue
@@ -86,6 +89,11 @@ mod tests {
     #[test]
     fn history_hit_kind_serializes() {
         assert_eq!(serde_json::to_string(&FindingKind::HistoryHit).unwrap(), "\"history_hit\"");
+    }
+
+    #[test]
+    fn date_skew_kind_serializes() {
+        assert_eq!(serde_json::to_string(&FindingKind::DateSkew).unwrap(), "\"date_skew\"");
     }
 
     fn sample_finding(online: Option<OnlineVerdict>) -> Finding {

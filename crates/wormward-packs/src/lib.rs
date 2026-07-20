@@ -570,6 +570,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn date_skew_flags_antidated_commit() {
+        use std::process::Command;
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str], cdate: &str| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                // Author date now; committer date backdated ~1 year (clock-rewind tell).
+                .env("GIT_AUTHOR_DATE", "2026-07-20T12:00:00")
+                .env("GIT_COMMITTER_DATE", cdate)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"], "2026-07-20T12:00:00");
+        fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "-A"], "2026-07-20T12:00:00");
+        git(&["commit", "-q", "-m", "antidated"], "2025-01-08T00:00:00");
+
+        let hits = wormward_core::scan_date_skew(&repo);
+        assert!(
+            hits.iter().any(|f| f.kind == FindingKind::DateSkew && f.git_ref.is_some()),
+            "a commit with a large author/committer date gap must be flagged, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn date_skew_quiet_on_normal_commit() {
+        use std::process::Command;
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        fs::write(repo.join("f.txt"), "hi").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "normal"]);
+        assert!(
+            wormward_core::scan_date_skew(&repo).is_empty(),
+            "a normal commit (author≈committer) must not be flagged"
+        );
+    }
+
     // ---- Phase 1 lockfile / dependency detection (G2) ----
 
     #[test]
