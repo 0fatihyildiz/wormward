@@ -72,7 +72,10 @@
       const osmToken = localStorage.getItem("osm_token") || undefined;
       const [machine, repos] = await Promise.all([
         doctor(),
-        scan(app.dirs, false, !!osmToken, osmToken),
+        // Full Scan is thorough: deep=true also checks the latest commit on every branch
+        // (worms hide on non-default branches). Branch-tip findings surface with git_ref set
+        // and are cleaned from the Advanced area, not the working-tree "Remove threats" button.
+        scan(app.dirs, true, !!osmToken, osmToken),
       ]);
       app.machineReport = machine;
       app.report = repos;
@@ -114,7 +117,7 @@
       // Repositories detail must NOT keep showing threats we just removed (honest state,
       // mirrors Workspace.apply()'s re-run). scan() is already imported (Task 3.3).
       const osmToken = localStorage.getItem("osm_token") || undefined;
-      app.report = await scan(app.dirs, false, !!osmToken, osmToken);
+      app.report = await scan(app.dirs, true, !!osmToken, osmToken);
       app.lastScanAt = Date.now();
       removedSummary =
         `Removed ${s.applied} ${plural(s.applied, "threat", "threats")} across ${s.repos} ${plural(s.repos, "place", "places")}.` +
