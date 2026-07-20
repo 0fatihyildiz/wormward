@@ -4,7 +4,7 @@
   import Home from "./routes/Home.svelte";
   import Workspace from "./routes/Workspace.svelte";
   import ScanFlow from "./routes/ScanFlow.svelte";
-  import GitHub from "./routes/GitHub.svelte";
+  import Advanced from "./routes/Advanced.svelte";
   import Doctor from "./routes/Doctor.svelte";
   import Settings from "./routes/Settings.svelte";
   import { fly } from "svelte/transition";
@@ -22,7 +22,7 @@
     flow: ScanFlow,
     machine: Doctor,
     repos: Workspace,
-    advanced: GitHub,
+    advanced: Advanced,
     settings: Settings,
   };
 
