@@ -89,7 +89,7 @@ mod tests {
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::write(
             repo.join("postcss.config.mjs"),
-            "export default {};\nglobal['!']='8-270-2';var _$_1e42=[];",
+            "export default {};\nglobal['!']='8-270-2';var _$_1e42=(function(a,b){return a})('x',7);",
         )
         .unwrap();
 
@@ -280,7 +280,7 @@ mod tests {
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::write(
             repo.join("postcss.config.mjs"),
-            "export default {};\nglobal.o='5-3-235-du';var _$_8e2c=[];",
+            "export default {};\nglobal.o='5-3-235-du';var _$_8e2c=(function(a,b){return a})('x',7);",
         )
         .unwrap();
         let f = scan_repo(&repo, &builtin_packs());
@@ -715,7 +715,7 @@ mod tests {
         // Entrypoint carries the injected v1 payload.
         fs::write(
             pkg.join("index.js"),
-            "module.exports={};\nglobal['!']='8-270-2';var _$_1e42=[];",
+            "module.exports={};\nglobal['!']='8-270-2';var _$_1e42=(function(a,b){return a})('x',7);",
         )
         .unwrap();
 

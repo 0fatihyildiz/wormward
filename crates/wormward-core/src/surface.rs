@@ -56,7 +56,31 @@ fn basename(path: &Path) -> String {
 /// in source config. Applied uniformly across every file source (working tree, git tree,
 /// API tree) so their scanned file sets match.
 pub fn is_excluded_path(path: &Path) -> bool {
-    if basename(path).contains(".min.") {
+    let bn = basename(path);
+    if bn.contains(".min.") {
+        return true;
+    }
+    // Lockfiles are inert data — package names, URLs, and SHA/integrity hashes, no executable code.
+    // Their hashes tripped the decoder/shuffle-seed matcher (a "MDy" substring in base64, digit runs
+    // inside a tarball SHA). Never content-scan them; they map to no auto-run surface. (Lockfiles are
+    // still PARSED by name for malicious packages in `check_lockfiles` — that path is unaffected.)
+    if bn == "yarn.lock"
+        || bn == "package-lock.json"
+        || bn == "npm-shrinkwrap.json"
+        || bn == "pnpm-lock.yaml"
+        || bn.ends_with(".lock")
+    {
+        return true;
+    }
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    // Content-addressed package-manager stores/caches: blob stores + `*-index.json` metadata. These
+    // are noise (not an install tree, pruned so paths go stale, blobs not executed) — meaningful
+    // detection is a package INSTALLED into a project, not a cache blob.
+    if path_str.contains("/.pnpm/")
+        || path_str.contains("/pnpm/store/")
+        || path_str.contains("Library/pnpm/store/")
+        || path_str.contains("/.npm/_cacache/")
+    {
         return true;
     }
     path.components().any(|comp| {
@@ -175,6 +199,23 @@ mod tests {
     #[test]
     fn config_toolchain() {
         assert_eq!(c("postcss.config.mjs"), Some(Surface::ConfigFile));
+    }
+
+    #[test]
+    fn lockfiles_and_stores_excluded_from_content_scan() {
+        // Inert package-manager data — never content-scanned (they FP'd the decoder/seed matcher).
+        assert!(is_excluded_path(Path::new("frontend/yarn.lock")));
+        assert!(is_excluded_path(Path::new("package-lock.json")));
+        assert!(is_excluded_path(Path::new("pnpm-lock.yaml")));
+        assert!(is_excluded_path(Path::new("Cargo.lock")));
+        assert!(is_excluded_path(Path::new("node_modules/.pnpm/foo@1/node_modules/foo/x.js")));
+        assert!(is_excluded_path(Path::new(
+            "/Users/me/Library/pnpm/store/v3/files/ab/cdef-index.json"
+        )));
+        assert!(is_excluded_path(Path::new("/Users/me/.npm/_cacache/content-v2/x")));
+        // Real source is NOT excluded.
+        assert!(!is_excluded_path(Path::new("postcss.config.mjs")));
+        assert!(!is_excluded_path(Path::new("src/index.js")));
     }
     #[test]
     fn config_nested() {

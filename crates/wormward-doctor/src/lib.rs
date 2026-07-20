@@ -180,38 +180,40 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
 }
 
-/// All candidate toolchain cache dirs (whether present or not) that may hold worm-executed
-/// artifacts. Pure and env-injected so it is unit-testable; [`cache_targets`] filters to the
-/// present ones. Covers the npx exec cache, the TypeScript ATA cache, the yarn/pnpm stores, the
-/// node-gyp cache, and the global `node_modules` roots — the dropper lands in any of these, not
-/// just `_npx`. The `MAX_CACHE_FILES` bound keeps a huge global store from stalling the scan.
-pub fn candidate_cache_dirs(home: &Path, pnpm_home: Option<&Path>) -> Vec<PathBuf> {
-    let mut dirs = vec![
+/// Candidate toolchain dirs that hold worm-EXECUTED artifacts: the npx exec cache (where `npx`
+/// extracts and RUNS packages), the node-gyp + TypeScript ATA caches, and the global `node_modules`
+/// install trees. Pure so it is unit-testable; [`cache_targets`] filters to the present ones.
+///
+/// Deliberately EXCLUDES content-addressed package-manager stores (the pnpm store, yarn/npm tarball
+/// caches). Those are inert blob caches: pruned (so reported paths go stale), not executed, and
+/// redundant with scanning the INSTALLED tree. Scanning them only produced noise and false
+/// positives on integrity / `*-index.json` metadata — meaningful detection is a package installed
+/// into a project, not a cache blob.
+pub fn candidate_cache_dirs(home: &Path) -> Vec<PathBuf> {
+    vec![
         home.join(".npm/_npx"),
         home.join(".node-gyp"),
         home.join("Library/Caches/typescript"),
-        home.join("Library/Caches/Yarn"),
-        home.join(".cache/yarn"),
-        home.join("Library/pnpm"),
-        home.join(".local/share/pnpm"),
         PathBuf::from("/opt/homebrew/lib/node_modules"),
         PathBuf::from("/usr/local/lib/node_modules"),
-    ];
-    if let Some(p) = pnpm_home {
-        dirs.push(p.to_path_buf());
-    }
-    dirs
+    ]
 }
 
-/// Toolchain cache dirs (present ones only) that may hold worm-executed artifacts — machine-level
-/// state the repo scan does not cover.
+/// Toolchain dirs (present ones only) that may hold worm-executed artifacts — machine-level state
+/// the repo scan does not cover.
 pub fn cache_targets() -> Vec<PathBuf> {
-    let home = home_dir();
-    let pnpm_home = std::env::var_os("PNPM_HOME").map(PathBuf::from);
-    candidate_cache_dirs(&home, pnpm_home.as_deref())
-        .into_iter()
-        .filter(|p| p.is_dir())
-        .collect()
+    candidate_cache_dirs(&home_dir()).into_iter().filter(|p| p.is_dir()).collect()
+}
+
+/// Inert package-manager metadata that must never be content-scanned (lockfiles + pnpm store
+/// `*-index.json`): package names, URLs, and SHA/integrity hashes, not code.
+fn is_metadata_file(path: &Path) -> bool {
+    let bn = path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    bn == "yarn.lock"
+        || bn == "package-lock.json"
+        || bn == "pnpm-lock.yaml"
+        || bn.ends_with(".lock")
+        || bn.ends_with("-index.json")
 }
 
 /// Recursively collect regular files under `dir` (bounded; symlinks not followed).
@@ -240,6 +242,7 @@ pub fn scan_cache_dir(dir: &Path) -> Vec<CacheHit> {
     collect_files(dir, &mut files);
     let contents: Vec<(PathBuf, String)> = files
         .into_iter()
+        .filter(|p| !is_metadata_file(p))
         .filter(|p| std::fs::metadata(p).map(|m| m.len() <= MAX_FILE_BYTES).unwrap_or(false))
         .filter_map(|p| std::fs::read_to_string(&p).ok().map(|c| (p, c)))
         .collect();
@@ -939,22 +942,31 @@ mod tests {
     }
 
     #[test]
-    fn cache_candidates_cover_pnpm_yarn_global() {
+    fn cache_candidates_are_exec_and_install_trees_not_cas_stores() {
         let home = PathBuf::from("/home/u");
-        let c = candidate_cache_dirs(&home, None);
+        let c = candidate_cache_dirs(&home);
+        // Exec / install trees where worm code actually runs.
         assert!(c.contains(&home.join(".npm/_npx")));
         assert!(c.contains(&home.join("Library/Caches/typescript")));
-        assert!(c.contains(&home.join("Library/pnpm")) || c.contains(&home.join(".local/share/pnpm")));
-        assert!(c.iter().any(|p| p.ends_with("Caches/Yarn") || p.ends_with(".cache/yarn")));
         assert!(c.contains(&home.join(".node-gyp")));
         assert!(c.iter().any(|p| p.ends_with("lib/node_modules")));
+        // Content-addressed blob stores are EXCLUDED — inert, pruned, redundant with the install
+        // tree; scanning them produced noise + FPs on integrity / *-index.json metadata.
+        assert!(!c.iter().any(|p| p.to_string_lossy().contains("pnpm")));
+        assert!(!c.iter().any(|p| {
+            let s = p.to_string_lossy();
+            s.contains("Caches/Yarn") || s.contains(".cache/yarn")
+        }));
     }
 
     #[test]
-    fn pnpm_home_override_is_included() {
-        let home = PathBuf::from("/home/u");
-        let store = PathBuf::from("/opt/pnpm-store");
-        assert!(candidate_cache_dirs(&home, Some(&store)).contains(&store));
+    fn metadata_files_are_not_content_scanned() {
+        assert!(is_metadata_file(Path::new("/x/yarn.lock")));
+        assert!(is_metadata_file(Path::new("/x/pnpm-lock.yaml")));
+        assert!(is_metadata_file(Path::new("/x/Cargo.lock")));
+        assert!(is_metadata_file(Path::new("/store/ab/cdef-index.json")));
+        assert!(!is_metadata_file(Path::new("/x/postcss.config.mjs")));
+        assert!(!is_metadata_file(Path::new("/x/index.js")));
     }
 
     #[test]
