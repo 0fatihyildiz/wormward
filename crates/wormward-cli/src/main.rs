@@ -98,6 +98,12 @@ enum Command {
         /// Fix every infected repo without the interactive selection prompt.
         #[arg(long)]
         all: bool,
+        /// DANGER: rewrite ALL git history (git-filter-repo) to redact injection markers from every
+        /// commit/tag — for a payload that was committed then force-pushed. Dry-run unless --yes.
+        /// Marker-redaction, not a surgical strip; a clean-commit rebuild is still best. Tags a
+        /// backup ref before rewriting.
+        #[arg(long = "rewrite-history")]
+        rewrite_history: bool,
     },
     /// Restore files from the latest wormward backup.
     Restore {
@@ -370,12 +376,52 @@ fn main() -> ExitCode {
             all_branches,
             yes,
             all,
+            rewrite_history,
         } => {
             for dir in &dirs {
                 if !dir.exists() {
                     eprintln!("error: path does not exist: {}", dir.display());
                     return ExitCode::from(2);
                 }
+            }
+            if rewrite_history {
+                if !wormward_core::git_filter_repo_available() {
+                    eprintln!("error: git-filter-repo is not installed (https://github.com/newren/git-filter-repo)");
+                    return ExitCode::from(2);
+                }
+                let packs = builtin_packs();
+                let dry = !yes;
+                let mut any_err = false;
+                for dir in &dirs {
+                    for repo in discover_repos(dir) {
+                        if !dry {
+                            // Tag a backup ref at the current HEAD before rewriting history.
+                            let _ = std::process::Command::new("git")
+                                .arg("-C")
+                                .arg(&repo)
+                                .args(["tag", "-f", "wormward-backup/pre-rewrite", "HEAD"])
+                                .status();
+                        }
+                        match wormward_core::rewrite_history(&repo, &packs, dry) {
+                            Ok(out) => {
+                                let status = if dry {
+                                    "history-rewrite DRY-RUN ok (pass --yes to apply; then force-push)"
+                                } else {
+                                    "history rewritten (backup tag: wormward-backup/pre-rewrite) — force-push required"
+                                };
+                                println!("{}: {status}", repo.display());
+                                if !out.trim().is_empty() {
+                                    print!("{out}");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("{}: history-rewrite failed: {e}", repo.display());
+                                any_err = true;
+                            }
+                        }
+                    }
+                }
+                return ExitCode::from(if any_err { 2 } else { 0 });
             }
             if do_push && !do_apply {
                 eprintln!("error: --push requires --apply");
