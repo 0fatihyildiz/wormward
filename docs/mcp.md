@@ -22,6 +22,20 @@ The two mutating tools default to a **preview** — a connected assistant must p
 explicitly, and `clean` always writes a backup first. System-level steps (a `/etc/hosts` C2 sinkhole)
 are only ever printed, never run.
 
+## Prerequisite — `wormward` must be runnable
+
+MCP clients spawn the command you configure, so `wormward` has to be on your `PATH` (or you point
+the config at an absolute path). Install it once:
+
+```bash
+cargo install --path crates/wormward-cli    # → ~/.cargo/bin/wormward (usually on PATH)
+```
+
+Not installing? Use the absolute path to the built binary instead — e.g. the `command` becomes
+`/path/to/wormward/target/release/wormward` (build it first with
+`cargo build --release -p wormward-cli`). A client error like `Executable not found in $PATH:
+"wormward"` means this step was skipped.
+
 ## Connect a client
 
 **Claude Code**

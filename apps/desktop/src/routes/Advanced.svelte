@@ -370,6 +370,12 @@ args = ["mcp"]`;
       unless explicitly applied). The assistant spawns <span class="mono">wormward mcp</span> itself;
       nothing runs here.
     </p>
+    <p class="muted small">
+      First make <span class="mono">wormward</span> runnable so the client can find it:
+      <span class="mono">cargo install --path crates/wormward-cli</span> — or use the absolute path to
+      the binary in the config below. A <span class="mono">"Executable not found: wormward"</span>
+      error means this step was skipped.
+    </p>
 
     <p class="muted small" style="margin-bottom: 4px">Claude Code</p>
     <div class="row" style="gap: 8px; align-items: flex-start">
