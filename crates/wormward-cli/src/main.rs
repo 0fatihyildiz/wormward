@@ -9,10 +9,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use wormward_core::{
-    amend_head, apply, apply_branch_cleans, branch_remote, commit_paths, current_branch,
-    deep_scan_repo, discover_repos, force_push_with_lease, force_push_with_lease_to, now_secs,
-    plan_branch_cleans, plan_remediation, push, restore, scan, scan_deep, scan_history, scan_repo,
-    BranchCleanStatus,
+    amend_head, apply, apply_and_verify, apply_branch_cleans, branch_remote, commit_paths,
+    current_branch, deep_scan_repo, discover_repos, force_push_with_lease, force_push_with_lease_to,
+    now_secs, plan_branch_cleans, plan_remediation, push, restore, scan, scan_deep, scan_history,
+    scan_repo, BranchCleanStatus,
 };
 use wormward_osm::OsmClient;
 use wormward_packs::builtin_packs;
@@ -690,7 +690,14 @@ fn main() -> ExitCode {
                 if !w.plan.manual.is_empty() || !w.branch_manual.is_empty() {
                     total_unresolved += 1;
                 }
-                let res = apply(repo, &w.plan.actions, !no_backup);
+                // With backups on, verify-after-strip and restore any file the strip couldn't fully
+                // clean (the same safety the GitHub fix path has). --no-backup has no restore source,
+                // so it falls back to a plain apply.
+                let res = if no_backup {
+                    apply(repo, &w.plan.actions, false)
+                } else {
+                    apply_and_verify(repo, &w.plan.actions, &packs)
+                };
                 for (a, e) in &res.skipped {
                     eprintln!("  skipped {}: {}", describe_action(a), e);
                 }

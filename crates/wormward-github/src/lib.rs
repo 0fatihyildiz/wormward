@@ -204,23 +204,69 @@ impl GitHubHost {
                 "refusing to send token to unexpected host: {url}"
             )));
         }
-        match ureq::get(url)
-            .set("Authorization", &format!("Bearer {}", self.token))
-            .set("User-Agent", "wormward")
-            .set("Accept", "application/vnd.github+json")
-            .call()
-        {
-            Ok(resp) => Ok(resp),
-            // 429, or 403 with the quota actually exhausted, is a rate limit — fatal for
-            // the run. A plain 403 (permissions) stays a per-repo Http error.
-            Err(ureq::Error::Status(code, resp))
-                if code == 429
-                    || (code == 403 && resp.header("x-ratelimit-remaining") == Some("0")) =>
+        // A fast parallel sweep trips GitHub's SECONDARY rate limit, which is transient and comes
+        // with a Retry-After / reset hint — so pause and retry instead of aborting the whole run.
+        // A far-off reset (true PRIMARY-quota exhaustion) has no cheap recovery, so give up fast.
+        // The most recent rate-limit body message, surfaced if every retry is exhausted.
+        let mut last_rl_msg: Option<String> = None;
+        for _ in 0..=MAX_RATE_RETRIES {
+            match ureq::get(url)
+                .set("Authorization", &format!("Bearer {}", self.token))
+                .set("User-Agent", "wormward")
+                .set("Accept", "application/vnd.github+json")
+                .call()
             {
-                Err(GithubError::RateLimited(format!("HTTP {code} from {url}")))
+                Ok(resp) => return Ok(resp),
+                // A rate limit is: 429; OR a 403 that is EITHER primary-quota exhaustion
+                // (`x-ratelimit-remaining: 0`) OR a SECONDARY limit — which a fast parallel sweep
+                // trips and which GitHub signals with a `Retry-After` header while remaining is
+                // still > 0. The secondary case was previously misclassified as a plain permissions
+                // 403 (no backoff, surfaced as "token permissions"), which is the error that kept
+                // recurring. A 403 with neither signal is a genuine permissions/scope error.
+                Err(ureq::Error::Status(code, resp))
+                    if code == 429
+                        || (code == 403
+                            && (resp.header("x-ratelimit-remaining") == Some("0")
+                                || resp.header("retry-after").is_some())) =>
+                {
+                    // Capture the wait hints and GitHub's own explanation before the body is
+                    // consumed, so an actionable message survives whether we give up now or after
+                    // exhausting retries.
+                    let retry_after = resp.header("retry-after").map(str::to_owned);
+                    let reset = resp.header("x-ratelimit-reset").map(str::to_owned);
+                    let wait = retry_wait(
+                        retry_after.as_deref(),
+                        reset.as_deref(),
+                        now_epoch_secs(),
+                        MAX_RATE_WAIT_SECS,
+                    );
+                    if let Some(msg) = resp.into_string().ok().as_deref().and_then(rate_limit_message) {
+                        last_rl_msg = Some(msg);
+                    }
+                    match wait {
+                        Some(w) => std::thread::sleep(w),
+                        None => {
+                            let detail = last_rl_msg.unwrap_or_else(|| format!("HTTP {code}"));
+                            return Err(GithubError::RateLimited(format!("{detail} ({url})")));
+                        }
+                    }
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    // Non-rate-limit HTTP error: include GitHub's message so a real cause (e.g. a
+                    // missing token scope: "Resource not accessible by personal access token") is
+                    // visible instead of a bare status.
+                    let detail = resp
+                        .into_string()
+                        .ok()
+                        .and_then(|b| rate_limit_message(&b))
+                        .unwrap_or_default();
+                    return Err(GithubError::Http(format!("HTTP {code} from {url}: {detail}")));
+                }
+                Err(e) => return Err(GithubError::Http(e.to_string())),
             }
-            Err(e) => Err(GithubError::Http(e.to_string())),
         }
+        let detail = last_rl_msg.unwrap_or_else(|| format!("rate limited after {MAX_RATE_RETRIES} retries"));
+        Err(GithubError::RateLimited(format!("{detail} ({url})")))
     }
 
     fn get(&self, url: &str) -> Result<(Option<String>, String), GithubError> {
@@ -279,6 +325,51 @@ fn url_scheme(url: &str) -> Option<&str> {
 
 /// Cap on paginated requests to bound the loop even if a host keeps advertising a next link.
 const MAX_PAGES: usize = 1000;
+
+/// How many times a rate-limited request is retried after honoring the server's wait hint.
+const MAX_RATE_RETRIES: usize = 3;
+/// Longest single pause we'll take for a rate-limit hint. A wait longer than this signals real
+/// primary-quota exhaustion (reset up to an hour out) — not worth blocking the run for, so we
+/// surface RateLimited instead of sleeping.
+const MAX_RATE_WAIT_SECS: u64 = 60;
+
+/// Pull the human `message` out of a GitHub error JSON body (e.g. "You have exceeded a secondary
+/// rate limit…" or "Resource not accessible by personal access token"), for surfacing the real
+/// cause. Returns `None` when the body isn't the expected `{ "message": "…" }` shape.
+fn rate_limit_message(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string())
+}
+
+/// Current UNIX time in whole seconds, for comparing against `x-ratelimit-reset` (also epoch secs).
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Decide how long to wait before retrying a rate-limited request, or `None` to give up. Pure so
+/// the policy is unit-tested without real sleeps or a clock. Prefers `Retry-After` (delta seconds,
+/// what secondary limits send); else derives the wait from `x-ratelimit-reset` (epoch secs) minus
+/// `now`. Returns `None` when there is no usable hint or the wait exceeds `cap_secs` (primary-quota
+/// exhaustion — recovery is too far off to block on). A non-positive computed wait retries
+/// immediately (0), which handles a reset that has just elapsed.
+fn retry_wait(
+    retry_after: Option<&str>,
+    ratelimit_reset: Option<&str>,
+    now_epoch: i64,
+    cap_secs: u64,
+) -> Option<std::time::Duration> {
+    let secs: i64 = if let Some(ra) = retry_after.and_then(|s| s.trim().parse::<i64>().ok()) {
+        ra
+    } else {
+        let reset = ratelimit_reset.and_then(|s| s.trim().parse::<i64>().ok())?;
+        reset - now_epoch
+    };
+    let secs = secs.max(0) as u64;
+    (secs <= cap_secs).then(|| std::time::Duration::from_secs(secs))
+}
 
 impl RepoHost for GitHubHost {
     fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
@@ -792,24 +883,81 @@ mod tests {
 
     #[test]
     fn rate_limit_is_a_distinct_error() {
+        // 403 + exhausted quota with a far-off reset (primary-quota exhaustion): no cheap recovery,
+        // so it surfaces RateLimited immediately rather than blocking on a long sleep.
         let server = MockServer::start();
+        let far = super::now_epoch_secs() + 3600;
         server.mock(|when, then| {
             when.method(GET).path("/repos/me/a/branches");
-            then.status(403).header("x-ratelimit-remaining", "0").body("{}");
+            then.status(403)
+                .header("x-ratelimit-remaining", "0")
+                .header("x-ratelimit-reset", far.to_string())
+                .body("{}");
         });
         let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
         assert!(matches!(host.list_branches("me/a"), Err(GithubError::RateLimited(_))));
     }
 
     #[test]
+    fn retry_wait_policy() {
+        use std::time::Duration;
+        let cap = 60;
+        // Retry-After (delta seconds) is honored when within the cap.
+        assert_eq!(retry_wait(Some("5"), None, 1000, cap), Some(Duration::from_secs(5)));
+        // Reset-based wait = reset - now.
+        assert_eq!(retry_wait(None, Some("1030"), 1000, cap), Some(Duration::from_secs(30)));
+        // A reset already in the past retries immediately (0), never a negative/huge wait.
+        assert_eq!(retry_wait(None, Some("900"), 1000, cap), Some(Duration::ZERO));
+        // Over the cap (primary-quota exhaustion, reset far out) → give up.
+        assert_eq!(retry_wait(None, Some("2000"), 1000, cap), None);
+        assert_eq!(retry_wait(Some("120"), None, 1000, cap), None);
+        // No usable hint → give up.
+        assert_eq!(retry_wait(None, None, 1000, cap), None);
+        // Retry-After takes precedence over reset.
+        assert_eq!(retry_wait(Some("3"), Some("9999"), 1000, cap), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
     fn plain_403_is_not_rate_limited() {
+        // A genuine permissions 403: quota remaining, NO Retry-After → stays an Http (scope) error,
+        // and now carries GitHub's own message so the cause is visible.
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/repos/me/a/branches");
-            then.status(403).header("x-ratelimit-remaining", "42").body("{}");
+            then.status(403)
+                .header("x-ratelimit-remaining", "42")
+                .json_body(serde_json::json!({"message": "Resource not accessible by personal access token"}));
         });
         let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
-        assert!(matches!(host.list_branches("me/a"), Err(GithubError::Http(_))));
+        match host.list_branches("me/a") {
+            Err(GithubError::Http(m)) => assert!(m.contains("not accessible"), "message surfaced: {m}"),
+            other => panic!("expected Http scope error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secondary_rate_limit_403_is_retried_then_surfaced() {
+        // GitHub's SECONDARY limit: 403 with Retry-After but quota REMAINING > 0. This was the
+        // misclassified case — treated as a plain permissions 403 with no backoff. It must now be
+        // recognized as a rate limit: retried (retry-after 0 = instant here) and, if persistent,
+        // surfaced as RateLimited with GitHub's own message — never as a permissions error.
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/repos/me/a/branches");
+            then.status(403)
+                .header("x-ratelimit-remaining", "500")
+                .header("retry-after", "0")
+                .json_body(serde_json::json!({"message": "You have exceeded a secondary rate limit"}));
+        });
+        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        match host.list_branches("me/a") {
+            Err(GithubError::RateLimited(m)) => {
+                assert!(m.contains("secondary rate limit"), "GitHub message surfaced: {m}");
+            }
+            other => panic!("secondary limit must be RateLimited, got {other:?}"),
+        }
+        // Initial attempt + MAX_RATE_RETRIES retries all hit the server (backoff engaged).
+        assert_eq!(mock.hits(), super::MAX_RATE_RETRIES + 1);
     }
 
     // ---- account audit host ----

@@ -36,6 +36,27 @@ fn strip_config<'a>(campaign: &str, packs: &'a [Pack]) -> Option<&'a PayloadStri
     }
 }
 
+/// The strip config used for campaign-agnostic capability findings — the injected-payload structure
+/// is the same family shape (padding run, bracket/dot global, decoder IIFE) regardless of which
+/// campaign label a capability hit carries, so the PolinRider `strip_after_marker` config is the
+/// canonical family strip. Returns the FIRST loaded pack that ships one, so it works even if the
+/// pack set is customized. `None` if no pack defines a strip (then capability findings stay manual).
+fn family_strip_config(packs: &[Pack]) -> Option<&PayloadStrip> {
+    packs.iter().find_map(|p| strip_config(&p.manifest.id, packs).map(|_| p.manifest.id.as_str()))
+        .and_then(|id| strip_config(id, packs))
+}
+
+/// Surfaces whose capability finding is a JS config/script that the family strip markers can clean.
+/// Parsed from the `capability:<Surface>:<top>` signature id. GitHook (shell), BinaryAsset, and
+/// TasksJson are deliberately excluded — tasks.json has its own DeleteFile branch, and a shell hook
+/// / binary asset is not stripped by JS markers.
+fn capability_surface_is_strippable(signature_id: &str) -> bool {
+    matches!(
+        signature_id.strip_prefix("capability:").and_then(|s| s.split(':').next()),
+        Some("ConfigFile") | Some("DerivedScript") | Some("LifecycleScript")
+    )
+}
+
 /// Map a single finding to its auto-remediation action, or `None` if it cannot be
 /// cleaned automatically (no file, unknown kind, or a strip with no configured marker).
 ///
@@ -71,6 +92,20 @@ pub fn action_for(finding: &Finding, packs: &[Pack]) -> Option<RemediationAction
                 && file.components().any(|c| c.as_os_str() == ".vscode") =>
         {
             Some(RemediationAction::DeleteFile { file })
+        }
+        // A capability-engine detection on a JS config/script surface (no pack signature matched, so
+        // it carries the "generic" campaign) is still the injected-payload family shape — offer the
+        // family strip. Bounded three ways: the file is already Critical-flagged, the markers are
+        // FP-safe by construction, and `apply_and_verify` reverts anything that doesn't come out
+        // clean. Without this, a config caught only by the capability engine was flagged but shown
+        // as "needs your attention" and never auto-fixed.
+        FindingKind::Capability if capability_surface_is_strippable(&finding.signature_id) => {
+            let cfg = family_strip_config(packs)?;
+            Some(RemediationAction::StripPayload {
+                file,
+                markers: cfg.markers.clone(),
+                strip_lines: cfg.strip_lines.clone(),
+            })
         }
         _ => None,
     }
@@ -247,6 +282,54 @@ pub fn apply(repo: &Path, actions: &[RemediationAction], backup: bool) -> Remedi
     RemediationResult { applied, skipped, backup_dir }
 }
 
+/// Apply, then VERIFY: re-scan the working tree and, for any file a just-applied action touched
+/// that a fresh finding still references, restore it byte-identical from the backup and move the
+/// action to `skipped`. This gives the LOCAL clean the same safety property the GitHub fix path has
+/// (`fix_scanned` reverts on residual): a strip that leaves detectable payload — e.g. a signature
+/// sitting before the cut marker, or an over-aggressive family strip on a capability-only finding —
+/// self-heals to "couldn't fully clean" instead of leaving a half-stripped file on disk.
+///
+/// Surgical: only files that are both touched AND still flagged are reverted; cleanly-fixed files
+/// and files carrying only unrelated (never-touched) findings are left as applied. Requires the
+/// backup to exist — a `backup=false` apply cannot be verified, so this always backs up.
+pub fn apply_and_verify(repo: &Path, actions: &[RemediationAction], packs: &[Pack]) -> RemediationResult {
+    let mut result = apply(repo, actions, true);
+    let Some(backup_dir) = result.backup_dir.clone() else {
+        return result; // no actions applied → nothing to verify
+    };
+
+    // Files still flagged by a default-tree (working-tree) finding after the apply.
+    let dirty: std::collections::HashSet<PathBuf> = crate::scanner::scan_repo(repo, packs)
+        .into_iter()
+        .filter(|f| f.git_ref.is_none())
+        .filter_map(|f| f.file)
+        .collect();
+
+    let mut kept = Vec::new();
+    for action in std::mem::take(&mut result.applied) {
+        let target = action.target().to_path_buf();
+        if dirty.contains(&target) {
+            // Restore the pristine original the apply backed up; the strip/delete didn't fully clean.
+            let src = backup_dir.join(&target);
+            let dst = repo.join(&target);
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::copy(&src, &dst).is_ok() {
+                result.skipped.push((action, "reverted: strip left detectable payload — needs manual review".into()));
+            } else {
+                // Could not restore (backup missing): keep it applied rather than lose the fix,
+                // but surface it so the state is never silently wrong.
+                result.skipped.push((action, "residual payload remains and backup restore failed — manual review required".into()));
+            }
+        } else {
+            kept.push(action);
+        }
+    }
+    result.applied = kept;
+    result
+}
+
 pub struct RestoreResult {
     pub restored: Vec<PathBuf>,
     pub backup_dir: Option<PathBuf>,
@@ -379,6 +462,45 @@ mod tests {
     #[test]
     fn strip_marker_matches_false_when_absent() {
         assert!(!strip_marker_matches("clean config", &["global['!']=".to_string()]));
+    }
+
+    fn cap_finding(sig: &str, file: &str) -> Finding {
+        let mut f = finding(FindingKind::Capability, Some(file), sig);
+        f.campaign = "generic".into();
+        f
+    }
+
+    #[test]
+    fn capability_config_finding_becomes_strip() {
+        // A capability-engine detection on a config surface (no pack signature, campaign "generic")
+        // is now auto-fixable via the family strip config — not left as manual.
+        let a = action_for(
+            &cap_finding("capability:ConfigFile:padding-injection", "vite.config.mjs"),
+            &[polinrider_pack()],
+        );
+        match a {
+            Some(RemediationAction::StripPayload { file, markers, .. }) => {
+                assert_eq!(file, PathBuf::from("vite.config.mjs"));
+                assert!(markers.contains(&"global['!']=".to_string()), "family markers used");
+            }
+            other => panic!("expected StripPayload, got {other:?}"),
+        }
+        // DerivedScript and LifecycleScript surfaces too.
+        assert!(matches!(
+            action_for(&cap_finding("capability:DerivedScript:obfuscation", "setup.js"), &[polinrider_pack()]),
+            Some(RemediationAction::StripPayload { .. })
+        ));
+    }
+
+    #[test]
+    fn capability_githook_stays_manual() {
+        // A .git/hooks payload is a shell script; the JS strip markers don't apply, so it stays
+        // manual rather than being falsely offered as auto-strippable.
+        assert!(action_for(
+            &cap_finding("capability:GitHook:obfuscation", ".git/hooks/pre-commit"),
+            &[polinrider_pack()],
+        )
+        .is_none());
     }
 
     #[test]
@@ -576,6 +698,55 @@ mod tests {
         let out = fs::read_to_string(repo.join(".gitignore")).unwrap();
         assert!(!out.contains("config.bat"));
         assert!(out.contains("node_modules") && out.contains("dist"));
+    }
+
+    #[test]
+    fn apply_and_verify_keeps_clean_strip() {
+        // A config whose payload strips cleanly stays fixed; nothing is reverted.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='8';var q=(\"rmcej%otb%\",2857687);",
+        )
+        .unwrap();
+        let a = RemediationAction::StripPayload {
+            file: PathBuf::from("postcss.config.mjs"),
+            markers: vec!["global['!']=".into()],
+            strip_lines: vec![],
+        };
+        let r = apply_and_verify(repo, &[a], &[polinrider_pack()]);
+        assert_eq!(r.applied.len(), 1, "clean strip stays applied");
+        assert!(r.skipped.is_empty());
+        assert_eq!(
+            fs::read_to_string(repo.join("postcss.config.mjs")).unwrap(),
+            "export default {};\n"
+        );
+    }
+
+    #[test]
+    fn apply_and_verify_reverts_residual_strip() {
+        // The signature sits BEFORE the strip marker, so cutting at the marker leaves it — the file
+        // is still infected after the strip. apply_and_verify must restore it byte-identical and
+        // report the action as skipped, never leave a half-stripped file on disk.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let original =
+            "export default {};\nvar q=(\"rmcej%otb%\",2857687);\nglobal['!']='8';TAIL\n";
+        fs::write(repo.join("postcss.config.mjs"), original).unwrap();
+        let a = RemediationAction::StripPayload {
+            file: PathBuf::from("postcss.config.mjs"),
+            markers: vec!["global['!']=".into()],
+            strip_lines: vec![],
+        };
+        let r = apply_and_verify(repo, &[a], &[polinrider_pack()]);
+        assert!(r.applied.is_empty(), "a residual-leaving strip must not stay applied");
+        assert_eq!(r.skipped.len(), 1, "the reverted action is reported skipped");
+        assert_eq!(
+            fs::read_to_string(repo.join("postcss.config.mjs")).unwrap(),
+            original,
+            "file must be restored byte-identical, not left half-stripped"
+        );
     }
 
     #[test]
