@@ -169,126 +169,373 @@ dependency is a bug, and every pack change ships with a clean-corpus regression 
 
 ## Observed infections (PolinRider — GitHub corpus, 2026-07-21)
 
-A detection-development record, not a shame list: most repos below are **victims** whose
-build was compromised through a malicious npm dependency. It exists so the algorithm can be
-hardened against real variants. Built by a rate-limit-paced, IOC-seeded GitHub code-search
-sweep (wormward's own PolinRider IOCs — TRON/Aptos wallets, C2 `*.vercel.app` domains, the
-`temp_auto_push.bat`/`config.bat` droppers, the `_$_` decoder, eight malicious `tailwind*`
-packages), then a **clone-free** fetch + scan of every matched file.
+A detection-development record, not a shame list: the repos below are overwhelmingly
+**victims** whose build was compromised through a malicious npm dependency. It exists so the
+algorithm can be hardened against real variants. Built by a **rate-limit-paced, IOC-seeded**
+GitHub code-search sweep — wormward's own PolinRider IOCs (TRON/Aptos wallets, C2
+`*.vercel.app` domains, the `temp_auto_push.bat`/`config.bat` droppers, the `_$_` decoder,
+eight malicious `tailwind*` packages), with the dominant `_$_1e42` decoder **partitioned by
+file extension and size** to beat GitHub's 1,000-results-per-query cap — then a **clone-free**
+fetch + scan of every matched file.
 
 | Metric | Count |
 |---|---:|
-| Candidate repos discovered | 1,124 |
-| **Confirmed infected** | **761** |
-| — by content/structure scan | 642 |
-| — by dropper artifact only | 121 |
-| Research / IOC-documentation repos (correctly not flagged) | ~360 |
+| Candidate repos discovered | 3,239 |
+| **Confirmed infected** | **2,471** |
+| — by content/structure scan | 2,193 |
+| — by dropper artifact only | 278 |
 
-**Version-tag families observed** (`global.X='<family>-…'`). The originally-tracked `5-3-*`
-is a *minority* — the family rotates the tag every wave, which is exactly why detection keys
-on structure, not the constant:
+This is a **lower bound** — GitHub code search only indexes default branches of public,
+indexed repos and hard-caps at 1,000 results per query; the densest decoder buckets still
+exceed that, so the true spread is larger.
 
-> `8-270-*`, `8-2699-*`, `8-4163-*`, `9-4365-*`, `9-0674-*`, `9-5607-*`, `9-0479-*`, `9-5334-*`, `9-3690-*`, `9-5536-*`, `9-5682-*`, `9-0016-*`, `9-825-*`, `9-0736-*`, `10-590-*`, `5-3-*`, …
->
-> Decoders: `_$_1e42` (dominant), `_$_ccfc`, `_$_2d00`, `_$_abcd` — all caught by the generic `_$_[0-9a-f]{4,}` identifier.
+**Version-tag families observed** (`global.X='<family>-…'`). The originally-tracked `5-3-*` is
+a small minority — the family rotates the tag every wave, which is exactly why detection keys
+on structure (padding-injection + the generic `_$_[0-9a-f]{4,}` decoder), never the constant:
+
+> `8-270-*`, `9-4365-*`, `9-1186-*`, `9-6380-*`, `9-0720-*`, `9-0777-*`, `9-0736-*`, `9-0112-*`, `8-4246-*`, `8-2699-*`, `8-3887-*`, `9-5682-*`, `9-0663-*`, `9-969-*`, `9-6896-*`, `9-5379-*`, `10-2130-*`, `9-0447-*`, `9-343-*`, `10-8720-*`, `9-2387-*`, `9-0755-*`, `9-825-*`, `8-2008-*`, … (dozens more)
 
 **Algorithm-development finding.** ~14% of infected repos carried the payload ONLY in
-non-config source (`server.js`, `routes/*.js`, `Gruntfile.js`, `.prettierrc.mjs`,
-controllers) — which the surface-scoped passes missed. This drove the repo-wide structural
-pass (`scan_injection_structure`), taking scan-detection from 573 → 643 repos. See
+non-config source (`server.js`, `routes/*.js`, `Gruntfile.js`, `.prettierrc.mjs`, controllers)
+— which the surface-scoped passes missed. This drove the repo-wide structural pass
+(`scan_injection_structure`). See
 [the FP-hardening spec](docs/superpowers/specs/2026-07-20-wormward-fp-hardening.md).
 
 <details>
-<summary><b>Full confirmed-infected repo list (761)</b> — click to expand</summary>
+<summary><b>Full confirmed-infected repo list (2,471)</b> — click to expand</summary>
 
+- `0rirobin0/Thesis-llm---Ecommerce-Websites`
+- `0rirobin0/face_recognition_cv`
+- `0rirobin0/icerie_2025`
+- `0rirobin0/sacred_forum`
 - `16navigabraham/stakely-backend`
 - `17ishan/my-portfolio-`
+- `1mm0rt41PC/Builder` · dropper-only
+- `1ogicbr0/layers-spa`
+- `24-droid/EY-Project`
+- `2786256218/Burglin-Gnomes-Demo-Translat-Patch` · dropper-only
+- `4FranJonas2/Tron_Seekers` · dropper-only
+- `8ad40n/Redux-Reaper-with-RTK-Query`
+- `8ad40n/nest-prisma`
+- `A4-AryanArshad/Backend12`
+- `A4-AryanArshad/MyBackend`
+- `A4-AryanArshad/NFTBACKEND`
+- `A4-AryanArshad/Vercel-Backend3`
+- `A4-AryanArshad/Vercel_Backend1`
+- `A4-AryanArshad/Vercel_Backend2`
+- `A4-AryanArshad/Vercel_Frontend`
+- `A4-AryanArshad/Vercel_Frontend1`
+- `ADAPT-Chase/ADAPT-Agent-GPT`
 - `AHMED168-ENG/chat-back`
+- `AI-coderss/AI_Doctor_Assistant`
+- `AI-coderss/AI_meeting_Assistant`
+- `AI-coderss/MedicalTranscription_Version2`
+- `AKDebug-UX/DoneWithIt`
+- `AKDebug-UX/challengePR`
+- `AKDebug-UX/interactive-tv-app`
 - `AKDebug-UX/whatsapp-bot-master`
+- `AKRGames/GoAnimate-2016-Offline` · dropper-only
+- `ALADETAN-IFE/repoguard`
 - `ALGORYCLLC/openhome-examples`
 - `ALPHAMAN-0/Document_Editor`
+- `ALPHAMAN-0/Web-Development`
+- `ARMANANS1218/Friend-app`
+- `ARMANANS1218/KANBAN-NEXT-APP`
+- `ARMANANS1218/hirrd-job-portal`
+- `ASADFi/muhammadasad`
 - `AYAN-SHAH/PORTFOLIO`
 - `AYAN-SHAH/healthcare-translate`
 - `AYAN-SHAH/syslab-task`
+- `Abdalla1990/generate-questions`
+- `Abdelkaderbzz/microservices`
+- `Abdelkaderbzz/neuroreset`
 - `Abdelkaderbzz/ramadan-tracker`
+- `Abdoo1998/SOAP_NOTE_UI`
+- `Abdul-Moiz31/QuickStart-ai`
 - `Abdul-Muneeb-Qureshi/fyp-backend`
+- `AbdulRehman938/CIM-Amplify-frontend`
+- `AbdulRehman938/dice_game`
+- `AbdulRehman938/next-app`
+- `AbdulRehman938/tts`
 - `AbdullahAymanMSRE/e-store`
+- `AbdullahKhetran/cloudinary-photos-app`
+- `AbdulmalikAlayande/veridify-ai`
 - `Abdulsadiqsamadani/Event-identify-web`
+- `AbdulwahidHusein/Shipper-chat`
+- `AbdulwahidHusein/portfolio-1`
 - `Abhinav-not-found/portfolio`
+- `AbhinavKumarjss/Leamigo`
+- `AbhinavKumarjss/VoiceNoteApp`
+- `AbhishekSharma55/clawgen`
+- `AbhishekSharma55/pushable_3_0`
+- `AbidJohar/Haroof-BE`
 - `AccumulateNetwork/explorer`
+- `Action-Kamen/Spider-Monkey-benchmarking`
 - `Adan-Asim/E-commerce-Admin-App-Backend`
+- `Addis-Career/Frontend`
+- `Adi9876/sample`
+- `Adityo-dev/poshntrendy`
+- `AdriSciTech/Real-Estate-plattform`
+- `Affan-Rehman/velox-core`
+- `AffanZahid804/Restaurant-E-Commerce-App`
+- `AffanZahid804/Weather-Web`
+- `Afsaruddin12133/SedNex`
+- `Afsaruddin12133/Sterling-Legal`
 - `Ahmed14z/Ahmed14z` · dropper-only
+- `AhmedHashem2104/glasshub-frontend`
+- `AhmedHashem2104/pokemon-assessment-daftra`
+- `Akinz-bobo/my-portfolio`
+- `Akinz-bobo/nuxt-project`
+- `AlMamunTalukder/craft-skills-backend`
+- `Ali-Ch-001/dessify-project-code`
+- `Ali-Ch-001/finsync`
+- `Ali-Ch-001/stacking_demo`
+- `Ali7040/AutoClarity`
+- `Ali7040/DSA`
+- `Ali7040/MentoraX-backend`
+- `Ali7040/TaskFlow`
+- `Ali7040/financeLandingpages`
+- `Ali7040/my-dashboard-app`
 - `AliHaider3820/AAA_SD_FYP`
+- `AliNarsinh/sync_repo`
+- `Aliraza1125/blue-sky`
+- `Aliraza1125/threads`
 - `AllZone-Technologies/canteen-pwa`
 - `Am4n-Ull4h/MyBaby6D_NextJS_Project`
 - `Aman-scripts/NugenEmployabilityTest`
+- `Amanrastogii/FruitStore`
 - `Ameer-Hamza289/AI_Rate_My_Professor`
+- `Ameer-Hamza289/micro-frontend`
+- `Ameer-Hamza289/test-auth_backend_vercel`
+- `Amite55/car-doctor-next-project`
+- `Amite55/hotchpotch-task-front-with-next`
 - `Ammar-Abid92/my-CRUD-api-with-mongo`
+- `Amrwaheed72/Com-Media`
+- `Anas-Ali-3673/CAA`
+- `Anas-Ali-3673/caa-interface`
 - `Anasibnyounis/complete-staffing-solution`
 - `Andre1917/challenge`
+- `Andyxhw/gb28181_2016` · dropper-only
+- `Anima-OS/Quokka`
+- `AnithaUwi/DEVSLAB_inventory-s_system`
+- `AnithaUwi/full-potfolio`
+- `AnithaUwi/pulse_monitor`
+- `Anonymous-hss/astra.ai`
+- `Anonymous-hss/next-auth`
+- `Anonymous-hss/next-ssr`
 - `Anshukk687/React-Capacitor-Android`
 - `Anshuman-Jha/Toku_Assestment`
 - `Anthem-InfoTech-Pvt-Ltd/chat-backend` · dropper-only
+- `Anthem-InfoTech-Pvt-Ltd/raffily-business-cron`
+- `Antokolos/instead-android-ng` · dropper-only
+- `Aplftltbox/Vbg2`
+- `ArafatBytes/Marcello-Vastore`
+- `ArafatBytes/enlighten-backend`
+- `ArafatBytes/enlighten-frontend`
+- `Arman8957/zenith-be`
 - `ArnoldEsquivel/best-city436-poc`
 - `ArslanUlfat/custom-gpt`
+- `ArslanUlfat/upwork-extension`
 - `ArturSargsyan1995/Test`
 - `ArturSargsyan1995/Test-commit`
 - `ArturSargsyan1995/arm-logic`
 - `ArturSargsyan1995/cart`
 - `ArturSargsyan1995/one-click-hugo-cms`
 - `ArturSargsyan1995/stax-tracker2`
+- `Asad-Saeed/Sasaek`
+- `Asad-Saeed/Sensei`
+- `Asad-Saeed/Splitify`
+- `Asad-Saeed/nest-fundamentals`
+- `AsadMughalAM/ecommerce-website`
+- `AsandiAlwis/PawPal-BE`
+- `AsharSal/2FA-Code-Generator`
+- `AslanovRustam/chat-ws-backend`
 - `AslanovRustam/games-tournament`
+- `AslanovRustam/onboarding-agent`
+- `Ateeq1997/RDS-website`
+- `Ateeq1997/SharixsPOS`
+- `Ateeq1997/Sheet-Metal-design`
+- `Atik203/Flood-Guard`
+- `Atik203/My-Anime-Client`
+- `Atik203/My-Anime-Server`
+- `Atik203/Quiz-Taker-Client`
 - `Atik203/VocabPrep`
+- `Atik203/anime-api`
+- `AuravexonFlow/ede-score-1`
+- `Autishnick/ExpensesTracker`
+- `AvaLaquita/sas-backend`
 - `Ayesha-Siddiqui1234/katy-youth-hackathon-2025-dev-post-`
 - `AyshaUrmi0/Dev-question`
 - `Ayu200git/Ayu200git`
+- `AyushG701/UMS`
+- `AyushG701/admin-dashboard`
+- `AyushG701/ai-interview`
+- `AyushG701/diagram-app`
+- `AyushG701/event-scheduler`
+- `AyushG701/fileconverter`
+- `AyushG701/finassist`
+- `AyushG701/nestjs-boilerplate`
 - `AyushG701/production-grade-react-app`
+- `AyushG701/uiexchange`
+- `BU-Trace/UniversityBusTransportSystem`
+- `BanukaBandara/ST-Website`
+- `Baoku26/BASED-RAFFLE`
+- `Basilisk-Development-Team/UXP-mirror`
+- `BenEgeIzmirli/mozilla_central_in_c`
+- `BeniSamuel/smart-blockchain-voting`
+- `BenjaminKobjolke/KeyboardLayoutWatcher` · dropper-only
 - `BenjaminSetton/PHOENIX` · dropper-only
+- `BernardOnuh/Afrimo-Database`
+- `BernardOnuh/Bizflip-Frontend`
 - `BernardOnuh/Warthug-DB`
+- `BernardOnuh/paga-api-test`
 - `BernardOnuh/rubic-test1`
+- `BernardOnuh/stakely`
+- `BiMalxMe/Token-Vesting`
 - `BigMarketDao/bigmarket-dao`
 - `BigMarketDao/bigmarket-mr`
+- `Bilalishaquee/Blockchain`
 - `Bioconductor/BBS` · dropper-only
+- `BorjaLia/Frogger` · dropper-only
+- `BrowserWorks/waterfox`
+- `BrowserWorks/waterfox-android`
+- `BuidlGuidl/LaunchPod`
 - `C0kke/API-NGINX` · dropper-only
+- `CDInstitute/Morpheus`
+- `CMSC-100-2S24-25/exer-05-mongodb-yuuneeell`
+- `CODECUBE-001/frontend`
+- `CODECUBE-001/liteweb-landing`
+- `CP-Pay/web`
+- `CaptainArgonut24/Wrapper-Offline-1.2.3` · dropper-only
+- `CarlosReinoso/carlos`
+- `CarlosReinoso/faisal`
 - `Cataclypsme/old-web3-project`
 - `Chakradharkolipaka/ozonehub_test_assesment`
 - `Charles-Abasimfon/fyn-the-fox-web`
 - `Chetan1204/Todo-Front-React`
 - `ChiraniSiriwardhana/Thumblify-backend`
+- `Click-Movement/ContentCreator-Client`
+- `CloudTechy/GreenCycle`
+- `CloudTechy/acctrenewal`
+- `CloudTechy/spacehub-digital-academy`
+- `CloudTechy/stockmanager-frontend`
+- `CodeWithMunnaX/Ipl-history`
+- `Codechef-VITC-Student-Chapter/CookOff-25`
 - `Cogni-Capital-Chain/SociFi-MVP`
 - `Computadores-Para-Todos/computers-4-all-manager`
+- `Confused-Careers/StepInFrontend`
+- `Constant441/TPS` · dropper-only
+- `Conversly/chat-widget`
+- `Cosmic-Robotics/CADLock` · dropper-only
 - `CrazyDev13/school-management`
 - `Cyber-Advance-Soliution/rtcServer`
 - `CyberMarinesTeam/umurava_challenge_frontend`
+- `CyberMarinesTeam/vulnerability_backend`
 - `CyberMarinesTeam/vulnerability_checker`
+- `DThiwanka/E-commerce`
+- `Daghnouj/deploy_back`
 - `DarioKolic/dario-kolic-v2`
 - `David1Savitsky/cal-eco-platform`
 - `Dawit212119/Devodemy`
 - `Dawit212119/LMS`
 - `Dawit212119/Natours`
 - `Dayones-Live/DayOnes`
-- `DbHridoy/Easyrenting` · dropper-only
-- `DbHridoy/golf-pro-backend` · dropper-only
+- `DbHridoy/Easyrenting`
+- `DbHridoy/golf-pro-backend`
 - `DbHridoy/nicholas_cook9-backend` · dropper-only
 - `Deepanshu7-bit/nugen-interns`
+- `Deflaktor/ssbr` · dropper-only
+- `Delower-Hasan/node-express-template`
+- `DenysFi/Spotify`
+- `Derrick99234/Church-Workflow`
+- `Dev-Logic-max/Editor-Frontend-Next`
+- `Dev-Logic-max/ecommerce-backend`
 - `Dev-Logic-max/ecommerce-frontend`
+- `DevAbdullah90/Startups-Insight-Miner-Project`
+- `DevAdeelAhmad/BloggingWebsite`
+- `DevAdeelAhmad/crypto-chain`
+- `DevAdeelAhmad/fullstack-flask`
+- `DevAdeelAhmad/next-payload`
+- `DevIbrahim07/endless_invo_task`
+- `DevIbrahim07/musicacademy`
 - `DevIbrahim07/patient-caregiver-dashboard`
+- `DevIbrahim07/prismapractice`
 - `DevWizardHQ/laravel-localizer-react`
+- `DevWizardHQ/laravel-localizer-vue`
 - `DevWizardHQ/laravel-react-permissions`
+- `DevXvidit/E-Commerce-Platform`
+- `Devanshi-4831/mern_blog`
 - `Devba/W3agregador`
 - `Devba/lmng-top-`
 - `Devsed-official/Visa-agent`
 - `Devsed-official/quba`
+- `DewminK/leader-tailors-frontend`
+- `Dhruv100404/MedopsAI-FE`
+- `Dhyanu22/Furious-Repair-Backend`
+- `Differenz-system-private-Ltd/Addressbook-WordPress-Elementor`
+- `Differenz-system-private-Ltd/Addressbook-WordPress-Woocommerce`
+- `DilakshaLakshan/construction-management-system`
+- `DilyaSoft/Time-off-company-manager`
+- `Distill-AI/distill-ai`
+- `Dixon282005/Cifrax`
+- `Dixon282005/Dashboard`
 - `Dominion116/API-Test`
+- `Dominion116/EchoPass`
+- `Dominion116/FrameMarket-Contracts`
 - `Dominion116/LimboStark`
+- `Dominion116/NovaWeb`
 - `Dominion116/Smile-TEST`
 - `Dominion116/Smile-TEST-2`
+- `Dominion116/StyleHub`
+- `Dominion116/VerbiVerse-Frontend`
+- `Dominion116/frontend`
+- `Dominion116/fundforge`
 - `Dominion116/futureblock`
+- `Dominion116/geoquest-frontend`
+- `Dominion116/modern-ui`
+- `Dominion116/my-celo-app`
 - `Dominion116/my-portfolio`
+- `Dominion116/pepe`
+- `Dominion116/token-faucet`
+- `Dominion116/token-launcher`
+- `Dominion116/verbiverse-backend`
+- `Dominion116/web3nova-backend`
+- `Dronesh77/konnectly`
+- `Echo-Sols-Ltd/IvuzeVuba-webApp`
+- `Ehtesham-Zahid/ChessMate`
+- `Ehtesham-Zahid/book-vista`
+- `Ehtesham-Zahid/meat-shop`
+- `Ehtesham-Zahid/vista-landing-page`
+- `Eisha313/Skynova-frontend`
+- `EmanDeveloper/DataScience`
+- `Emmanuelombaye/RentalSystem`
+- `Emmanuelombaye/alexiantwebsite`
+- `Emmanuelombaye/engineer-ombaye`
+- `Emmanuelombaye/multipos`
+- `Engineerbabu777/book_nest_expo_react_native`
+- `Engineerbabu777/hospital-management-strapi-backend`
+- `Engineerbabu777/podcast-app`
+- `Enigma-Incorporated-Ltd/N0DE-Website`
+- `EponymousBearer/PakBridge-AI`
 - `EponymousBearer/backend`
+- `EponymousBearer/nijwebsolution`
+- `FSDTeam-SAA/AMES_Investment_new`
+- `FSDTeam-SAA/Igghy-dashboard`
+- `FSDTeam-SAA/brazen-kits`
+- `FSDTeam-SAA/ftfdesignco-backend`
+- `FSDTeam-SAA/ftfdesignco-backend-new`
 - `FSDTeam-SAA/heart-bridge-dialogue`
+- `FSDTeam-SAA/jwade16-backend`
+- `FSDTeam-SAA/nico41278-frontend`
 - `FSDTeam-SAA/rayb_23-backend`
+- `FSDTeam-SAA/stevenar77-backend`
+- `FSDTeam-SAA/topperscrowd-backend`
+- `FSDTeam-SAA/vendopos81-backend`
+- `FSDTeam-SAA/wellnessmclear-frontend`
 - `FabrikCreations/fabrik-lightbox`
+- `FabrikCreations/fabrik-lightbox-2`
+- `Faisal-Khan-dev/Clinic-Management-System-Frontend`
+- `FanWuUCL/GImalloc` · dropper-only
 - `Farhanasharna2000/B7A1` · dropper-only
 - `Farhanasharna2000/CampusNest` · dropper-only
 - `Farhanasharna2000/FMart` · dropper-only
@@ -300,8 +547,39 @@ pass (`scan_injection_structure`), taking scan-detection from 573 → 643 repos.
 - `Farhanasharna2000/Real-State` · dropper-only
 - `Farhanasharna2000/Typescript-Practice` · dropper-only
 - `Farhanasharna2000/redux-nextjs-practice` · dropper-only
+- `FavorSelect/admin`
+- `FavorSelect/frontend`
+- `FayazK/Pixelflow`
+- `FayazK/StoryMagic`
+- `FayazK/Studio-Next`
+- `FayazK/UniChat-AI`
+- `Feodor2/Mypal68`
+- `FinWise-Labs/FinWise`
+- `Flitzinteractive/FlitzSpace`
+- `Floorp-Projects/Floorp-Runtime`
+- `Floorp-Projects/gecko-dev`
+- `FlowBondTech/danz-miniapps`
+- `FlowBondTech/danz-web`
+- `FlowBondTech/egator`
 - `FlowBondTech/flowb`
+- `FlowRMSLabs/flowdemandwebsite`
+- `FlutterBytes-IO/conference-2024`
+- `Frankish0014/EXPRESSGO_PROJECT`
+- `FranklinChen/hugs98-plus-Sep2006` · dropper-only
+- `FrazKhan1/dev-team-chat`
+- `Frontier-tech-consulting/olas-mcp-application-workflow`
+- `Fruity3010/Business-intelligence`
+- `FuadTalukder85/ird-foundation`
+- `FuadTalukder85/real-estate`
+- `FuadTalukder85/vogal`
+- `FullStack-Manmohan/10th-grade-history-revision-`
+- `FullStack-Manmohan/htw-collab`
 - `GARAGE-POS/GarageCustomerAdmin`
+- `GDSC-COMSATS-Sahiwal/tegathon`
+- `GIST-NJU/ICAG` · dropper-only
+- `Gabriella-Moraes/interdisciplinar2sem` · dropper-only
+- `GlyphBytes/Laravel-Job-Portal`
+- `GopiSVDev/shop.co`
 - `Goutam245/-Digital-health-brand-`
 - `Goutam245/-digital-health-brand`
 - `Goutam245/ACS-Modern-Portfolio-Website`
@@ -372,122 +650,469 @@ pass (`scan_injection_structure`), taking scan-detection from 573 → 643 repos.
 - `Groot-Software-Solutions/Flutter-Apps`
 - `GrootNet-Software-Solutions-Pvt-Ltd/memory_game`
 - `Grzafnan/nest-server`
+- `Guerteltier/WebKit`
+- `Guerteltier/firefox`
+- `Guischk/Airboost-next`
 - `Hamid-javed/E-Learn-Backend`
 - `Hammad911/DataVisualizationProject`
 - `Hamyal/Career-Assessment` · dropper-only
+- `HanjoBulKing7/balconeria-omar`
+- `HansLove/AlgosPowTester`
 - `HansLove/PanelRespuestasWhats`
+- `HardwareGeiler/WinOptiKit` · dropper-only
+- `Harshit457/CRUD-App--Solana`
+- `Harshit457/MedBrain`
+- `Harshit457/PowerPoint-Editor-Web-Application`
 - `Harshitpahuja20/play`
+- `Harshitpahuja20/study`
+- `Harshitpahuja20/studyBack`
 - `Harsimran-Nugen/assignment`
+- `HasanAlif/Blog_App-NestJs-NextJs-`
+- `HasanAlif/InitialSetup-With-Auth-Prisma-and-Postgress`
 - `HasanAlif/Learning_Practice_JavaScript`
+- `HasanAlif/MediCurePoint-Backend-Personal-Project`
+- `HasanAlif/My-Portfolio`
+- `HasanAlif/Personal_Portfolio`
+- `HasanAlif/Simplified-Version-Of-Google-Docs`
+- `HasanAlif/garyh_backend`
+- `Hasnain-Shabbir/medico`
+- `Hasnatrasool163/HabitHubDevOps`
+- `Hassam-01/Forsit-task`
 - `Hassam-01/WhiteBoardFrontEnd`
+- `HassanAbbas10/MERN-Ecommerce`
+- `HassanAbbas10/Nature`
+- `HassanAbbas10/Portfolio`
+- `HassanAbbas10/RRTS-BoilerPlateTS`
+- `HassanAbbas10/Sentrius`
+- `Hassanahmed52/LLM-powered-code-issue-resolver`
+- `HassantahirDev/optimalemd-be`
+- `HearthProperty/ltr-renewal`
+- `HearthProperty/ltr-sweep`
+- `Helium-327/WorkspaceWizard` · dropper-only
 - `Hernny/defiguard-wallet-task`
 - `Herrcorps/KonanAgent2`
+- `Heshan2691/spiritX_Innovexa_2`
+- `HimanshuJain04/RouteToReach-portfolio`
+- `HimanshuJain04/WalletWhisper`
 - `HimanshuJain04/portfolio-2.0`
+- `HirenTariwala/movie-hub`
 - `Hriday-paul/anyjob-wellcome`
+- `Hus211/mealrocket-backend`
+- `Huzaifagit1/wunder-power`
+- `HyGw/test` · dropper-only
+- `HyderYash/find-my-faculty`
+- `IFUMSA/Mobile-App`
+- `IJwesley601/RNA`
 - `ILhankhondaker/todo`
 - `Iambilalfaisal/Acme-One-React`
 - `Iambilalfaisal/PM-Dev`
 - `Iambilalfaisal/glow-aim-tools`
 - `Ianwarzai/cotd_cronjob`
+- `IdanHarari11/ma-team-preview`
+- `IdanHarari11/mongodb-ai-query-chat`
+- `IndraniSahu423/IndraniSahu_Web_Assignment2026`
 - `Innovative-VAS/polinrider-cleanup`
+- `InternalError503/cyberfox`
+- `IsaacCDHall/toolkit-registry`
+- `IslamSolimanInnowise/next-crud`
+- `Iteam-company/restaurant-rn-app`
+- `JGKhushi/user-dashboard-`
 - `JROB774/runner` · dropper-only
+- `Jaber-Riyan/HealthQServer`
+- `JagadeshwaranK/E-Commerce`
+- `Jahan-Shah/draw-doodle`
+- `James-CodeX/Artify-master`
+- `James-CodeX/FUTURE_FS_03`
+- `James-CodeX/Leafguard-AI`
 - `James-CodeX/SEO-Blogs`
+- `James-CodeX/jhub-gallery`
+- `James-CodeX/movie_explained_frontend`
+- `James-CodeX/pizza-city`
+- `James-CodeX/shamba-records`
+- `James-CodeX/tasks-manager`
+- `Jamil255/LMS`
+- `Jamil255/NestJs-template`
+- `Jamil255/NodeJs-Template`
+- `Jamil255/WhatsApp_saas`
+- `Jamil255/quotation-system-web`
 - `Jaskaran2701/Test-1`
+- `JayeshGoswami26/Rawat-Organics`
+- `Jazzzny/platform-uxp`
+- `JeanCharlesMEILLAND/Urbamat`
+- `JeanCharlesMEILLAND/bob-invitation`
+- `JeanCharlesMEILLAND/carte-ferroviaire`
+- `JeanCharlesMEILLAND/cartographie-gntc`
+- `JeanCharlesMEILLAND/cartographie-otc`
+- `JeanCharlesMEILLAND/kadeco-strapi`
+- `JeanCharlesMEILLAND/new-bob`
 - `JesusCova177/09-Omnifood-Optimizations`
 - `JordanCpp/Gtk1` · dropper-only
 - `JoshKisb/dhis2-dashboard`
 - `Jtobyy/qa-forum`
+- `K-Karventhan/django_n_next_js-_auth`
 - `Kairo4-organization/shigud-dapp`
+- `Kanhaiya-30/user-page`
+- `KaramatiSyntax/App`
 - `KaranChouhan018/arxino`
 - `KaranChouhan018/dentsi`
+- `KaranChouhan018/karan2`
 - `KaranChouhan018/todo`
+- `KarynaIsakova-0428/Lumanagi-Project`
+- `KavinMadusanka/Safe-AI-Framework`
+- `KavitaGoyal-1/processMissingDataFromIgdb`
 - `KeniKT/machinery_management_system`
 - `KeshanWijesinghe/yap-mobile-app`
+- `KhaledBaltaji/3pay-sdk`
 - `KhizerAhmed1/Vehicle-Management-System` · dropper-only
+- `KhubaibShabbir4/Health-Nexus-FYP`
+- `KillerCroc9/EAD`
+- `Kosiso29/hilum-kiosk`
+- `Kreliannn/Document-Request-System-FRONTEND`
 - `Kreliannn/House-Rental-Platform`
 - `Kreliannn/MusicPlayer`
+- `Kreliannn/PDF-To-Reviewer-Quiz-FRONTEND`
 - `Kreliannn/grocery-pos-system`
 - `Kreliannn/pharmacy-management-backend`
 - `Kreliannn/pharmacy-management-frontend`
+- `Kreliannn/student-passed-rate-analysis-frontend`
+- `Krish-na-Ai/Front-self`
+- `KshSiaan/Pocketoire`
+- `KshSiaan/Raven-New`
+- `KshSiaan/alvheim`
+- `KshSiaan/confesso_backend`
+- `KshSiaan/diva`
+- `KshSiaan/fastrack_client_management`
+- `KshSiaan/howljs-test`
+- `KshSiaan/noir_v2`
+- `KshSiaan/raven`
+- `KshSiaan/skokomo`
+- `KshSiaan/tawun`
+- `KunjSavaliya/Woxxin-new-website`
 - `Kvit-Dm/RammSound`
+- `L-Dinosaur/Microprocessor` · dropper-only
 - `LADSoft/OrangeC` · dropper-only
+- `LEVIII007/Bhavani-machinery-website`
+- `LEVIII007/Conversly`
+- `LEVIII007/GIST`
+- `LEVIII007/Portfolio-LEVIII`
+- `LEVIII007/SaaS_Workspace`
+- `LEVIII007/xDOTContractor`
+- `Lablab-DeepAI/GitGuard-AI`
+- `Lablab-DeepAI/traeai-drawx`
 - `LeshanieM/Lavendra-Photography-Management-System` · dropper-only
 - `LeshanieM/Leshanie-Portfolio` · dropper-only
+- `Liergab/Coffee-Pre-Ecom-Website`
+- `Liergab/NestJs-Template`
+- `Liergab/Portfolio`
+- `Lindydancer/font-lock-regression-suite` · dropper-only
+- `LiteObject/ai-chatbot-v2`
+- `LiteObject/inbox-ai`
 - `LomoX-Offical/nginx-openresty-windows` · dropper-only
+- `Lucifer4255/Board.io`
+- `Lucifer4255/affine-chatwoot-task`
 - `LuigiClemente/calendar_bookings`
 - `MAHIR-DEVES/Helth-care-Backend`
+- `MD-Ishan-Rana-MIR/Biddayon-Frontend`
+- `MHDabdulkader/uber`
+- `MMansy19/Gheras-Manager`
+- `MMansy19/Hurass-Al-Thughur`
+- `MMansy19/PPH`
+- `MMansy19/Rosokh`
+- `MMansy19/Telemedicine-App`
+- `MMansy19/cdss-xray-app`
 - `MOAIZ-UL-ISLAM/Astro-Portfolio`
+- `MOBO-OSS/systemd-relative` · dropper-only
 - `MOTY12/gacatraning`
 - `MTS-Services/asalmiah_nextjs_fixing`
 - `MTS-Services/rpr2011_2500_cli` · dropper-only
 - `MUGISHA-Pascal/Google-Map-Application`
+- `MUmerch641/Esabal-Massage`
+- `MUmerch641/PDF-Unloacker-app`
+- `MUmerch641/safariWeb`
+- `MUmerch641/upward-marketing`
+- `Maaz2404/Debug_Battle_DevDay26`
+- `Madushanka24/Event-Booking`
+- `MahadA456/mahad-portfolio`
 - `Maham-Liaqat/CricketGame`
+- `Mahedihasanimam/Zakat-Calculator-app`
+- `MaksymKurniy/schema-translation`
+- `MalithDN/Malith-portfolio`
+- `Mallchad/emacs` · dropper-only
+- `MamtazDev/poznanski-backend`
 - `Mamun-Hossain-dev/agency-server`
 - `Mamun-Hossain-dev/clinicallymanic-frontend`
+- `Mamun-Hossain-dev/latest-offshore-pirates-project`
 - `Mamun-Hossain-dev/quickCart-ecommerce`
+- `Mamun-Hossain-dev/wasabi-gaming-backend`
+- `Mamun-Hossain-dev/wasabi-gaming-final-admin-dashboard`
+- `Mamun-Hossain-dev/wasabi-gaming-final-frontend`
+- `ManojTarad65/BTU-setup`
+- `MarteFilho/SecurityX`
+- `MasakatsuFunaki/VN_TRANSLATE_DIST` · dropper-only
+- `MasudRiam/sellsfie-customer-website`
+- `MathewWi/freestyledash` · dropper-only
 - `Maxima24/synthSentry`
 - `MdJowelAhmed/redux-toolkit-query-practice`
+- `Mediasoft-Cie-S-A/formeditor.ms`
 - `Meharab/scam-origin`
+- `MehfoozurRehman/Ecomerce`
+- `MehfoozurRehman/PDF-vision`
+- `MehfoozurRehman/content-strategies`
+- `MehfoozurRehman/dashboard-electromart`
+- `MehfoozurRehman/devscot-agency`
+- `MehfoozurRehman/password-manager`
+- `MehfoozurRehman/pos-admin`
+- `MehfoozurRehman/pos-app`
+- `MehfoozurRehman/vka-sample-fulfillment-form`
+- `MehfoozurRehman/vka-sample-fulfillment-system`
+- `Mehul90/appointment-booking-frontend`
+- `MeliodasX/fabric-video-editor`
+- `Mh-Abdullah/career-linker`
 - `Mike-flowbiz/Flowbiz-backend`
 - `MikiW03/algorithms_benchmarking` · dropper-only
 - `MohamedAshraf701/node-initdb`
+- `MohamedH1000/ethaq_ecommerce`
+- `MohamedH1000/ethaq_ecommerce_admin`
+- `MohamedMoaaz/I-Wish-It` · dropper-only
+- `Mohammed-Zain-ul-Hassan/Catalog-Property-AI`
+- `Mohammed-Zain-ul-Hassan/intellidocs`
+- `Mohankotte123/Nostic_KRB`
+- `MohitKumawat74/Next-js-Portfolio`
+- `MohitKumawat74/Pie-Fitness-Backend`
+- `MohitKumawat74/Portify-Frontend`
+- `MohitKumawat74/Proposal`
 - `Moinuddin-dotcom/Moinuddin-Port-Next`
+- `Mokujin18/wind_destruction_vision`
+- `MonsterXLabs/VaultX_Admin`
 - `Mr-Saadis/PixelPirates`
 - `MrSohaibAhmed/interview-assessment`
 - `Mshandev/Trello-Clone`
+- `Mubin33/aero-refund`
+- `Mubin33/beyond-ai-demo`
+- `Mubin33/beyondai`
+- `Mubin33/developement-building`
+- `Mubin33/mubin_portfolio`
+- `Mubin33/next.js-assignment`
+- `Mubin33/paragon`
+- `MudassarSattar034/next-js-portfolio`
+- `MudassarSharifSandhu/youtube-thumbnail-analyser`
 - `MuhammadAnique7535/alira-server`
 - `MuhammadAsadAnsari/backend`
 - `MuhammadZeeshanAshraf/yapily-integration`
 - `Mukela12/CGAZ-website`
+- `Mukela12/Omelette-ordering-system`
+- `Mukela12/Rive-asset-downloader`
+- `Mukela12/ben-auto-demo`
+- `Mukela12/dwello`
+- `Mukela12/fluxium-wellness`
+- `Mukela12/puttinggreen-demo`
+- `Mukela12/trainer-aide-test`
+- `Mukela12/veduwa-demo`
+- `Mukela12/wellness-backend-demo`
+- `MunibQazi12/next-starter-template`
 - `Muqadas-javed/DummyList`
+- `NafisOfficial/My-Components-library`
+- `NafisOfficial/office-management-system`
+- `Naoldaba/ArtistryNexus`
+- `Nasirul-Islam-Chowdhury/developer-portfolio`
+- `Navoda001/portfolio-frontend`
+- `NayabKhanvict/vibeswap`
+- `NazmulhaqueD/smart-shop`
+- `Nbruchi/esoko-frontend`
+- `Nbruchi/marketplace`
+- `Nbruchi/store-it`
+- `Nbruchi/system`
+- `Nbruchi/taskmaster`
+- `Ndevu12/stayAwakeBot`
+- `Nexa-Final-Year-Project/Nexa-Frontend`
+- `NguyenPhuc2205/Nestjs-Learning`
+- `NguyenPhuc2205/ecommerce-fe`
+- `Nikunj110/Educational-Institution-Management-`
+- `No-bodyq/QuadClue`
+- `No-bodyq/rates-compare`
+- `Nuclear1Gandhi/MVP-test`
+- `NyLaurent/Talynk`
 - `OMBOY33/moonboy`
 - `Olamidipupo-favour/thesebasterdshaven_tpaidourmoney`
 - `OlegPoloviy/courseWork`
+- `OlegPoloviy/crypto-diploma`
+- `OlehKobrynovych/skills_tests`
+- `OlgaYellowflowers/vite-eleventy-nunjucks-starter`
+- `Olipro/VMG1312-B10A` · dropper-only
+- `Opentelcos/Opentelcos` · dropper-only
+- `Ordinistan/Ordinistan`
 - `OrlandoDuocUc/oftalmetryc_sistema` · dropper-only
+- `OwnedByWuigi/dactylic`
+- `OwnedByWuigi/oxifox`
+- `PLSysSec/hfi_firefox`
+- `PLSysSec/icarus-firefox`
+- `PLSysSec/zerocost_testing_firefox`
 - `Pa-ppy/Checkout`
+- `ParallaxPicturesStore/ascension`
 - `Pavel-Shcherbo/defiguard-dev`
 - `PecodeAutomation/playwright-demoqa-framework`
+- `PecodeAutomation/swag_labs_cypress_example`
+- `Poojawa/Citadel-Station-13-5th-Port` · dropper-only
+- `PradeepKundekar0101/CarBooking2`
+- `PradeepKundekar0101/Portfolio`
 - `PradeepKundekar0101/WebRTC-POC`
+- `PradeepKundekar0101/ZapLaunch`
+- `PradeepKundekar0101/dashboard`
+- `PradeepKundekar0101/medical-ai`
+- `PradeepKundekar0101/meta100x`
+- `PradeepKundekar0101/probo`
+- `PradeepKundekar0101/react-hook-form`
+- `PradeepKundekar0101/sample-nodejs`
+- `PradeepKundekar0101/thread-clone-nextjs`
+- `Prajjwal2051/AyurTrace`
 - `Prakhar6046/Feedflow-New`
 - `Prakhar6046/Nethgo-backend`
 - `Prakhar6046/json`
 - `Prakhar6046/testing`
 - `Prakhar6046/ubk-development-official-website-export`
 - `Prakhar6046/website`
+- `Prasantha123123/O2Temple`
+- `PratikRaval123/DemoTask`
+- `PremShakti/Inventory-Todo-Manager`
+- `PremShakti/backendforaries`
 - `PremShakti/diagram-offline-tool`
+- `PremShakti/multi-tenet-school-profile-app`
+- `PriyanshiGoyal-15/Blog-App`
+- `PriyanshiGoyal-15/EMORA`
 - `Professor833/orchestrix`
+- `ProvLeon/agape-platform`
+- `ProvLeon/chat`
+- `ProvLeon/couldyou_chatbot`
+- `ProvLeon/downlink`
+- `ProvLeon/ecclesia-gnc`
+- `ProvLeon/nextjs_tut`
+- `ProvLeon/survey-360-research`
+- `ProvLeon/whatsapp-clone`
+- `Pushpit07/PraSLE-Simulation-in-Contiki-NG-Cooja` · dropper-only
+- `QUBIP/mozilla-central`
+- `QaisarMoin/Alkarmh-admin-testing`
+- `QualifyAI/qualify-frontend`
+- `QuirkBees-Technologies-LLP/BBRTek-Platform`
+- `RAMADAN-MAHDY/-Warehouse-management-system-for-an-office-said2-frontend`
+- `RAMADAN-MAHDY/servicesTorke`
+- `Rachit2323/agave`
+- `Rafiul-Hossain/Brady-Haugh-Plugin`
 - `Rahad-Ullah/Re-wears-dashboard`
 - `Rahmasamy/Event-system-gateway`
 - `RanaRehman7676/my-electron-app2`
+- `Ranking-Topnotch/blog-`
+- `Rasujon3/social_frontend`
+- `RathodDeven/danz-web`
+- `Rdilshan/MEAN_chat`
+- `Rdilshan/pos-api`
 - `Reactongraph/challenges`
 - `Reactongraph/digital-signature-pad`
+- `RealityRipple/UXP`
+- `RecurX-Main/recurx-token`
 - `Rezonality/mutils` · dropper-only
 - `Rezonality/zep` · dropper-only
 - `Rezonality/zest` · dropper-only
+- `RinSanom/IoTWeb`
+- `Rishikpulhani/SecGit`
+- `Ritik00sharma00/ZeneticEnergyBackendDB`
 - `Roberto328/TokenPresaleDApp`
+- `RoganDawes/nexmon_wifi_covert_channel` · dropper-only
+- `RojanShrestha77/LearnJs`
+- `RubelCoderX/Ors-Tracker-backend`
+- `RubelCoderX/must-pure-frontend`
+- `RubelCoderX/room-meeting-frontend`
+- `RubelCoderX/vue-masterclass`
+- `RubelCoderX/vue-task-project-frontend`
+- `Ryane23/3dportfolio`
+- `Ryane23/Formula1`
+- `Ryane23/eagle`
 - `Ryanyntc2013/usbpcapAI` · dropper-only
+- `Ryosuke-Asano/Noraneko-Runtime-macOS`
+- `Rytnix786/MindStack`
 - `Rytnix786/OFF-Boarder`
 - `S7AWKAT/ClubGrub`
 - `S7AWKAT/Tears-of-Yoi---Interactive-GDD-Website`
+- `SAP/project-foxhound`
+- `SHAKIR2001/Finance_Traker`
+- `SISIYAM/language-exchange`
+- `SR-Rony/new-portfolio`
+- `SRIYOGconsulting/nepalmotor.com`
+- `STAR-RG/entente`
 - `Saarcasmic/BulkEmailCampaignManager` · dropper-only
 - `Sabbirnde1/Nava`
+- `Sabrizeek/PAF-Project2025`
+- `Sabrizeek/Resume-analyzer`
 - `SagittariusBA/ComfyUI_SetupKit` · dropper-only
+- `SahilDudhatWork/Hyperzod-Scraping`
+- `Sahl-AI/sahl-ai-iframe`
+- `Saif-Ul-llah/project_finder`
+- `SajidAfridi/SajidAliPortfolio`
+- `Sakura286/firefox-es`
+- `Sakura286/firefox-rockos`
+- `SalmanNawaz921/JobScamShield`
+- `Sameer447/O2_app`
+- `Sameer447/launchpad-incubator-backend`
+- `Sameer447/pet-evolution-arena`
+- `Sammydepoj/next-js-scaffold`
+- `Samsung/js_vendor_tc`
+- `SamuelAtKx/kdbtrain` · dropper-only
+- `Sanjeev-Chakaravarthy/Database-ca-2`
+- `Sanjeev-Chakaravarthy/SW-assignment-2.3-sem-4`
+- `Sanjeev-Chakaravarthy/Skillfinix`
+- `Sant-Thiago/ST-Tools` · dropper-only
+- `Sarith-Samarakoon/TaskMate`
 - `SeiamAlMahmud/Shop-on-track`
+- `Senti-fi/Senti.fi`
+- `Shadyshref/project-managment`
+- `ShafiqUllah2233/Module-08`
+- `ShafiqUllah2233/Resume-AI---Smart-Resume-Builder-with-AI-Suggestions`
 - `ShafiqUllah2233/SCDProject25`
 - `ShahbazRamzan/NodeTestApp`
+- `ShaheryarBabar786/personality-test`
+- `Shakilofficial/authentication-app`
+- `Shakilofficial/nosql-backend-brainiac`
 - `ShamratX/AI-Banking`
 - `ShantoGUB567/AI-Desktop-Assistant` · dropper-only
 - `Shariarhosain/BatteryQK-Backend`
 - `Shariarhosain/Batteryqk`
+- `Shariarhosain/Community-Based-Recycling-Tracker-citizen`
 - `Shariarhosain/ibracks_backend`
+- `Shariarhosain/member_plugin`
+- `Shariarhosain/myledger`
+- `ShariqueBaig/Zetsol-Internship`
+- `ShawnBrownDev/uplink-ai`
+- `ShehanaHewage/cwp-web`
 - `Shimul-12/token-presale-dapp`
+- `ShirleyAR0826/shirley_reyes_fullstack_react_nextjs`
+- `Shivam-fibo/Scalo-Technologies-Assingment--Backend`
 - `Shivam29k/portfolio`
+- `ShowyCone/portal-partner-v2`
 - `SimalChaudhari/real-estate`
+- `Smainer/smainer-desktop`
+- `Smainer/smainer-telegram`
+- `SmanSayeed/exam-taker-frontend`
+- `SmanSayeed/exam-taker-student`
+- `SmanSayeed/fametonic`
+- `SmanSayeed/life-reboot`
+- `Socheema/3legant`
 - `Socheema/bukkahut`
+- `Socheema/clot`
+- `Socheema/ticketFlow`
+- `SoftyPy-IT/world-auto-solution-server`
+- `SoftySkills/quiz_app`
 - `Sohaib909/rfid_pos_server`
+- `SohaibAmjad169/als_asphalt_landing_page`
+- `SohaibAmjad169/connection_hut`
+- `SohaibAmjad169/intelliaudit_dashboard`
+- `SohaibAmjad169/madusaJS_boilerplate`
+- `SohaibAmjad169/wos_store`
+- `SonicBotMan/openclaw-portable` · dropper-only
 - `StanislavKhom/ContentAnalyserAI`
+- `Starlink/latex2html` · dropper-only
 - `Stephenanokz/ihmhealth-api`
+- `Stephenanokz/mshr-api`
 - `Stephenanokz/stalbertschool-api`
+- `Still-Maintainance/student-api`
 - `SubhamKrGuptaDev/assisment-crypto-card`
 - `SubhamKrGuptaDev/crypto-card-project`
 - `SubhamKrGuptaDev/crypto-changes-init-value`
@@ -517,17 +1142,92 @@ pass (`scan_injection_structure`), taking scan-detection from 573 → 643 repos.
 - `SumaiyaNishat/web-developer-portfolio`
 - `SumaiyaNishat/zap-shift-client`
 - `SumaiyaNishat/zap-shift-server`
+- `SumanKunwar1/OMSound`
+- `SunsetFi/suntime-js`
+- `Swayam-Raj/Swayam_Web_Assignment2026`
+- `Sweetgum3897/Polka-Pepe`
+- `Sweetgum3897/local-delivery-plus`
+- `Sweetgum3897/mine-shopify`
+- `SyedHassamJan/CrudAuthAppNext`
+- `SyedHassamJan/NexusStartupNext`
+- `SyedHassamJan/SleepTracker`
+- `SyedHassamJan/VanLockWebsite`
+- `SyedHassamJan/sleep-trackerNext`
 - `T-MAPY/GenSMD` · dropper-only
+- `Taction-Software-LLC/app-cost-frontend`
+- `TalkingCactus/Citadel-Station-13-5th-Port-Extended-` · dropper-only
+- `Tamakuz/RipleyStream`
+- `Tanmay2001Choudhary/dcluttr`
+- `Tayan-Dias/users-cities-api`
+- `TayeburRahman/brunop-eCommerce-backend`
+- `TayeburRahman/partner-transport-backend`
+- `Team-Tensors/EAD-Automobile-Service-Management-System`
+- `Techistics/Continental`
+- `TehStoneMan/SpaceEngineers` · dropper-only
 - `TemuriTsutskiridze/React-Final`
+- `TemuriTsutskiridze/currency-convertor-backend`
+- `TerraDharitri/drt-dune-analytics-service`
+- `TerraDharitri/drt-lite-extras-service`
+- `TerraDharitri/drt-sdk-dapp-core-ui`
 - `TerraDharitri/drt-template-service`
 - `TerraDharitri/drt-workflow-rerun-on-comment`
 - `TerraDharitri/x402`
+- `Thakur156/Quick-Ticket`
+- `Thakur156/aicar`
+- `Thakur156/videoai`
+- `ThandarHtetHtetSan/personalized-local-coffee-recommendation-system`
+- `Thanhnt-64/Contiki` · dropper-only
+- `The-Being-Human-Project/The-Compassion-App`
+- `TheFlexLab/NodeJs-Best-Starter-Template`
+- `TheFreeWeb/FreeSearcher` · dropper-only
+- `TheProjectsX/anytxn-next`
+- `TheProjectsX/articwriter`
+- `ThilinaTLM/ReactJsTuteExpenseTracker`
+- `ThilinaTLM/codesearch-rs`
+- `Tikes123/Tikes123`
+- `TimothyBabatu13/Stampchain`
+- `TimothyBabatu13/TokenMind`
+- `ToqeerAfzal/realm`
 - `TsionTesfaye/assignment`
+- `Twarimitswe-Aaron/CCMS`
+- `Twarimitswe-Aaron/KEC`
+- `UQ-Solutions/uq-solutions-API`
+- `URHH-SR/Datove-Balicky` · dropper-only
+- `USAMA327/marjanuae`
+- `Unit237/netranks-frontend`
+- `UroojFatim/ARISE`
 - `UroojFatim/tMust`
+- `UroojFatim/unitedstoriesofamerica`
+- `Usama06/jackpot-jumble-blockchain`
 - `Usamahafiz8/CCMB`
+- `Usamahafiz8/blastwheels-web`
+- `Usamahafiz8/charity-coin-moiz-fyp`
 - `Usamahafiz8/ios-refferal-to-clipboard`
+- `Usamahafiz8/mansoor-fitme-fyp`
+- `Uy-Chakriya/Practice_Next_Auth_UY_CHAKRIYA`
+- `Uy-Chakriya/testing-fecthing-data`
+- `VALENSAPP/coin_backend`
+- `VKM-Repos/women-hub-admin`
+- `VPRoyal/athena`
+- `VPRoyal/bloxhq`
+- `VRAUTO/ScheduleHQ-SaaS`
 - `Vacademy-io/vacademy_internal_dashboard`
 - `VanessaGikebe/FOMO-app`
+- `VanessaGikebe/hello-please`
+- `VanirAOSP/packages_amlogic` · dropper-only
+- `Vedansh24/edtech-ui`
+- `Vedansh24/rbac_dashboard_AMENSES`
+- `Veriton-Tech/Veriton-Tech-Site`
+- `Victorola-coder/tewo`
+- `Video-FX-Bot/VFXB-App-Frontend`
+- `Video-FX-Bot/VFXB-auth`
+- `ViditGalav/ImapctBridge-Linking-Defi-Sustainability-`
+- `Viglofix/Form` · dropper-only
+- `VigneshPT/temporaryRepo` · dropper-only
+- `Vinceclave/SubdivisionApp`
+- `VindiPerera/Game`
+- `VipulGoyal95/SAE-NITKKR`
+- `VitaliiPVV/vibe_pulse`
 - `VitthalGund/Koinos-Test`
 - `Vladyslav0060/autopartner`
 - `Vladyslav0060/budget-app`
@@ -535,52 +1235,188 @@ pass (`scan_injection_structure`), taking scan-detection from 573 → 643 repos.
 - `Vladyslav0060/comparison-api`
 - `Vladyslav0060/cp-authorization`
 - `Vladyslav0060/popover-task`
+- `Vuththana/09_KEO_VUTHTHANA_SR_NEXTJS_PRACTICE_NEXT_AUTH`
+- `Vuththana/Next_JS_Practice`
+- `Vynsmokee/Stage_Directions`
+- `W-labs-coder/hebrew-app-node`
+- `WSP-LAB/js-test-suite`
+- `Wajeeh-Haider/primehelp-dashboard`
+- `WalPress/site-builder`
+- `WalPress/starter-template`
+- `Wasee-Ur-Rehman/DarziXpress`
 - `Waseem12wa/DentalPrep`
+- `WeOwnAiAgents-Hackerhouse/WeOwnAiAgent`
+- `WeOwnNetwork/EthDenver-submission`
 - `WebInventix/avion`
 - `WebInventix/marketplace-frontend`
+- `WebKit/WebKit`
+- `Webminds-designs/hq`
+- `Webminds-designs/webminds`
+- `WimpyvL/Zappy-Health-Dashboard`
+- `Wirsuchen/wisuchen`
+- `Work-TCL/TrueReff-FE`
 - `Work-TCL/channel-microservice` · dropper-only
 - `Work-TCL/product-microservice` · dropper-only
+- `WorkForUse/rbac-next-stack`
 - `XboxUnity/freestyledash` · dropper-only
+- `Xether-AI/xether`
 - `XpertWebApp/BlockterraAssignment`
+- `XpertWebApp/stocky_shop_aadhya`
 - `YShokrollahi/polyscope-imaging` · dropper-only
+- `Yagna3903/NeuroBank-Guardian`
 - `Yaroslav781/drainer`
+- `Yasalkhan99/firebase-auth`
+- `Yasalkhan99/yk-codes`
 - `Yasiru3875/Shoplytic`
+- `Ymirke/SIMLI-HACK`
+- `Ymirke/llama-hack`
 - `YoussefPasha/pages-builder`
+- `ZGOLDEN20/TWINKLE-TO-DO`
+- `Zarmeen1978/clone-website`
 - `ZeeshanMehdiDev/texas-2026`
 - `Zenncode/ftccmain`
+- `Zentaurios/basedchats`
+- `Zentaurios/blinky`
+- `Zentaurios/citizenly-mvp`
+- `Zentaurios/degenesismint`
+- `Zentaurios/stable-monitor`
+- `ZunairKhursheed/oman-ai`
+- `Zyjinn/Godot-Build-And-Publish` · dropper-only
+- `aJkal-abdulmoiz/NUML-QUIZ-APP`
+- `aJkal-abdulmoiz/truthcorner.ai`
 - `aahmedfaraz/ai-linkedin-agent`
 - `aamir-786/Legacy-Capsule-website`
 - `aamir-786/silicon-savannah-vested`
+- `aaroned/KH-Video-Switcher` · dropper-only
+- `abdallah244/automated`
+- `abdallah244/express-task-1`
+- `abdallah244/fbt-ai-backend`
 - `abdallah244/ff`
+- `abdallah244/grd-project`
+- `abdallah244/mb`
+- `abdallah244/my_protofolio_backend`
+- `abdallah244/mzzady-complet`
+- `abdallah244/store-backend`
+- `abdelhameedhamdy/android-spatialite` · dropper-only
+- `abdelhameedhamdy/android-spatialite-v5` · dropper-only
+- `abdulfatiransari/erp-test`
+- `abdullah-azab/Dir819gpl_code` · dropper-only
+- `abdullah2310ishaq/afronaut`
+- `abdullah2310ishaq/bridgeit`
+- `abdullah2310ishaq/company`
+- `abdullah2310ishaq/ecommerce_jewellery_store`
+- `abdullah2310ishaq/resposive-doctor-websote`
+- `abdullahalnomandev/File_Management_System_FRONTEND`
+- `abdullahalnomandev/mr-chemist-doctors-dashboard`
 - `abdulqadeer273/apple-auth-app`
 - `abdulrhman-developer0/traf-dashboard-api`
 - `abhi-dev78/strapi-cloud-template-blog-0f64e1d1e9`
+- `abhisheksh2412/referral-netlify-deploy`
 - `abidhabib/Nalnda-Reader` · dropper-only
 - `abidhabib/Windows-Activatior-` · dropper-only
 - `abimtad/Customer-feedback`
 - `abimtad/upload_file`
+- `abinig29/Qemer-test`
+- `abinig29/software-agency`
+- `ablazeyredcap/danger-test`
+- `abokixyz/Aboki-Business`
+- `abrar-khan-alvi/Heygen-AI-Video`
 - `abrarkhalidofficial/Aigronpages`
 - `abrarkhalidofficial/Videoplayer`
+- `abrarkhalidofficial/holidaycountry`
+- `abtaaahi/amar-vote`
+- `abtaaahi/ecommerce-api-nest`
+- `abtaaahi/krishi-shurokkha`
+- `abusayedwd/Brand-Marketing-server`
 - `abusayedwd/property-rental-serverr`
+- `adarsh-206/ecommerce-platform`
 - `addis-ale/July2025Cohorot-Hackathon1`
+- `addis-ale/discord`
+- `addis-ale/ega_backend`
+- `addis-ale/ega_updated`
 - `addis-ale/git_learn`
+- `addis-ale/group-match`
 - `addis-ale/gym-app`
+- `addis-ale/hirecards-prod`
+- `addis-ale/lms`
+- `addis-ale/meetai`
+- `addis-ale/shadcn-dashboard`
+- `adduc/phpmodbus` · dropper-only
+- `addygeek/Walmart-Inventory-Clearance-Optimizer`
+- `adi6409/browser-ff`
+- `adi6409/browser-src`
 - `adityaranjan2005/card-activity`
+- `aezur/rag-demo`
+- `agentsifyai/Agentsify.ai-Website-Dev`
+- `ahfoysal/Flight-Expert-Clone`
+- `ahfoysal/Luxify-Client-Code-MERN`
+- `ahfoysal/event-management-react`
+- `ahmadali507/CARTX`
+- `ahmadali507/Shocodoc`
+- `ahmadali507/Tax-Lens`
+- `ahmadmusa9805/university-management-server`
+- `ahmadraza382/Ferrano`
+- `ahmadraza382/FinanceAi`
+- `ahmadtahir1399/Todovex`
+- `ahmadtahir1399/drive-tool`
+- `ahmed-elgaml11/chatio`
+- `ahmedghonim/TreatMeta`
+- `ahmedghonim/esraa`
+- `ahmedghonim/thelal`
+- `ahmi-365/CSGO`
+- `aindrajaya/3d-rendering-high-performance`
 - `aindrajaya/chainx-docs`
+- `aindrajaya/dashboard-funnel`
+- `aindrajaya/eduujoy-ui`
+- `aindrajaya/funneldash`
+- `aindrajaya/llm-pipeline`
+- `aindrajaya/node-proxy-server`
+- `aindrajaya/sdos-purification`
 - `aindrajaya/senda-api`
 - `aindrajaya/virtual-run-api`
+- `aindrajaya/vrun-api`
+- `airclast/AirClast_Backend`
+- `aixoss/emacs` · dropper-only
 - `ajainoffbeat/offbeat-flutter-ems` · dropper-only
+- `ajasad25/HealthTracker`
 - `ajaypanchal761/dvision` · dropper-only
+- `akhlaqahmad/nextjs-app-template`
+- `akilaManu-MaHiTo/LunuMirisa`
+- `akradadiya28/E-Learning`
 - `akshat-mechlin/TimeFlow-website-2`
+- `alamin-sujon/project-9-client`
 - `alamin-sujon/software-chamber`
+- `alaminrifat/bulk-image-gen`
 - `alaminrifat/company-portfolio`
+- `alaminrifat/smart-inventory`
+- `alaminrifat/treecn`
+- `alanserafim/cadastro-cliente` · dropper-only
+- `alexvirdee/claudia`
+- `alexvirdee/sprout`
 - `aliff56/ai-code-comment-generator` · dropper-only
+- `aliraheel626/motar-next`
+- `alisw/yacc-like` · dropper-only
 - `aliyun/iotkit-embedded` · dropper-only
+- `amMubbasher/cleannami.ceenami-old`
+- `amMubbasher/jose-frontend-design`
+- `amMubbasher/shop.ceenami.com`
+- `amazing-guardian/backup-blog` · dropper-only
+- `ambroff/gecko`
+- `aminehamrouni24/hardcode`
 - `ammarbinshakir/k8s-url-shortener-app`
+- `ammarbinshakir/knowledge-capture-app`
+- `ammarbinshakir/typescript-backend-toolkit`
+- `amoghbl1/tor-browser`
 - `anas-developer01/SolutionRootRepo` · dropper-only
 - `anasbinarif/texas-2026`
+- `anashanif123/frontened-hackathone`
+- `anboralabs/android-spatialite` · dropper-only
 - `andrewlehmann32/Flask`
 - `andrewlehmann32/RSTRockying`
+- `aniketnedunuri1/rls-auth`
+- `anilgoswamistartbitsolutions/bolt-novel-merry`
+- `anilgoswamistartbitsolutions/firebasebase-auth-and-store`
+- `anilgoswamistartbitsolutions/travel-payload-sites`
 - `anilgoswamistartbitsolutions/travel-platform`
 - `anmolcheema836/americanpathways`
 - `anmolcheema836/anmolcheema836`
@@ -597,156 +1433,544 @@ pass (`scan_injection_structure`), taking scan-detection from 573 → 643 repos.
 - `anmolcheema836/thirtysixstudio`
 - `anmolcheema836/thunderzone`
 - `anmolcheema836/will-you-be-my-valentine`
+- `annasudol/app_medusa`
+- `annasudol/vault`
+- `anoexpected/stem-hub`
+- `ansarSultan999/company-portfolio`
+- `ant-dot-comm/besttruckparking`
 - `antonver/defiguard-dev`
+- `arifbiswas/react-native`
+- `arifbiswas/react_native_primary_setup`
 - `arpit01923/inventory-management-backend`
+- `arsalanmughal23/giaic_q2_nextjs_assignment1`
+- `arsalanmughal23/mynextjsapp`
+- `arsalanmughal23/shadcn_project`
+- `arsalanmuntaha1/hackathone_figma`
+- `ascandella/emacs-mac` · dropper-only
 - `ashar160/ashar160`
 - `ashar160/email-signature`
 - `ashar160/email-template`
 - `ashar160/film-maker-portfolio`
+- `ataceyhun/old-src` · dropper-only
+- `atik735/Next.Js-Tutorials`
+- `atik735/next-js`
+- `att/uwin` · dropper-only
+- `augustss/Hugs` · dropper-only
+- `aviel9552/plusfive-frontend`
+- `ayanmal1k/Sol-Market`
+- `aymaneallaoui/setup-terminal` · dropper-only
+- `ayon7544/nest_production`
+- `ayushjaiz/task`
+- `ayushjaiz/task-manager-4`
+- `azamdev00/hms-dashboard`
+- `azimuddin2/nextmart-frontend`
+- `azimuddin2/secondhand-marketplace-backend`
+- `azimuddin2/stationery-shop-backend`
+- `azimuddin2/university-management-backend`
+- `azuwis/debian_emacs24` · dropper-only
+- `badhon252/portfolio-v2.0`
+- `badhon252/psykick_dashboard`
+- `balabit-deps/balabit-os-7-groff` · dropper-only
+- `balabit-deps/balabit-os-7-texinfo` · dropper-only
+- `basitnawaz123/Simple-Lead-Manager`
+- `belawalumer/edura-api`
+- `belize2004/gigasend`
+- `belize2004/gigasend2`
+- `belladev250/Aegis-Web`
+- `belladev250/Pixeleye-web`
+- `bfulgham/WinCairoRequirements` · dropper-only
 - `bhaveshkumbhani0070/string-calculator`
+- `bhavik-dreamz/Pdf-search-based-on-ai-backend`
 - `bhavin002/shadcn-flipbook`
 - `bhnybrohn/cal-eco-platform`
 - `bhoomikamehtastartbit/reactchakraui`
+- `bigGreenPeople/SharkWechatBot` · dropper-only
+- `bigstarlee058/bbb-cms-04142026`
+- `bijeaylimbu/company-website-portfolio`
+- `bikashroy120/OLW-web`
+- `biny001/MedFind`
+- `biny001/Metebaber`
+- `biny001/Protostore`
+- `biny001/better-auth-sample`
+- `biny001/dicom-viewer`
+- `biny001/hobbies`
+- `biny001/nexter-blog`
+- `biny001/nexter-car`
+- `biny001/portfolio`
+- `bioimageit/bioimageit-install` · dropper-only
+- `bitwiseworks/mozilla-os2`
+- `blackboxai-deploy/vibe-1755797977844`
+- `blackboxai-deploy/vibe-1756714110048`
+- `blue3k/StormForge3rdParties` · dropper-only
+- `bnorum/nova`
+- `bollu/hugs` · dropper-only
+- `boranfurkan/smart-salons-be`
 - `brainstormforce/edd-purchase-details`
+- `brandnholl/lowng`
+- `brianonbased-dev/BaseAppShop`
+- `brodynelly/game-marketplace-store-web`
 - `brodynelly/mizzou-health-care-dashboard`
+- `brysonandrew/content-ops-starter`
+- `brysonandrew/skyfacture`
+- `builder08/xbmc_kodi20_dm` · dropper-only
+- `buildwithama01/recurrly`
+- `bygreencn/libxml2_msvc2010` · dropper-only
+- `c-g-studio/sol-clean`
 - `cashilaa/discord-bot` · dropper-only
+- `charleschyna/New-folder`
+- `charleschyna/smarttrafic`
+- `chetanji028/crypto-web-chat`
 - `chetanji028/tradingview2`
+- `chinedu16/face-azure-liveness`
+- `chinedu16/fintrack-dashboard-test`
+- `chingu-voyages/V54-tier3-team-31`
+- `chingu-voyages/V56-tier3-team-31`
+- `chitsii/Elin.Mods` · dropper-only
+- `chromylei/third_party` · dropper-only
+- `classy-endeavors/lottie-animation`
+- `clausecker/Hugs` · dropper-only
 - `cletusgizo/genetiq-v2--test-task`
+- `cliqz-oss/browser-f`
+- `cloudnerddev/cn-webapp-template`
+- `cmaughan/mgfx` · dropper-only
 - `cmaughan/morny` · dropper-only
 - `codecraftwt/shivaji-university-next`
+- `codehag/compiler-compiler-dev`
+- `coderkhalide/Anti-Detect-Browser`
+- `coderkhalide/Trading-Journal`
+- `coderkhalide/ks-dekto`
+- `coderkhalide/scalping-trading-tools`
+- `columbia/pdslib-firefox`
+- `commercial-emacs/commercial-emacs` · dropper-only
+- `connectedbymayeen/weare-connected`
+- `conscious-collective/footprint`
 - `contact474/videeo-ai`
 - `corange-lab/Waaree-API-`
+- `costa-tech/Codveda-Task-2-3`
+- `costa-tech/LMS-BACKEND`
+- `costa-tech/Login-Page`
 - `cto-varun/git-challenge`
 - `cto-varun/user-crud-design-nextjs`
+- `cwstechnology123/incampaigntracker`
+- `cx-oleg-mikashevsky/gecko-dev-master-18M-LOC`
+- `d12frosted/emacs-plus-basis` · dropper-only
+- `dailin/wesnoth_ios` · dropper-only
 - `danishjavedcodes/Data-Pack`
+- `dataluscorp/browser`
+- `dave-get/My-AI-agent`
+- `dawid-rok/content-ops-starter`
+- `dbankston2409/Sober-Deck`
+- `dbarowy/groff` · dropper-only
+- `dearfuture/oldv-driver` · dropper-only
+- `debanjo31/innovation-consulting`
+- `debanjo31/novacrust-lab`
+- `debanjo31/shekina-family`
+- `deborahniainar/Gestion_AO`
+- `deceser/schema-path-selector`
+- `decimalsolution/Decimal-Solution-Customer`
+- `deepin-community/firefox`
+- `deepin-community/firefox-esr`
+- `deepin-community/latex2html` · dropper-only
+- `deepin-community/mozjs`
+- `deepin-community/mozjs115`
+- `deepin-community/thunderbird`
+- `delwar-bscse/startup-website`
 - `desowin/usbpcap` · dropper-only
+- `dev1scaleupally/july-nextjs-fastify-task`
+- `developerdesigner18/events-test`
+- `development0264/GrowBusiness`
+- `devesh-2004/Bill-Mate`
+- `devesh-2004/Clone`
+- `devesh-2004/Code-Editior`
 - `devhub324/React_VideoPlayer`
 - `devhub324/react_prisma_Loika`
+- `devildev-cyber/front-app`
+- `devnaspi/lawtechfrontend`
 - `devtag2026/AimDiscover-FrontEnd`
 - `devtalhaa/demoportfolio`
+- `devthedeveloper/electronBlurImages`
 - `devthedeveloper/w3glpop`
+- `dhakarRaghu/ThoughtCanvas`
+- `dhakiweere/reflex-ci-cd`
+- `dhruveshborad/nextJs-redux`
+- `dhruveshborad/tanstack-nextjs-app`
+- `dhruvmalik007/Stratavault`
+- `dhruvmalik007/forensics-board`
+- `dhruvmalik007/small-case_preEthDelhi`
+- `dhruvmalik007/smallcase_defi`
+- `dhruvmalik007/solana-colossum-hackathon`
+- `dhruvmalik007/xrpl_haks_hackathon_project`
+- `difanz/SVGATextMode` · dropper-only
 - `dineshkuma1234/Gimmel`
+- `dineshkuma1234/Netflix-clone`
+- `dirisujesse/transcribr-landing-page`
+- `dishi152003/lendii_testing`
+- `dishi152003/smart-app-management`
+- `disneyXIX/ecommerce`
+- `dletterio1/Sonik-Adbuilder_MVP`
+- `dletterio1/event-intellegence-platform`
+- `dletterio1/google-integration`
+- `dletterio1/sonik-email-template-tester`
+- `dletterio1/tiktok-integration`
+- `dnl-nash/soxcom` · dropper-only
 - `drewroberts/website`
 - `dryhurstdigital/invoice-my-clients-cursor-plugin`
 - `dsand20142014/openpos` · dropper-only
+- `dshant/express-postgres-test`
+- `dshant/movie-list-test`
+- `dtebbs/emacs-env` · dropper-only
 - `dunkware/dotcom`
+- `duythong28/connect-career-be`
 - `dv1/ion_player` · dropper-only
 - `eagleio786/TheEagles_Backend`
 - `eastmade/web3project-momo-token`
+- `ebe1kenobi/tf-mod-fortrise-ai-jimmy` · dropper-only
+- `ebe1kenobi/tf-mod-fortrise-variant-corpse` · dropper-only
+- `edbrix-school/Redington-AWS-SMB-FE`
+- `edelle-del/CoinBuddy-G5`
 - `edtechug/KONEKTA`
+- `edu4teen/education4teen`
 - `eferos93/test4`
+- `eftakhar-491/L-2_B-6-Assignment-4-frontend`
+- `eftakhar-491/L-2_B-6-Assignment-5-Frontend`
+- `eftakhar-491/ena_ema_company_task_next_client`
 - `eftakhar-491/merge-cart`
+- `eftakhar-491/solo-blog-nextjs`
 - `ehsan18t/resume-ai`
+- `elevate-iiitn/hellofounder`
 - `emacs-mirror/emacs` · dropper-only
 - `emacsmirror/emacs` · dropper-only
+- `emmanueldavidson96/popular_saas_product_landing_page`
+- `enamul90/Our-Denmark`
+- `ep-infosec/12_snyk_snyk-cpp-plugin` · dropper-only
+- `ericniyon/gemurai`
 - `erikfva/qgiscode` · dropper-only
+- `esaleci/Auto-Repair`
+- `esaleci/email-marketing`
+- `esaleci/ugc-platform`
+- `eshancool123/SyncBoardProject`
 - `ethansliu/software_space_skill_test_problem_1`
+- `evenwalser/FinalPaperclipPro`
+- `evgeniums/hatn` · dropper-only
+- `evolver56k/Darwin-0.3` · dropper-only
+- `excelsior-oss/xds` · dropper-only
 - `faaizmahmood/eduwise-backend`
+- `fahad009/generate-pdf`
+- `fahadali503/FitPro-Gym`
+- `fahadali503/nestjs-nextjs-starter`
 - `fahadali503/react-email-templates`
 - `fahadsahib786/tts-backend`
 - `fahadsahib786/tts-frontend-admin`
 - `fahadsahib786/tts-frontend-user`
+- `faheemshah2017/graduate-research-platform`
 - `falconpl/falcon` · dropper-only
+- `farazz23/AI-Generated-PDF-Summary`
+- `fariskt/Portfolio`
+- `fariskt/faskum-task`
+- `fariskt/zynk-client`
+- `faroqbright/Construction`
+- `fazlyalahi01/mui-kit`
+- `fazlyalahi01/tax-website`
+- `fiestatools/tacotruck-action`
 - `findusman/POS_backend`
+- `flackeryy/mwc`
 - `foisaluddin400/backend_basic_structure` · dropper-only
+- `foundershubnetwork/onlyFounders-Educhain-Hackathon`
 - `freejob985/elzero_vue` · dropper-only
+- `freelancework00700/CRM-test-task`
+- `freelancework00700/TShirt_Perfect_Apparel`
+- `fsdteam8/boss65-frontend`
 - `furqan137/whisp-notify`
+- `futureroads/Cardiac-Solutions-Login`
+- `fx-dev-playground/gecko`
 - `g-zenr/MSA-EXPORT-IMPORT`
+- `gSimani/ConcordBroker`
+- `galadran/tor-browser`
+- `gandrewstone/GameMaker` · dropper-only
 - `garrycha/test-job`
 - `gauravraisharma/Infobip-sample`
 - `gauravraisharma/InventoryManagementSystem`
 - `gauravraisharma/Ticketting-System`
+- `gavingunapala/payroll-frontend`
+- `geoapify/angular-geocoder-autocomplete`
+- `geopaparazzi/libjsqlite-spatialite-android` · dropper-only
+- `gfor-gour/Projectile-Simulation`
+- `gilbert-keter/smart-campus`
+- `gilleswaeber/Deterfox`
+- `gitGNU/gnu_groff` · dropper-only
+- `gitpan/Alien-SVN` · dropper-only
+- `gitpan/Language-Haskell` · dropper-only
+- `gmhridu/bicycle-assignment-ph`
 - `goldendragon68/Bullana`
+- `gouravnainop/hrbustime`
+- `gouravnainop/resource-manager`
+- `gouravnainop/schoolManager`
+- `gru-lucy/big-sender`
+- `gru-lucy/event-ticketing`
+- `gru-lucy/excel-factorial-addin`
+- `gru-lucy/express-typescript-starter`
+- `gru-lucy/humble-superhero-api`
 - `guitinem/carting_assessment`
+- `gwydirsam/emacs-mac-borderless` · dropper-only
+- `gyanshupathak/DEX`
+- `gyanshupathak/Oasis`
+- `gyanshupathak/SolVest`
+- `gyanshupathak/TFT-Battle`
+- `hafizzain/assignment-frontend-cloud-book`
+- `haiderkhalil0000/print-web-ai-api`
 - `hajuuk/R7000` · dropper-only
 - `haloivanid/monorepo`
+- `haloivanid/nest-skeleton`
+- `haloivanid/vive-task-management-api`
 - `hambaloch/Carting-assessment`
 - `hammad872/review`
+- `hammadqurashi/shop-easy`
+- `harisshakeel/comuni`
 - `haroldcalvo/workshop`
+- `harshPandey0911/Civilconnect`
+- `harshPandey0911/Homebuddy`
+- `harshPandey0911/Homebuddy24`
+- `harshPandey0911/Homster`
 - `harshPandey0911/student_education`
+- `harshgharsandiya/Diabetes_Chatbot`
+- `haseeb-iqbal/invoiceflow-sass-homepage`
+- `healthBridge01/healthBridge-web`
+- `heamlk/Next.js-automation`
+- `heider-mostafa/ecommm`
+- `hewenhao2008/asuswrt-xdmj76` · dropper-only
 - `himanshu077/material-card-ui-test`
+- `himanshu077/my-portfolio`
+- `hiraekram10/project_mern`
+- `hoangnv170752/Mushroom-Hotpot`
+- `hoangnv170752/ai-timekeeper`
+- `hoangnv170752/apollo-search`
+- `hoangnv170752/next-ralforum`
+- `hoangnv170752/sci-cast`
+- `hopeforkoami/lamuse`
+- `hosainahmeed/Ammur`
+- `hosainahmeed/nur-nadiya-website`
 - `hrch3k/AI-LegalXpert` · dropper-only
+- `hssn08/vici2`
+- `hubertit/kivuride-api`
+- `hubertit/milliondollarbot`
+- `hussainahmad17/Blogging_web`
 - `huzzy12/Zauf-Labs-Test`
 - `hvmgeeks/frontendengine1`
+- `i-tarun/Consultations`
+- `i-usman-56/TaskManagemantFronEND`
+- `i4/site-attestation`
+- `iamanaskhan10/my-portfolio-nextjs`
+- `iambisuu/kitchen-portfolio`
 - `iamnasirudeen/E-wallet`
+- `ibrahimraimi/tobika`
+- `icap2025/ICAP2025`
 - `icecoldjay/bri`
+- `ichi404gh/personal_page`
 - `ifshad/shadcn-practise`
 - `iftekhar2979/Knitting_Client`
+- `iftykhar/khaboDhaka`
+- `iftykhar/memory-match`
+- `iftykhar/sum-dim-sum`
 - `ihzhatamamy/-MagicDoor_Property_Rental`
 - `ilhamsabir/ilhamsabir`
 - `ilhamsabir/mylibs`
 - `ilhamsabir/waha-app`
+- `imrancs058/todofrontend`
+- `imranwebstudio/Github-repo-maleware-remover`
+- `in1004kyu/news_recommend` · dropper-only
+- `inaumanmajeed/CryptoNextjs`
+- `inaumanmajeed/nextjs-boilerplate`
+- `inrg/gb28181_2016` · dropper-only
+- `iotcubedev/mozjs`
+- `ipwndev/DSLinux` · dropper-only
 - `irskid5/Computer-Processor` · dropper-only
 - `ishanrt119/NFT-Marketplace`
 - `ishimwejeanluc/EventStreamingSystem`
+- `ishivamgaur/BookStore-Application`
+- `ishivamgaur/Divyanth-Ayurveda`
+- `ishivamgaur/eTab-redesign`
 - `islamto-mpa101-stack/CarService` · dropper-only
+- `ismailbentabett/aqua-flow-hydration-marketing-focused-app`
+- `isworking/flamewolf`
+- `itsaky/mozilla-release`
+- `itxtalal/medgpt`
 - `ivanwassaf/skill-test`
+- `iyosayi/disxt`
 - `jade0615/Bookme`
 - `jade0615/updeal-mvp`
+- `jadonamite/Aboki-Business`
 - `jahid123978/Bg-remover_Fast_API` · dropper-only
 - `jahid123978/Fast-AI-image-bg-remover` · dropper-only
+- `jahidhiron/portfolio`
 - `jainchirag1234/backgroundChanger`
+- `jaksoftwares/smarttrafficAI`
+- `jameshilliard/DD-WRT` · dropper-only
+- `jameshilliard/R7000` · dropper-only
+- `jameshilliard/R7000-V1.0.2.164_1.0.15_GPL` · dropper-only
+- `jameshilliard/acs-GPL-3.3.0` · dropper-only
+- `jamesmaccoy/betaplek`
 - `jareer1/AI-GoogleAds-MVP` · dropper-only
 - `jareer1/robolawyer` · dropper-only
 - `jareer1/voice-engine-main` · dropper-only
+- `jasonjckn/emacs-mac` · dropper-only
 - `jawatech/emacs-24.5` · dropper-only
 - `jaxteller2016/Social-App-MVP-Poker-CRA`
+- `jayveeolla/jayveeolla.github.io`
 - `jbaze/clarity-cover`
 - `jdwhite0/jdproductions-saas`
+- `jesus270/Krain-MVP-v1`
+- `jihuacao/CommonConfig` · dropper-only
+- `jishad10/poddagolf_all_code`
 - `jjin43/invelo_assessment`
+- `jobayer-hossen/L2-Assignment-3`
+- `jobayer-hossen/master-overFlow`
 - `jobayer-hossen/soft_and_cookie_project`
+- `johan-andruejol/libiconv-cmake` · dropper-only
 - `johnsonfash/electron-react-sqlite-autoupdate-boilerplate`
 - `jonaslim-ucg/nmac-crm`
+- `josmithiii/l2hmj` · dropper-only
 - `jroimartin/emacs` · dropper-only
+- `jsorg71/waterfox_classic_releases`
 - `juggernautsei/calendar_facility_view`
 - `juggernautseinc/healthpals`
+- `justbytecode/RecurX-demo`
+- `jwidar/LatencyZeroGithub`
+- `jyc/gecko`
 - `kalanas210/IWB25-274-CodeByte-Backend` · dropper-only
 - `kalanas210/Vogues-BackEnd` · dropper-only
 - `kalanas210/kalanas210` · dropper-only
 - `kalanas210/movie-app` · dropper-only
+- `kalidai53/ShopNova-AI`
 - `kamiaslam/MM-CompleteFRONTEND` · dropper-only
+- `kamiaslam/multivision_ai`
+- `kanchana404/Brainwave`
 - `kanchana404/Cypress`
+- `kanchana404/signal-WebSocket`
+- `kanchana404/xora`
+- `kaniyamaratha0264/shadcdn-svelte-casino`
 - `kashifali0969082/Finalized-scripts`
+- `kashifali0969082/Lab-47-v1`
+- `kashifali0969082/eagles-backend-finalized`
+- `kashifali0969082/game-eth`
 - `kashifali0969082/librechat`
 - `kashifali0969082/scripts`
+- `kashifali0969082/study-mode`
+- `kashifali0969082/web3-v2`
+- `kasunwathsala/Loomistore`
+- `kasunwathsala/Service-marketplace`
+- `kavindu-98/PMS_Frontend`
+- `kavindu-98/app`
 - `khaledssbd/KS-University-server`
 - `khaledssbd/RideRevolt-project`
 - `khaledssbd/SoulSyntax-project`
 - `khaledssbd/SwiftCart-APIs` · dropper-only
 - `khaledssbd/ThinkGreenly-apis`
 - `khaledssbd/TuneTrail-a-bike-service-management-solution-serverside`
+- `khaledssbd/Xpartex-App`
 - `khaledssbd/khaledssbd` · dropper-only
 - `khaledssbd/sfr-claw-code` · dropper-only
+- `khalidkhnz/avis-media-news`
+- `khalidkhnz/ecom-sass`
 - `khan8799/next-claude-app`
+- `khoabt94/team-sync`
+- `khorshedsadhin/tree-plantation-server`
+- `kierandrewett/browser-chrome-experiment`
+- `kinetiknz/gecko`
+- `kishan-kumar-codes/spotify_clone`
+- `kiyakebe/a2sv-hub`
 - `komangmahendra/rental-prop-task`
 - `korvinus777/texas-holdem-ux`
+- `kou-yeung/Contrib.Gate` · dropper-only
+- `koutakimura0510/ProjectFolder` · dropper-only
+- `krishprav/Appointment-Booking-System`
+- `krishprav/Ludo`
+- `krishprav/cricket-app`
+- `krishprav/flexprice-front`
+- `krishprav/therapport-practice`
+- `kryyyaaaa/peredoz-stealer` · dropper-only
+- `ksoham2003/AI_Mock_Interview`
+- `ksoham2003/Todo-crud`
+- `kusl/TortoiseSVN` · dropper-only
+- `labidrahat/frontend-v1`
 - `laerciosimoes/giit-challenge-laercio`
+- `lambeboluwatife/altschool-eventful-frontend`
+- `lambeboluwatife/eventful-frontend`
+- `lambeboluwatife/eventrite`
 - `lambeboluwatife/lbdflix`
+- `lambeboluwatife/nextjs-crash-course`
+- `lambeboluwatife/portfolio-with-agent-frontend`
+- `lambeboluwatife/tailwind-next-crash-course`
 - `lamdan0901/YouTube-Playlist-Pulse`
-- `lasith2003/durdans-lims-frontend` · dropper-only
+- `lamdan0901/audio-listener-ai`
+- `lamdan0901/basedict-fe`
+- `lasith2003/durdans-lims-frontend`
+- `latex2html/latex2html` · dropper-only
 - `leandrosoaresdesouza/test`
+- `leothatguy/Leo-AI-document-summarizer`
 - `leothatguy/ai-processing-text-interface`
+- `leothatguy/cardano_onchain_escrow`
 - `leothatguy/conference-ticket-generator`
 - `leothatguy/devlinks`
 - `leothatguy/embeddable-tour-web-app`
 - `leothatguy/lendsqr-test`
+- `leothatguy/mint-policy`
 - `leothatguy/primo-dashboard`
+- `leothatguy/smartcontractwallet`
 - `leothatguy/transfer-ckb`
+- `leothatguy/wallet-service`
 - `leothatguy/zetrochat`
+- `lheckemann/open2x` · dropper-only
+- `lijunchen/hugs98` · dropper-only
 - `lilLink/kursova_telegram_bot` · dropper-only
+- `linden6266/FE_PWA`
+- `linfordlee14/ai-for-bharat-agrishield-ai`
+- `lingolette/api-wrappers`
+- `linuxmint/mozjs102`
+- `linzj/weex_native`
 - `lkm1developer/mcp-servers-sse`
+- `loekTheDreamer/releaf-website`
+- `lstoll/emacs` · dropper-only
+- `lucaoskaique/boilerplate`
+- `lucaoskaique/v2.blog.lucaskaique.com.br`
 - `luckyS330/turbo_assessment`
+- `lweyand/my_desktop` · dropper-only
+- `mab3321/Event-Seating-API---Backend`
+- `magicdict/MongoCola` · dropper-only
 - `mahadi-zulfiker/Backend-Tour-Management-System`
+- `mahadi-zulfiker/Hishabee_Frontend_Task`
+- `mahadi-zulfiker/Nextjs-Prisma-Portfolio-Frontend`
+- `mahadi-zulfiker/PH-Job-Task-Web-Instructor`
 - `mahadi-zulfiker/REPLIQ-Limited-Task`
+- `mahadi-zulfiker/Raintor-Job-Task`
+- `mahadi-zulfiker/Ride-Management-Backend`
 - `mahadi-zulfiker/SpaceZee`
+- `mahadi-zulfiker/SparkTech-Job-Task`
+- `mahi-abeysinghe/SkillSync`
 - `maihd/ui_programming` · dropper-only
+- `maleesha-pramud/WigerlabsEMS`
 - `maleesha-pramud/saloon_guide_backend`
+- `maleesha-pramud/second_house`
+- `maleesha-pramud/typing-dev`
+- `mallah-elmehdi/sales-mind-ai-test`
 - `manaknight/backend_mock_fast`
-- `maniksarker25/physics-education-website` · dropper-only
+- `manaknight/internship_node_2`
+- `mani901/Mern-JobPortal`
+- `maniksarker25/physics-education-website`
+- `marcosptf/ds-linux` · dropper-only
 - `marinirin909-lang/saasable`
 - `markomilivojevic/ethvault_staking`
+- `marouanMesri/aladin-app`
+- `martincardarilli/EXAMEN`
+- `maruf-pfc/build-to-learn`
+- `marufkhan20/test-next.js`
+- `masterking008/Apna-Dabba-D02-DE346`
+- `masum-khondhoker-efaz/WinkApp`
 - `masumhasan/musaabadam_app` · dropper-only
+- `mateenikhtiyar/ProperFrontend-CIM-AMP`
+- `mayur-keswani/supabase-sdk-playground`
 - `md-fahad-ali/idp-project`
+- `md-fahad-ali/playfair_cipher_file_encryption`
+- `md-fahad-ali/simple-chat-app`
 - `md-naimul-hassan/Uddoktapay-Payment` · dropper-only
 - `md-naimul-hassan/resid-plus-host` · dropper-only
 - `md-naimul-hassan/resid-plus-user` · dropper-only
@@ -755,71 +1979,239 @@ pass (`scan_injection_structure`), taking scan-detection from 573 → 643 repos.
 - `mdemong87/picturetv`
 - `mdemong87/reqres`
 - `mdemong87/tech-fix-services`
+- `mdimamhosen/BU-Bus-Schedule-Server`
+- `mdimamhosen/Babel`
+- `mdimamhosen/Care2-Training-Consultancy`
+- `mdimamhosen/PH-L-2`
+- `mdimamhosen/ShoperyBackend`
+- `mdimamhosen/StroyNest-Server`
+- `mdimamhosen/Teacher-s-Center`
+- `mdimamhosen/VisaVibe-Server`
+- `mdimamhosen/bublog`
+- `mdimamhosen/realstate`
+- `mdmehedihasan-dev/ecommerce-backend-nestJS`
+- `mdmehedihasan-dev/nest-route`
+- `mdrakibali/doctor-appointment`
+- `mehediScriptDev/CoderFlixTube`
+- `mehediScriptDev/MiskinerBasa`
+- `mehediScriptDev/MultiTime-working-Dashboard`
 - `mehediScriptDev/atarShop`
 - `mehediScriptDev/landing-page`
+- `mehulagg/mozilla-central`
+- `meoneeb/figics-api`
+- `meoneeb/figics-web`
+- `meoneeb/i1sm-edge`
+- `metaupspace/AMS-Frontend-Feature-Addition-Draft`
 - `metaupspace/Nma-Product-Page-new`
+- `metaupspace/metaupspace-website`
 - `metawake/node-task-test`
 - `metoo10987/OpenNT-4.5` · dropper-only
+- `metorial/metorial-platform`
+- `mewanDimalsha/telemetry-ingestor`
+- `micahflee/thunderbird-test`
+- `michelzappy/zappy-scratch-091225`
 - `micymike/AI-assistant` · dropper-only
 - `micymike/classic-calculator` · dropper-only
 - `micymike/classwork` · dropper-only
 - `micymike/instructors-elimu` · dropper-only
 - `micymike/tutorial` · dropper-only
+- `minombreesjeff/darwin_env` · dropper-only
 - `mirzaghalib4726/committee-backend`
+- `mirzaghalib4726/committee-system-next`
 - `mirzaghalib4726/event_management_backend`
+- `mizan-rh/my-app`
 - `mjatin-dev/test-task`
+- `mjunayed2003/Nest.js-todo-and-authentication`
+- `mjunayed2003/NewsChannel`
+- `mjunayed2003/Nextjs-Ecomerch`
+- `mjunayed2003/Nextjs-Ecomerch-2`
+- `mjunayed2003/School-Management-System`
+- `mjunayed2003/first-github-ci-cd-actions`
+- `mjunayed2003/nestJS`
+- `mjunayed2003/nestJS-CRUD-Oparation`
+- `mjunayed2003/nestJS-prisma-setup-and-method-decoretors`
+- `mjunayed2003/shamimrana2006ww`
+- `mkhan429419/Hack-for-Humanity-2025`
 - `mlbench-lhr/vendr`
+- `mmudassir0/Full-Stack-E-commerece`
 - `mohamedeturki/shigud-clone`
 - `mohammadalnajar/markdown-blog`
+- `mohi-khan/cnc-group`
+- `mohsinkhan60/Full-stack-website`
+- `mohsinkhan60/business-website`
 - `mohsulthana/aurora-reminder-app`
+- `mohsulthana/yc-directory-nextjs`
 - `monazahmed/Agrismart-project-`
+- `monirhabderabby/EduMentor`
+- `monirhabderabby/armaitoly-dashboard`
+- `monirhabderabby/boxt`
+- `monirhabderabby/pacific-rim-fusion`
+- `moovweb/open-tritium` · dropper-only
+- `morshidulrahman/assignment-9-frontend`
+- `morshidulrahman/frontend-assignment-4`
+- `morshidulrahman/girligirl`
+- `morshidulrahman/healthy-vendor`
+- `morshidulrahman/next-app-new`
+- `morshidulrahman/pouchCareBd-agency`
+- `morshidulrahman/pouchcarebd`
 - `motia/GoldenCity`
 - `motormouthvis/dream-neighborhood-admin`
+- `mozilla-firefox/firefox`
+- `mozilla-releng/git-backing`
+- `mozilla-releng/staging-firefox`
+- `mozilla/enterprise-firefox`
 - `mr-ammar-1/Project-management-app`
 - `mr-ammar-1/ProjectCheck`
 - `mr-ammar-1/ammar-farooq`
+- `mrb-haqee/proposal-unud-latex` · dropper-only
+- `mrenouf/android-spatialite` · dropper-only
 - `msuhels/Inventory_Managment_react_native`
+- `mthero24/pythias-electon-apps`
+- `mtwebster/mozjs115`
+- `mtwebster/mozjs78`
 - `mu-majid/image-cropping`
+- `mu0chu/firefox-149.0.2-audit`
+- `muana8877/panda-board`
+- `mubeen360/Portfolio`
+- `muhammad-sharique/ekitabify`
 - `muhammad-sohel131/PostgreSQL_Assignment`
 - `muhammad-sohel131/libaray-management-api`
 - `muhammad-sohel131/muhammad-sohel131`
 - `muhammad-sohel131/ppt`
 - `muhammad-sohel131/python_code`
+- `muhammad-tahir-sultan/rehman-fyp-nextjs-multivendor`
+- `mujeebhashone/dubio-frontend`
+- `muneeb6624/MyLabGo-Lab`
+- `muneebhashone/ai-coaches-web-app`
+- `muneebhashone/dubio`
+- `muqeeturrahman/ber`
+- `mykhalik7/PFC-Controls`
 - `mysticvikingr/instagram-monitor` · dropper-only
 - `mysticvikingr/medicine-websocket` · dropper-only
+- `nabeeltahirdeveloper/platinum-edge-admin-app`
+- `nabeeltahirdeveloper/truenorthmarkets`
+- `nabishafin/discussHub-client`
+- `naim0018/Assignment-04-Client`
+- `naim0018/CV-Template`
+- `naim0018/RetroPortfolio`
+- `naim0018/agency-template-01`
+- `naim0018/car-mechanics`
+- `naim0018/ecommerce-template-02-frontend`
+- `naksh1414/AuthFlow`
 - `naksh1414/Googlle-Slides-Converter`
+- `naksh1414/Internship_Task`
+- `namalgo/genesis` · dropper-only
+- `namansharma28/uiLibraryKodex`
 - `namo-usquare/cmc`
+- `naseemkhandev/clash-app`
+- `naseemkhandev/ecommerce-frontend`
+- `naseemkhandev/fullstack-ecommerce-store`
+- `naseemkhandev/genius-ai-model`
+- `naseemkhandev/nextjs_nft`
+- `naseemkhandev/nft-react`
+- `nasirrasheed/Deadlive`
+- `nathnaeltefera/book-management-api`
+- `nathnaeltefera/common-app-web`
+- `nathnaeltefera/search-test`
+- `nathnaeltefera/tradehub`
+- `naymHdev/2x-warriors`
+- `naymHdev/afiya-anjum-maya`
+- `naymHdev/car-rental-server`
 - `naymHdev/nobel-sports-dashboard`
 - `naymHdev/nobelsport-client`
 - `naymHdev/play-top`
+- `nc-proyectos/Medihub`
+- `nchiara68/amplify-gen2-bedrock-playground`
+- `nchiara68/amplify-next-pages-template`
 - `nelsondev19/defi-property`
+- `neozeed/Darwin_0.3` · dropper-only
+- `netd-tud/adaptive-prasle` · dropper-only
 - `netmask/emcas-24.3` · dropper-only
+- `neurolab-0x/docs`
 - `new-computers/arena-ff-addon`
 - `new-computers/arena-toolkit`
 - `new-computers/seeder`
 - `new-computers/web-of-trust`
+- `nextgencodex-com/ShareTaxi-website-Frontend`
+- `nextgencodex-com/ceylon_visitors`
+- `nhatbao2805/BE-Expense-Management`
 - `nhonlvsoict/skill-test-main`
+- `nhumayun2/Study-Hall-Project`
+- `nickk-o/campers-rental`
+- `nikunj05/travel-region-nextjs`
 - `nilsrusten-dev/mysite`
+- `nimurr/Backend_Temp`
 - `nimurr/Koukoutsa-Backend2.0`
 - `nimurr/Pricely-cusang_commerce-Backend`
 - `nimurr/Social-Media-App-Involved-Server`
+- `nimurr/cobag-website`
+- `nimurr/ecommarce-full-stack-by-ClaudeAI`
+- `nimurr/ecommerce-amar-kid`
+- `nimurr/f-com-website-V2.0`
+- `nimurr/nimur-rahman-nerob-portfolio`
+- `nimurr/prediction-website-server`
+- `nimurr/suplify-website`
 - `nimurr/supplify-websitee`
+- `nimurr/the1787llc_Landing_pages_backend`
+- `nipun-imesh/interview-contry-task`
 - `nishantrepozitory/welcome`
+- `nithin138/Techmate_UserWebApp-22-01-25`
+- `nizhnikovskiy/test-task-clearity`
+- `nolimitconnect/kodi-addon-nolimitconnect` · dropper-only
+- `nomiscientist/ai_skillfitsports`
 - `noors-code/Flask`
 - `noors-code/MovieHouse`
 - `noors-code/MovieHouse-api`
+- `noors-code/medical-messaging`
 - `noors-code/swarrpay-backend`
+- `nowal/TakeShape`
+- `nox/spidermonkey`
+- `nrshakib/travel-website`
+- `nzayisengaemmy939/lifelineapp`
+- `odusina-adeyemi/instapick_`
 - `okanaslan/tirios`
 - `okshanaby/wonderful-app`
+- `olamideoludipe/ama-fashion`
 - `olartgabo/studentCommunityDay`
+- `omarpervezz/favor-select-website`
 - `ome/bioformats` · dropper-only
+- `omerbhr129/meety`
+- `one-project-one-month/donatio-nextJS`
+- `onyx-pro8/UAX-Frontend-Mobile-View`
+- `orynth-dev/vite-shadcn-template`
+- `osanda02/singlish-sinhala-playwright-tests`
+- `osasalohan/blusalt1`
+- `osasalohan/blusalt2`
 - `oscafrica/chapters-directory`
 - `oscfcommunity/osd_strapi_cms`
+- `oukiar/freestyledash` · dropper-only
+- `ovabor/worksync-frontend`
+- `owaisrafiq05/Customer-Support-Frontend`
+- `owaisrafiq05/Developers-Day-2025-Frontend`
+- `owaisrafiq05/FastGram-Backend`
+- `owaisrafiq05/FastGram-Frontend`
+- `owaisrafiq05/RideRevive-MERN-Backend`
+- `owaisrafiq05/SecureRide-MERN-Backend`
+- `owolabi-victor/lami-website`
+- `oyewoas/ens_dapp`
 - `oyewoas/smc_lossless_bidding`
 - `pacifiquem/idebug`
 - `parallax-kal/CognitoVault`
+- `parthbvaishnav/alleygames-frontend`
 - `parthvaghani/ring-configurator`
+- `pcabaniss/Joule`
+- `pepperymilkcap/xbmc` · dropper-only
+- `percy-g2/Novathor_xperia_u8500` · dropper-only
+- `phillipshepard1/Help-Docs-Video`
 - `phillipshepard1/internal-re-crm`
+- `phynos/Scanner` · dropper-only
+- `pierooLedesma/Proyectos-Programacion_3` · dropper-only
+- `pinard/paxutils` · dropper-only
+- `pir-ahsan-raza/n8n-nodes-plausible`
+- `pmatos/WebKit_HTML-in-canvas`
+- `polyscope/polyscope` · dropper-only
+- `pombredanne/tor`
+- `prafullvyas272/simplify`
 - `prahaladbelavadi/CoinLocatorDemo`
 - `praisezee/andreportfolio`
 - `pranav033/Flutter`
@@ -828,35 +2220,111 @@ pass (`scan_injection_structure`), taking scan-detection from 573 → 643 repos.
 - `pratikp72/Taoufik_ticket_management`
 - `pratikp72/brainbattle`
 - `pratikp72/calendar-app`
+- `pratikp72/strollr-app`
 - `pratiksingh1702/friend` · dropper-only
+- `prit-nadoda/the-communicare-ai-backend`
 - `prit-nadoda/vs-ext-injectify`
+- `priyankastack/clinic-frontend`
 - `prodsec-opti/badCode`
+- `progax01/suidex`
 - `prosigns/dex-data-aggregation`
 - `prosigns/nestjs-api-boilerplate`
+- `prudywn/GrowthProject`
 - `pt67/bond`
 - `pt67/node-postgresql`
 - `pt67/railstodo`
 - `pt67/whope`
+- `ptomato/mozjs`
 - `pushpakpandya3292/QuickBite_Backend`
+- `pythia-inc/Springfield.Project`
+- `qixin5/debloating_study` · dropper-only
+- `qwerty1023/wive-rtnl-firmware` · dropper-only
+- `rafay-dev92/flicker-ai`
+- `rahulprasad0710/project_management_app`
+- `rahulsinghnegiii/Kakushin`
+- `rahulsinghnegiii/Room-Dekho`
 - `rajaXcodes/Token-Presale-dApp`
 - `rajasadeem/raja-sadeem`
+- `rajatswami/inotebook-mern`
+- `rajatswami/textutils`
+- `rajdavee/agri`
+- `rajdavee/animations`
+- `rakesh-mth/dotfiles` · dropper-only
+- `rakeshkarmaker/Hitster-Kodevio`
+- `rakeshkarmaker/dcs-club-alliance-backend-api`
+- `rakeshkarmaker/event-management-next`
+- `rakeshkarmaker/event-management-nextjs`
 - `rakeshkarmaker/mercy-daily-backend-andreia250472`
+- `rakeshkarmaker/tourism-web-application-frontend`
 - `rakeshkarmaker/visualexstasy-CeleBrease`
+- `rakeshkarmaker/vlietson26-Hitster-admin-fullstack`
+- `rakibul2242/tutor_lms`
 - `ramkrishnakuldeep/react-test`
+- `ramohin1236/Claimly`
+- `ranjannkumar/Chat-Application`
+- `ranjannkumar/Food-Delivery-App`
+- `ranjannkumar/Token-Vesting-App`
 - `raoarafat/steelh-website`
+- `rasandu17/Mini-Travel-Experience-Listing-Platform`
 - `raverkamp/plsqldiff` · dropper-only
+- `rayhanalmim/BongoAI`
+- `rayhanalmim/BongoAI_server`
+- `rayhanalmim/Marchant`
+- `rayhanalmim/doc`
+- `rayhanalmim/foundry-cross-chain-rebase-token`
+- `rayhanalmim/foundry-defi-stablecoin`
+- `rayhanalmim/foundry_LV1`
+- `rayhanalmim/ipfs_localnode_with_hardhat`
+- `rayhanalmim/metaversAdmin`
+- `rayhanalmim/minimal-account-abstraction`
+- `rayhanalmim/mmbotGCB-client`
+- `rayhanalmim/news_ipfs_pinata_client`
+- `rayhanalmim/nftrakuichirakuza`
+- `rayhanalmim/objectRecognizerAndFaceDetectAI`
 - `rayhanalmim/oveswapclientmainnet`
+- `rayhanalmim/v_nftclient`
 - `rayhanalmim/xmtp_mvp`
+- `reallyhq/V0-ReallyGlobal`
+- `rechtlygmbh-dev/rechtly_backend`
+- `rechtlygmbh-dev/rechtly_frontend`
 - `rejoan121615/ClientOps`
 - `rejoan121615/VA-DISABILITY-RATING-CALCULATOR`
 - `rejoan121615/camera-overlay`
+- `rejoan121615/heritage-trial-overlay`
 - `reksar/SpaceEngineers` · dropper-only
+- `reksar/cinject` · dropper-only
 - `ricardomartins9899/SmartPay-Demo`
+- `rifatulislamr/cheque_print_by_saas`
+- `rifatulislamr/ispahani-frontend`
 - `riteshahir28/myfirstproject`
+- `riteshrh/sclassics`
+- `ritiktangri/Emirouq-Mobile`
+- `rmcsharry/bootcamp-16`
+- `rmottola/Arctic-Fox`
 - `rodrigogz64/MagicDoor-Property-Rental-Platform`
+- `rohitgoru/curves-slider`
+- `roidanton/mmvis_static` · dropper-only
+- `roma2023/Snoonu`
 - `ron-aoxapps/test-job-old`
+- `ronymia/doctor-portal-app`
+- `ronymia/doctor-portal-backend`
 - `ronymia/employee-nexus-backend`
+- `ronymia/employee-nexus-frontend`
+- `ronymia/university-management-auth-service`
+- `ronymia/university-management-core-service`
 - `ronymia/university-management-frontend`
+- `roytam1/UXP`
+- `roytam1/basilisk55`
+- `roytam1/palemoon-source-tracking`
+- `roytam1/palemoon27`
+- `rszhd/promptmgr-sdk`
+- `rvmediacorp/Headshot-Portland-Official`
+- `s-mostafaahmadi/Mini-Python-Projects` · dropper-only
+- `saadmustafa-111/Next3dModel`
+- `sahlminkok/atomic-blog`
+- `sahlminkok/qalby_tunes`
+- `sahlminkok/react-quiz`
+- `sai-nirish/glib-for-ios` · dropper-only
 - `saidur1/saidurrahman`
 - `saif72437/36-WEEKS-REMOTE-JOB-COURSE`
 - `saif72437/36-weeks-remote-jobs-preparation-challenge`
@@ -889,79 +2357,324 @@ pass (`scan_injection_structure`), taking scan-detection from 573 → 643 repos.
 - `saifullah-max/Sound-Cloud-Downloader`
 - `saifullah-max/elevate-backend`
 - `sailfishos-mirror/emacs` · dropper-only
+- `sailfishos-mirror/firefox`
+- `sailfishos-mirror/gecko-dev`
+- `sajib689/meal-client`
 - `sajib689/university-management-service`
+- `sakhidevofficial/globalship_ship_frontend`
+- `salimkhandev/all-about-redux-toolkit`
+- `salmanbao/research`
 - `salmansarwarr/WonderCard`
+- `salmansarwarr/XRPL-iso20022-middleware`
+- `salmansarwarr/idex`
+- `salmansarwarr/noottools-indexer`
+- `salmansarwarr/notttools`
+- `salmansarwarr/si3`
+- `salmansarwarr/si3-main-clone`
 - `salmansarwarr/solana-sniper-bot`
+- `salmansarwarr/subtrate-frontend`
+- `salmansarwarr/taskboard`
+- `salmansarwarr/unlock-webhook`
+- `salsabeelomar/postmanify-express`
+- `samir-45/CarePlus`
+- `samir-45/PrepWise`
+- `samir-45/portfolio`
+- `samir-45/react-native-app`
+- `samir-45/the-hive`
 - `samirhassen/ToDo-Realtime`
+- `samirhassen/Verify-Email`
+- `samuel-warrie/Pizzeria_project`
 - `sanchuanhehe/fbb_ws63` · dropper-only
+- `sandazz/hrm`
 - `santos25/institute-report-management`
+- `santosmarco/asdasd`
+- `santosmarco/bolt-shadcn-bfqnd1`
+- `santosmarco/total-next-template`
+- `sarthik-7span/air-born`
+- `sathudeva7/crypto_loan_backend`
+- `satishstartbit/AI-Health-Assistant`
+- `savir2010/Hyphen-Hacks`
 - `sbshihab24/Agentic--AI` · dropper-only
 - `sbshihab24/rag-chatbot-project` · dropper-only
+- `scieloorg/Web-Windows` · dropper-only
+- `securesystemslab/pkru-safe-mozjs`
+- `seekehr/seekehr.github.io`
+- `seemab-ahmed/cutzclub-next`
+- `seemab-ahmed/digital-resume`
+- `seemab-ahmed/eden-funded`
 - `semirhamid/travel-rec-web`
+- `semitha-dev/BlockChain-Semitha`
+- `semitha-uni-west/clash-of-clan`
+- `semitha-uni-west/google-beet`
+- `sengeedorjcody/converter`
+- `sespinosav/Angular` · dropper-only
+- `sevar83/android-spatialite` · dropper-only
+- `shahid538org/microrealestate`
+- `shahriyardx/json-hub`
+- `shahriyardx/marketing-agent`
+- `shahriyardx/phorum`
+- `shahriyardx/portfolio-builder`
+- `shahzad2121/Production_Setup`
 - `shakibul22/daily-news`
+- `shakil9120/Meeteria`
 - `shakilkhan496/omegle-server`
+- `shalzz/aruba-ap-310` · dropper-only
+- `shamimrana2006/TechnicStore`
 - `shanfei/golden-city`
+- `shani-techv1/source-app-v2`
 - `shariyerShazan/nest-crud-postgresql-home-practice-roadmap`
 - `shariyerShazan/nestJs-mongodb-second-proj`
+- `shashwatrai05/meetmux-backend-task`
+- `shazeedul/g2c-portal`
+- `shelltdf/osgall` · dropper-only
+- `shery7378/multifront`
 - `sheryglitch/challenge-ping-tree`
+- `shinu0066/XLS-Convert`
+- `shipon-hossen-raju/first-nestjs-project`
+- `shipon-hossen-raju/starter-dashboard`
+- `shipon-hossen-raju/strong-chat`
 - `shivc868/text-animations`
+- `shohaib1996/fl-gestionnaires`
+- `shopify01/reader-pwa-remix`
+- `shreyash-jain/holistic_crm`
 - `shreyash-jain/still-lift-zone`
+- `sidrarasool/vista-logica`
+- `sig-chakrava/firefox`
+- `sig-chakrava/firefox_sarif`
+- `sig-chakrava/firefox_sarif_grouped`
+- `sig-chakrava/firefox_sarif_ungrouped`
+- `sig-chakrava/firefox_sarif_ungrouped_`
 - `simmsb/emacs-mac-31` · dropper-only
 - `simon-rock/emacs-23.3b` · dropper-only
+- `simonpaul08/repair-shop`
+- `skar777123/drepto-mobileApp-backend`
+- `smartcoindev389/colorstudio-react`
+- `smartcoindev389/cra-template-custom`
+- `smartcoindev389/three-next`
 - `smit455/Arc`
 - `smit455/Task_manager`
+- `smit455/big_bazaar-admin`
 - `smit455/big_bazaar-store`
+- `smit455/mock-test-backend`
+- `smusmanzia123/meetly`
+- `solojungle/social-later`
+- `solomon-mh/brainwave`
+- `soykotrah12/Personal_Portfolio`
+- `sozibhossain/frontend_gman`
+- `spacecode-library/nurse-nest`
+- `spaceghostu/space-engineers-scripts` · dropper-only
+- `spendwise99/spendwise_backend`
 - `splinxplanet/splinx-planet-backend`
+- `srrasel/Divi5plugin`
 - `srrasel/pmchl-medi`
+- `stelianrosca618/charlee-aiNode`
 - `stuartcampbell/playpen` · dropper-only
+- `sunchaesk/ECE352Project` · dropper-only
+- `sunilsen510/TrueClube`
+- `surajiiitn/AIR_BNB`
+- `surajiiitn/HELLO`
 - `surajiiitn/WEB`
+- `survos-sites/barcode-demo`
+- `survos-sites/bunny-demo`
+- `survos-sites/dummy`
 - `survos-sites/framework7-bundle-demo`
+- `survos-sites/kitchen`
+- `survos-sites/mds`
 - `survos-sites/modo`
+- `survos-sites/movies`
+- `survos-sites/omarexpo`
+- `survos-sites/pgsc`
+- `survos-sites/pokemon`
+- `sushilhemrom500530/Chat-App---Socket-io`
+- `svn2github/unicon` · dropper-only
+- `syed-zaeem/fyp-frontend`
+- `syedmuhammadbilalgillani/job_portal`
+- `syedmuhammadbilalgillani/pos_store`
+- `tahajahangir4151/POSNS-UI`
+- `tahirthedev/uniconnect`
 - `taijulsir/antelier-antelier.io`
 - `taijulsir/appifylab-buddy-script-frontend`
 - `taijulsir/cineticket-app`
+- `taijulsir/messenger-chat-app-frontend`
 - `taijulsir/package-finance-module`
 - `taijulsir/zainab-jahan-fashion-coach-site`
+- `talhamajid02/chat-app`
+- `tanushbhootra576/Bionary-Website-Challenge-and-final`
+- `tanushbhootra576/Grid`
+- `tanushbhootra576/GridSaga`
 - `tanushbhootra576/MoodSync`
+- `tanushbhootra576/PW-app`
+- `tanushbhootra576/PWA_RESTRO`
+- `tanushbhootra576/RESTRO`
+- `tanushbhootra576/game`
+- `tanushbhootra576/turbo-happiness`
+- `tanushbhootra576/weather`
+- `tanushbhootra576/week3-forms-and-inputs`
+- `tanvir1418/wild-oasis`
+- `tanzid64/artisan-shop-frontend`
 - `tanzid64/test-auth-cache-laravel`
+- `tareqhasan382/simulated-meta-api`
+- `tarun-khatri/auto-twitter-replies`
+- `tarun-khatri/nexus-kiteAI-hackathon`
+- `tc39/test262`
+- `tcoders16/matrix-portfolio`
+- `tcoders16/testingprisma`
 - `teeps-heisenberg/Langchain-Huggingface-Generative-AI`
+- `tek-life/cmpp` · dropper-only
+- `telexintegrations/Smart-Log-Error-Tracker`
+- `thachrocky12345/local-agent-train-workstation`
+- `thachrocky12345/research-agent-with-dashboard`
+- `thakurabhinav22/Lykon-Browser`
+- `thanhdanh111/challenge`
+- `tharen/pynvel` · dropper-only
+- `theGridbase/yatch-web`
 - `theabhishek4u/building-finance-backend-system`
+- `thealpha93/voice-recorder-be`
+- `theanuragg/Data-Alchemist`
 - `theanuragg/Relayer`
+- `theanuragg/UPtime-monitoring`
 - `thegreaterdev/backend-ai-assessment`
+- `thisdotLolu/MYLT-nft`
+- `thisdotLolu/lyra-frontend`
+- `thisdotLolu/mylt`
+- `thisdotLolu/property-app-demo`
+- `thisdotLolu/vecole-client`
+- `thisdotLolu/vpad`
 - `thomas-moulard/urbi-debian` · dropper-only
+- `tiago-sampaio-cordeiro/leds-control` · dropper-only
+- `tizenorg/toolchains.diffutils` · dropper-only
+- `tjsoho/chatbot`
+- `tjsoho/path2well`
 - `tlord101/hck`
 - `tokenbot-org/token-contracts`
+- `tokyovigilante/xbmc-sources-fork` · dropper-only
+- `traincapetech/HMS-Website`
 - `traincapetech/University-Backend` · dropper-only
+- `triggeredxhub/lms_admin`
+- `tsaung/oauth-smiplified`
 - `tsol/Open-PoniX` · dropper-only
+- `um8r/bridge-master-fyp`
+- `umairafzal-ua/Dentist-Clinic-AI`
+- `umairnaeem373/fix-my-ride`
+- `umar-abdullah22/portfolio-someone`
+- `umarabid123/Raise-Your-Hack`
+- `umarabid123/The_INTERNET_OF_AGENTS_HACKATHON`
+- `umarkhalid12/MediTracker`
 - `umerasifdevexcel/casino-top`
 - `umershafiq19/Connectify`
 - `umrasghar/heygen-demo`
+- `umrasghar/surprise-site`
 - `umrasghar/webflow-automator`
 - `unfazed24072005io/youtube-clone`
+- `uplancera/opsboard-pro`
 - `uribresler/Elevated-Spaces-Backend`
+- `usama-mangi/kushim-web`
+- `usama-maxenius/maxenius-v3`
+- `usama228/Our-Product-Backend`
 - `user2745/Web3Aggregator`
 - `user2745/dev-test-kamto-kionos`
+- `usman-007/checkboxes-frontend`
+- `usman-174/CalKong`
+- `usman-faisal/ai-agents-hackathon`
+- `usmanmanii/wx-pro`
+- `utujesandrine456/Stocka`
+- `uzairwaheed1/Nest_Project1`
+- `vaibhavsagar/experiments` · dropper-only
+- `vans33w/gridbuddy`
+- `vasi/mozilla-unified`
 - `vb352/koinos-assessment`
+- `vibhu927/TestAppProject`
+- `vibhu927/pgx-nextjs`
+- `vibhu927/random-match`
 - `victordaj/buggy`
+- `vinitProjectWork/vinit-partner-portal-challenge`
+- `vinod365/context-compressor`
+- `vinod365/json-tree-viewer`
+- `vinod365/metal-price`
+- `vinod365/vinod`
+- `vishuRizz/dhwanibackend`
+- `vishuRizz/emailing-automation-saas`
+- `vishuRizz/events-freelance-apk-deployment`
+- `vishuRizz/expense-tracker-freelance`
 - `vishuRizz/kyd-lnm-hacks`
+- `vishuRizz/ovalon-astro`
+- `vishuRizz/timepass`
 - `vishwaVaghasiya16/boiler-plate` · dropper-only
 - `vishwaVaghasiya16/mollie-stripe` · dropper-only
+- `vishwaVaghasiya16/monorepo-js`
 - `vishwaVaghasiya16/monorepo-ts` · dropper-only
+- `vkrms/astro-bookworm`
+- `vkrms/flocoin-dashboard`
+- `vkrms/landing-b`
+- `vkrms/sb1-k7fs48xr`
+- `vkrms/wizard`
 - `vnvstore/funtico-labs-assessment-15`
+- `wahab12345678/SchoolVehicleManagement`
 - `wahajansari08/NextDashboard`
+- `wahjava/emacs` · dropper-only
+- `warexify/wive-rtnl` · dropper-only
+- `wasay048/clientiq-backend`
+- `wasay048/smarthelp-ai-backend`
+- `waseemmazari110/Groupe_Escape_Houses`
+- `wasi2320/ctk-new`
 - `wasif903/backend-assessment-pluton` · dropper-only
+- `wasifahmed85/Nexa_Pay`
+- `wasifahmed85/agojeremy`
 - `wayne931121/Sandbox` · dropper-only
+- `web-ghoul/AlCazar`
+- `web-ghoul/movie-app`
+- `webprogramminghack/b3-practice-30`
+- `webprogramminghack/b3-practice-31`
 - `williamwen1986/Luakit` · dropper-only
+- `wisdomedeki761/YouTube-short-creator-BE`
 - `wisdomedeki761/YouTube-short-creator-FE`
 - `wisdomedeki761/forex-premium-and-discount-bot-integrated-with-telegram`
+- `wolfstudiosai/braxx-admin`
+- `wolfstudiosai/braxx-v3`
+- `wolfstudiosai/frontend_wolfstudios`
+- `wolfstudiosai/havocker`
+- `woopengcheng/GameLib` · dropper-only
 - `workonlly/interview_bucket`
+- `wpmatriq/matriq-store-analytics`
+- `wualia/solvify-web`
+- `wuxi-nextcode/packer` · dropper-only
 - `wyrustaaruz/cal-eco-platform`
 - `xacq/SISBACK` · dropper-only
+- `xenitesh/box-game`
+- `xenitesh/next-gradlers`
+- `xerpi/3ds-arm9-linux` · dropper-only
+- `xquantxz/dslinux` · dropper-only
+- `xuhao1/RapidFDM` · dropper-only
+- `y0ngdev/cast`
+- `yaseen041/buyahouseinrosarito`
+- `yeaminstudent5598/pixelandcodeweb`
+- `yinjinzhong/qnx` · dropper-only
+- `yousafsabir/TUYO-Admin`
+- `youwen5/firefox-zen`
 - `yujieschool/U3DEventFrame` · dropper-only
+- `yuriy-kulakovskyi/ticker-mind`
 - `zafarnajmi1/FWRD`
 - `zainhaider-123/betterauth-starter-template`
 - `zainjaved-ui/INoteBook`
+- `zainjaved-ui/Job-Portal-website`
+- `zakaria-akash/asset-track-lite`
+- `zakaria-akash/fashion-mart-website`
+- `zakaria-akash/mini-habit-tracker-frontend`
+- `zakaria-akash/pulse-board-frontend`
+- `zakaria-akash/pulseboard-backend`
+- `zakaria-akash/quran-web-application`
+- `zakaria-akash/rapid-mart`
+- `zakaria-akash/rise-at-seven-clone`
+- `zakriyamalik/docvault-ai`
+- `zalun/firefox`
+- `zc00gii/emacs` · dropper-only
+- `zcomputerwiz/OpenKiosk`
+- `zerogradientguy/portfolio-website`
 - `zhm/node-spatialite` · dropper-only
+- `zohuapp/Zohuapp---Website`
+- `zoushipeng/zbardecoder` · dropper-only
+- `zubairjamil418/MCERT`
+- `zurichat/zc_plugin_company_files`
 
 </details>
 
