@@ -934,17 +934,24 @@ pub fn deep_scan_repo_cancellable(
 const MAX_NODE_MODULES_PKGS: usize = 5_000;
 const MAX_BUILD_OUTPUT_FILES: usize = 20_000;
 
-/// Scan BUILD-OUTPUT dirs (`.output`, `.next`, `dist`, `build`) for a hidden payload — e.g. a dropper
-/// written into `.output/server/*.mjs`, which EXECUTES on the server. These dirs are excluded from
-/// the general walk (full of legit minified/generated code that false-positives the structural
-/// detectors), so this uses the STRICT [`CampaignAnalyzer::hidden_payload`] fingerprint (a decoder /
-/// version-tag marker only), which is FP-clean on generated code.
+/// Dirs the general walk excludes but that still need the STRICT hidden-payload scan — every
+/// excluded dir that can hold JS (build output, vendored code, coverage), i.e. `EXCLUDED_DIRS`
+/// minus the ones covered elsewhere or that hold no JS. Deriving from `EXCLUDED_DIRS` (single source
+/// of truth) means a newly-excluded build/cache dir is automatically re-covered, never left a blind
+/// spot: `.nuxt`/`.output`/`out`/`coverage`/`vendor`/`dist`/`build`/`.next` all qualify.
+const NOT_BUILD_SCANNED: &[&str] = &["node_modules", "target", ".wormward-backup"];
+
+/// Scan BUILD-OUTPUT / vendor / cache dirs for a hidden payload — e.g. a dropper written into
+/// `.output/server/*.mjs` (which EXECUTES on the server) or a `.nuxt`/`dist`/`vendor` bundle. These
+/// dirs are excluded from the general walk (full of legit minified/generated code that
+/// false-positives the structural detectors), so this uses the STRICT
+/// [`CampaignAnalyzer::hidden_payload`] fingerprint (the decoder identifier only), FP-clean on
+/// generated code.
 fn scan_build_output(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
-    const BUILD_DIRS: &[&str] = &[".output", ".next", "dist", "build"];
     const EXTS: &[&str] = &["js", "mjs", "cjs"];
     let mut findings = Vec::new();
     let mut count = 0usize;
-    for bd in BUILD_DIRS {
+    for bd in crate::surface::EXCLUDED_DIRS.iter().filter(|d| !NOT_BUILD_SCANNED.contains(d)) {
         let mut stack = vec![repo.join(bd)];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {

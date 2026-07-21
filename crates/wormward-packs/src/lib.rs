@@ -890,6 +890,29 @@ mod tests {
     }
 
     #[test]
+    fn hidden_payload_in_every_excluded_build_dir_is_detected() {
+        // Regression: `.nuxt`/`out`/`coverage`/`vendor`/`dist` were excluded from the general walk;
+        // each must still be covered by the strict hidden-payload pass (no excluded-but-uncovered
+        // blind spot). Deriving the scan list from EXCLUDED_DIRS guarantees this.
+        for dir in [".nuxt", "out", "coverage", "vendor", "dist"] {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path().join("app");
+            fs::create_dir_all(repo.join(dir).join("server")).unwrap();
+            fs::create_dir_all(repo.join(".git")).unwrap();
+            fs::write(
+                repo.join(dir).join("server/bundle.mjs"),
+                "export default {};\nvar _$_1e42=(function(a){return eval(atob(a))})('x');",
+            )
+            .unwrap();
+            let f = scan_repo(&repo, &builtin_packs());
+            assert!(
+                f.iter().any(|x| x.signature_id == "hidden-payload:build-output"),
+                "a payload in an excluded '{dir}' dir must be detected: {f:?}"
+            );
+        }
+    }
+
+    #[test]
     fn legit_build_output_not_flagged() {
         // A legit generated server bundle (UMD global export, regex .exec, no decoder) must stay silent.
         let tmp = TempDir::new().unwrap();
