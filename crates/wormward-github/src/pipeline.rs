@@ -14,7 +14,7 @@ use wormward_core::{
 };
 
 use crate::api_tree::{ApiTree, BlobCache};
-use crate::{GithubError, RepoHost, RepoRef};
+use crate::{GithubError, RepoHost, RepoRef, Tree};
 
 #[derive(Debug, Clone)]
 pub struct GithubRunOpts {
@@ -215,7 +215,13 @@ pub struct ScanProgress {
 /// blob on every branch first). The fallback SCAN path must NOT use it: its deep scan cat-files
 /// arbitrary branch blobs, and each read would become its own lazy network fetch. A server
 /// without filter support just ignores the flag (git warns and does a full clone).
-fn clone_repo(repo: &RepoRef, dest: &Path, token: &str, blobless: bool) -> Result<(), String> {
+fn clone_repo(
+    repo: &RepoRef,
+    dest: &Path,
+    token: &str,
+    blobless: bool,
+    depth: Option<u32>,
+) -> Result<(), String> {
     let mut cmd = wormward_core::proc::git();
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         // Ignore a hostile /etc/gitconfig (it could set a global hooksPath or url-insteadOf).
@@ -229,6 +235,11 @@ fn clone_repo(repo: &RepoRef, dest: &Path, token: &str, blobless: bool) -> Resul
         .args(["clone", "--no-single-branch", "--template=", "-q"]);
     if blobless {
         cmd.arg("--filter=blob:none");
+    }
+    if let Some(d) = depth {
+        // Shallow: fetch only each branch tip's tree (deep scan reads tips, never history), so a
+        // big-repo scan clone is one minimal packfile transfer instead of thousands of REST calls.
+        cmd.arg(format!("--depth={d}"));
     }
     let out = cmd.arg(authed_url(&repo.clone_url, token)).arg(dest).output();
     match out {
@@ -255,8 +266,10 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
         }
     };
     let dest = tmp.path().join(sanitize_full_name(&repo.full_name));
-    // Full clone (not blobless): the deep scan below reads blobs from every branch tip.
-    if let Err(e) = clone_repo(repo, &dest, token, false) {
+    // Shallow all-branches (depth 1), NOT blobless: the deep scan reads every branch TIP tree
+    // (which depth-1 provides) but never history, and a blobless clone would lazily re-fetch each
+    // blob over the network — defeating the point of cloning instead of per-blob REST.
+    if let Err(e) = clone_repo(repo, &dest, token, false, Some(1)) {
         out.error = Some(e);
         return out;
     }
@@ -273,6 +286,21 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
     }
     out.findings = findings;
     out
+}
+
+/// Blob count above which a repo is scanned via a shallow clone instead of per-blob REST. The
+/// repo-wide injection pass reads every code file, so the API path issues up to one `GET
+/// /git/blobs` per file per branch tip — hundreds/thousands of round-trips that are both slow and
+/// exhaust the 5000/hr REST quota (the "rate limit / refused" the user hit). Above this, one
+/// shallow packfile transfer is dramatically faster and spends almost no quota. Chosen well below
+/// the point where REST amplification dominates, and far under GitHub's own ~100k truncation cap.
+const BIG_TREE_BLOBS: usize = 2000;
+
+/// Whether a tip's tree should be scanned via a clone rather than per-blob REST: GitHub truncated
+/// the listing (too large to enumerate over the API at all), or it has more blobs than the REST
+/// path handles efficiently. Pure so the routing threshold is unit-tested without a network.
+fn tree_needs_clone(tree: &Tree) -> bool {
+    tree.truncated || tree.entries.len() > BIG_TREE_BLOBS
 }
 
 /// Scan one repo entirely through the API: default-branch tip first (findings stay
@@ -334,7 +362,10 @@ fn api_scan_repo(
                 return Ok(out);
             }
         };
-        if tree.truncated {
+        // A truncated or simply large tree scans far faster (and without exhausting the REST
+        // quota) via one shallow clone than via per-blob REST across every code file. Decided
+        // from the tree listing already in hand — before a single blob is fetched.
+        if tree_needs_clone(&tree) {
             return Ok(fallback_clone_scan(repo, packs, token));
         }
         let files = ApiTree::new(host, &repo.full_name, &tree, cache);
@@ -486,7 +517,7 @@ fn fix_scanned(
     let dest = base.join(sanitize_full_name(&sr.repo.full_name));
     // Blobless: the fix only edits/commits/pushes the default working tree, so downloading
     // every blob of every branch (the old full clone) was the fix path's dominant wait.
-    if let Err(e) = clone_repo(&sr.repo, &dest, token, true) {
+    if let Err(e) = clone_repo(&sr.repo, &dest, token, true, None) {
         outcome.error = Some(e);
         return outcome;
     }
@@ -853,6 +884,45 @@ mod tests {
         git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
         git_ok(&src, &["push", "-q", "origin", "main"]);
         bare
+    }
+
+    #[test]
+    fn tree_needs_clone_gate() {
+        // Truncated always clones (too large to enumerate over the API).
+        assert!(tree_needs_clone(&Tree { entries: vec![], truncated: true }));
+        // A small tree uses the API path.
+        let small: Vec<TreeEntry> = (0..10)
+            .map(|i| TreeEntry { path: PathBuf::from(format!("f{i}.js")), sha: "s".into() })
+            .collect();
+        assert!(!tree_needs_clone(&Tree { entries: small, truncated: false }));
+        // Above the blob threshold, clone even when not truncated (avoids per-blob REST amplification).
+        let big: Vec<TreeEntry> = (0..BIG_TREE_BLOBS + 1)
+            .map(|i| TreeEntry { path: PathBuf::from(format!("f{i}.js")), sha: "s".into() })
+            .collect();
+        assert!(tree_needs_clone(&Tree { entries: big, truncated: false }));
+    }
+
+    #[test]
+    fn fallback_clone_scan_detects_infection_via_shallow_clone() {
+        // The big/truncated-repo path: fallback_clone_scan clones (shallow, all branches) and runs
+        // the full local scan. It must detect the infected config from a real clone of the bare origin.
+        let tmp = TempDir::new().unwrap();
+        let bare = make_infected_origin(&tmp);
+        let repo = RepoRef {
+            full_name: "me/big".into(),
+            clone_url: bare.to_string_lossy().to_string(),
+            default_branch: "main".into(),
+            fork: false,
+        };
+        let sr = fallback_clone_scan(&repo, &builtin_packs(), "");
+        assert!(sr.error.is_none(), "unexpected error: {:?}", sr.error);
+        assert!(
+            sr.findings.iter().any(|f| f.file == Some(PathBuf::from("postcss.config.mjs"))),
+            "shallow clone scan must detect the infected config, got {:?}",
+            sr.findings
+        );
+        // Findings are relabeled onto the virtual repo path, not the temp clone dir.
+        assert!(sr.findings.iter().all(|f| f.repo == PathBuf::from("me/big")));
     }
 
     #[test]

@@ -204,23 +204,40 @@ impl GitHubHost {
                 "refusing to send token to unexpected host: {url}"
             )));
         }
-        match ureq::get(url)
-            .set("Authorization", &format!("Bearer {}", self.token))
-            .set("User-Agent", "wormward")
-            .set("Accept", "application/vnd.github+json")
-            .call()
-        {
-            Ok(resp) => Ok(resp),
-            // 429, or 403 with the quota actually exhausted, is a rate limit — fatal for
-            // the run. A plain 403 (permissions) stays a per-repo Http error.
-            Err(ureq::Error::Status(code, resp))
-                if code == 429
-                    || (code == 403 && resp.header("x-ratelimit-remaining") == Some("0")) =>
+        // A fast parallel sweep trips GitHub's SECONDARY rate limit, which is transient and comes
+        // with a Retry-After / reset hint — so pause and retry instead of aborting the whole run.
+        // A far-off reset (true PRIMARY-quota exhaustion) has no cheap recovery, so give up fast.
+        for _ in 0..=MAX_RATE_RETRIES {
+            match ureq::get(url)
+                .set("Authorization", &format!("Bearer {}", self.token))
+                .set("User-Agent", "wormward")
+                .set("Accept", "application/vnd.github+json")
+                .call()
             {
-                Err(GithubError::RateLimited(format!("HTTP {code} from {url}")))
+                Ok(resp) => return Ok(resp),
+                // 429, or 403 with the quota actually exhausted, is a rate limit. A plain 403
+                // (missing scope / permissions) stays a per-repo Http error.
+                Err(ureq::Error::Status(code, resp))
+                    if code == 429
+                        || (code == 403 && resp.header("x-ratelimit-remaining") == Some("0")) =>
+                {
+                    let now = now_epoch_secs();
+                    match retry_wait(
+                        resp.header("retry-after"),
+                        resp.header("x-ratelimit-reset"),
+                        now,
+                        MAX_RATE_WAIT_SECS,
+                    ) {
+                        Some(wait) => std::thread::sleep(wait),
+                        None => {
+                            return Err(GithubError::RateLimited(format!("HTTP {code} from {url}")))
+                        }
+                    }
+                }
+                Err(e) => return Err(GithubError::Http(e.to_string())),
             }
-            Err(e) => Err(GithubError::Http(e.to_string())),
         }
+        Err(GithubError::RateLimited(format!("rate limited after {MAX_RATE_RETRIES} retries: {url}")))
     }
 
     fn get(&self, url: &str) -> Result<(Option<String>, String), GithubError> {
@@ -279,6 +296,43 @@ fn url_scheme(url: &str) -> Option<&str> {
 
 /// Cap on paginated requests to bound the loop even if a host keeps advertising a next link.
 const MAX_PAGES: usize = 1000;
+
+/// How many times a rate-limited request is retried after honoring the server's wait hint.
+const MAX_RATE_RETRIES: usize = 3;
+/// Longest single pause we'll take for a rate-limit hint. A wait longer than this signals real
+/// primary-quota exhaustion (reset up to an hour out) — not worth blocking the run for, so we
+/// surface RateLimited instead of sleeping.
+const MAX_RATE_WAIT_SECS: u64 = 60;
+
+/// Current UNIX time in whole seconds, for comparing against `x-ratelimit-reset` (also epoch secs).
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Decide how long to wait before retrying a rate-limited request, or `None` to give up. Pure so
+/// the policy is unit-tested without real sleeps or a clock. Prefers `Retry-After` (delta seconds,
+/// what secondary limits send); else derives the wait from `x-ratelimit-reset` (epoch secs) minus
+/// `now`. Returns `None` when there is no usable hint or the wait exceeds `cap_secs` (primary-quota
+/// exhaustion — recovery is too far off to block on). A non-positive computed wait retries
+/// immediately (0), which handles a reset that has just elapsed.
+fn retry_wait(
+    retry_after: Option<&str>,
+    ratelimit_reset: Option<&str>,
+    now_epoch: i64,
+    cap_secs: u64,
+) -> Option<std::time::Duration> {
+    let secs: i64 = if let Some(ra) = retry_after.and_then(|s| s.trim().parse::<i64>().ok()) {
+        ra
+    } else {
+        let reset = ratelimit_reset.and_then(|s| s.trim().parse::<i64>().ok())?;
+        reset - now_epoch
+    };
+    let secs = secs.max(0) as u64;
+    (secs <= cap_secs).then(|| std::time::Duration::from_secs(secs))
+}
 
 impl RepoHost for GitHubHost {
     fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
@@ -792,13 +846,38 @@ mod tests {
 
     #[test]
     fn rate_limit_is_a_distinct_error() {
+        // 403 + exhausted quota with a far-off reset (primary-quota exhaustion): no cheap recovery,
+        // so it surfaces RateLimited immediately rather than blocking on a long sleep.
         let server = MockServer::start();
+        let far = super::now_epoch_secs() + 3600;
         server.mock(|when, then| {
             when.method(GET).path("/repos/me/a/branches");
-            then.status(403).header("x-ratelimit-remaining", "0").body("{}");
+            then.status(403)
+                .header("x-ratelimit-remaining", "0")
+                .header("x-ratelimit-reset", far.to_string())
+                .body("{}");
         });
         let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
         assert!(matches!(host.list_branches("me/a"), Err(GithubError::RateLimited(_))));
+    }
+
+    #[test]
+    fn retry_wait_policy() {
+        use std::time::Duration;
+        let cap = 60;
+        // Retry-After (delta seconds) is honored when within the cap.
+        assert_eq!(retry_wait(Some("5"), None, 1000, cap), Some(Duration::from_secs(5)));
+        // Reset-based wait = reset - now.
+        assert_eq!(retry_wait(None, Some("1030"), 1000, cap), Some(Duration::from_secs(30)));
+        // A reset already in the past retries immediately (0), never a negative/huge wait.
+        assert_eq!(retry_wait(None, Some("900"), 1000, cap), Some(Duration::ZERO));
+        // Over the cap (primary-quota exhaustion, reset far out) → give up.
+        assert_eq!(retry_wait(None, Some("2000"), 1000, cap), None);
+        assert_eq!(retry_wait(Some("120"), None, 1000, cap), None);
+        // No usable hint → give up.
+        assert_eq!(retry_wait(None, None, 1000, cap), None);
+        // Retry-After takes precedence over reset.
+        assert_eq!(retry_wait(Some("3"), Some("9999"), 1000, cap), Some(Duration::from_secs(3)));
     }
 
     #[test]

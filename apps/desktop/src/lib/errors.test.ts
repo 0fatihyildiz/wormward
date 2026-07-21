@@ -20,21 +20,21 @@ describe("humanizeError", () => {
     );
   });
 
-  it("maps 403 to a refused request", () => {
+  it("maps 403 to a missing-scope message", () => {
     expect(humanizeError("Error: 403")).toBe(
-      "GitHub refused the request — token permissions or rate limit. Check the token's scope, or wait and retry.",
+      "GitHub refused the request — your token is missing a required scope. Give it repo read (and write, to fix) access in Settings.",
     );
   });
 
-  it("maps 'forbidden' to a refused request", () => {
+  it("maps 'forbidden' to a missing-scope message", () => {
     expect(humanizeError("Forbidden")).toBe(
-      "GitHub refused the request — token permissions or rate limit. Check the token's scope, or wait and retry.",
+      "GitHub refused the request — your token is missing a required scope. Give it repo read (and write, to fix) access in Settings.",
     );
   });
 
-  it("maps 'rate limit' to a refused request", () => {
-    expect(humanizeError("API rate limit exceeded")).toBe(
-      "GitHub refused the request — token permissions or rate limit. Check the token's scope, or wait and retry.",
+  it("maps 'rate limit' to a distinct wait-and-retry message", () => {
+    expect(humanizeError("github rate limit: HTTP 403 from ...")).toBe(
+      "GitHub rate limit reached — wormward paused and retried, but it's still limited. Wait a few minutes and try again.",
     );
   });
 
