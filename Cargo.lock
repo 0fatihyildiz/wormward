@@ -2163,6 +2163,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "httpmock",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

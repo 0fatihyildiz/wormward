@@ -261,23 +261,39 @@ fn list_packs() -> Vec<PackInfo> {
 
 #[tauri::command]
 async fn clean_preview(dirs: Vec<String>) -> Result<Vec<RepoPlan>, String> {
-    let packs = builtin_packs();
-    let mut out = Vec::new();
-    for dir in to_paths(dirs) {
-        for repo in discover_repos(&dir) {
-            let findings = scan_repo(&repo, &packs);
-            let plan = plan_remediation(&findings, &packs);
-            if plan.actions.is_empty() && plan.manual.is_empty() {
-                continue;
-            }
-            out.push(RepoPlan {
-                repo: repo.display().to_string(),
-                actions: plan.actions,
-                manual: plan.manual,
-            });
+    // spawn_blocking + rayon: the preview re-scan is as CPU/I/O-heavy as a full scan, so it
+    // must neither pin the async executor nor run repo-by-repo sequentially (it used to do
+    // both, which made "Clean" take a multiple of the scan the user had just watched).
+    tauri::async_runtime::spawn_blocking(move || {
+        use rayon::prelude::*;
+        let packs = builtin_packs();
+        let mut repos: Vec<PathBuf> = Vec::new();
+        for dir in to_paths(dirs) {
+            repos.extend(discover_repos(&dir));
         }
-    }
-    Ok(out)
+        repos.sort();
+        repos.dedup();
+        let mut out: Vec<RepoPlan> = repos
+            .par_iter()
+            .filter_map(|repo| {
+                let findings = scan_repo(repo, &packs);
+                let plan = plan_remediation(&findings, &packs);
+                if plan.actions.is_empty() && plan.manual.is_empty() {
+                    return None;
+                }
+                Some(RepoPlan {
+                    repo: repo.display().to_string(),
+                    actions: plan.actions,
+                    manual: plan.manual,
+                })
+            })
+            .collect();
+        // Parallel collection order is nondeterministic; keep the list stable for the UI.
+        out.sort_by(|a, b| a.repo.cmp(&b.repo));
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Clean exactly the repos the user selected (paths from `clean_preview`), rather than
@@ -285,48 +301,66 @@ async fn clean_preview(dirs: Vec<String>) -> Result<Vec<RepoPlan>, String> {
 /// no-op.
 #[tauri::command]
 async fn clean_apply(repos: Vec<String>) -> Result<CleanSummary, String> {
-    let packs = builtin_packs();
-    let mut summary = CleanSummary {
-        repos: 0,
-        applied: 0,
-        skipped: Vec::new(),
-        backups: Vec::new(),
-    };
-    for repo in to_paths(repos) {
-        let findings = scan_repo(&repo, &packs);
-        let plan = plan_remediation(&findings, &packs);
-        if plan.actions.is_empty() {
-            continue;
+    tauri::async_runtime::spawn_blocking(move || {
+        use rayon::prelude::*;
+        let packs = builtin_packs();
+        // The freshness re-scan before writing (repos may have changed since the preview) runs
+        // per selected repo in parallel; each repo's apply is independent (its own working tree
+        // and backup dir), so the whole per-repo unit parallelizes safely.
+        let results: Vec<_> = to_paths(repos)
+            .par_iter()
+            .filter_map(|repo| {
+                let findings = scan_repo(repo, &packs);
+                let plan = plan_remediation(&findings, &packs);
+                if plan.actions.is_empty() {
+                    return None;
+                }
+                Some(apply(repo, &plan.actions, true))
+            })
+            .collect();
+        let mut summary = CleanSummary {
+            repos: 0,
+            applied: 0,
+            skipped: Vec::new(),
+            backups: Vec::new(),
+        };
+        for res in results {
+            summary.repos += 1;
+            summary.applied += res.applied.len();
+            for (a, e) in res.skipped {
+                summary.skipped.push(SkippedAction {
+                    action: describe(&a),
+                    reason: e,
+                });
+            }
+            if let Some(bd) = res.backup_dir {
+                summary.backups.push(bd.display().to_string());
+            }
         }
-        let res = apply(&repo, &plan.actions, true);
-        summary.repos += 1;
-        summary.applied += res.applied.len();
-        for (a, e) in res.skipped {
-            summary.skipped.push(SkippedAction {
-                action: describe(&a),
-                reason: e,
-            });
-        }
-        if let Some(bd) = res.backup_dir {
-            summary.backups.push(bd.display().to_string());
-        }
-    }
-    Ok(summary)
+        summary
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn restore(dirs: Vec<String>) -> Result<RestoreSummary, String> {
-    let mut summary = RestoreSummary { repos: 0, restored: 0 };
-    for dir in to_paths(dirs) {
-        for repo in discover_repos(&dir) {
-            let r = core_restore(&repo);
-            if r.backup_dir.is_some() {
-                summary.repos += 1;
-                summary.restored += r.restored.len();
+    // spawn_blocking: rediscovery walks the whole tree; don't pin the async executor.
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut summary = RestoreSummary { repos: 0, restored: 0 };
+        for dir in to_paths(dirs) {
+            for repo in discover_repos(&dir) {
+                let r = core_restore(&repo);
+                if r.backup_dir.is_some() {
+                    summary.repos += 1;
+                    summary.restored += r.restored.len();
+                }
             }
         }
-    }
-    Ok(summary)
+        summary
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ---- Feature B: cross-branch cleaning -------------------------------------------------
@@ -372,23 +406,38 @@ pub struct BranchCleanApplySummary {
 /// Never mutates anything.
 #[tauri::command]
 async fn clean_branches_preview(dirs: Vec<String>) -> Result<Vec<BranchCleanPreview>, String> {
-    let packs = builtin_packs();
-    let ts = now_secs();
-    let mut out = Vec::new();
-    for dir in to_paths(dirs) {
-        for repo in discover_repos(&dir) {
-            let findings = deep_scan_repo(&repo, &packs);
-            for plan in plan_branch_cleans(&findings, &packs, ts) {
-                out.push(BranchCleanPreview {
-                    repo: plan.repo.display().to_string(),
-                    branch: plan.branch,
-                    backup_ref: plan.backup_ref,
-                    action_count: plan.actions.len(),
-                });
-            }
+    // spawn_blocking + rayon: a deep scan per repo is the heaviest scan there is; run repos in
+    // parallel and keep the async executor free (this used to be a sequential loop on it).
+    tauri::async_runtime::spawn_blocking(move || {
+        use rayon::prelude::*;
+        let packs = builtin_packs();
+        let ts = now_secs();
+        let mut repos: Vec<PathBuf> = Vec::new();
+        for dir in to_paths(dirs) {
+            repos.extend(discover_repos(&dir));
         }
-    }
-    Ok(out)
+        repos.sort();
+        repos.dedup();
+        let mut out: Vec<BranchCleanPreview> = repos
+            .par_iter()
+            .flat_map(|repo| {
+                let findings = deep_scan_repo(repo, &packs);
+                plan_branch_cleans(&findings, &packs, ts)
+                    .into_iter()
+                    .map(|plan| BranchCleanPreview {
+                        repo: plan.repo.display().to_string(),
+                        branch: plan.branch,
+                        backup_ref: plan.backup_ref,
+                        action_count: plan.actions.len(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.repo, &a.branch).cmp(&(&b.repo, &b.branch)));
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Apply branch-clean plans for exactly the selected (repo, branch) pairs. Re-derives the
@@ -400,27 +449,34 @@ async fn clean_branches_apply(
     selected: Vec<BranchSelection>,
     push: bool,
 ) -> Result<BranchCleanApplySummary, String> {
-    let packs = builtin_packs();
-    let ts = now_secs();
+    let outcomes = tauri::async_runtime::spawn_blocking(move || {
+        use rayon::prelude::*;
+        let packs = builtin_packs();
+        let ts = now_secs();
 
-    // Group the selected branches by repo so each repo is deep-scanned once.
-    let mut by_repo: HashMap<String, HashSet<String>> = HashMap::new();
-    for s in selected {
-        by_repo.entry(s.repo).or_default().insert(s.branch);
-    }
-
-    let mut plans = Vec::new();
-    for (repo_str, branches) in by_repo {
-        let repo = PathBuf::from(&repo_str);
-        let findings = deep_scan_repo(&repo, &packs);
-        for plan in plan_branch_cleans(&findings, &packs, ts) {
-            if branches.contains(&plan.branch) {
-                plans.push(plan);
-            }
+        // Group the selected branches by repo so each repo is deep-scanned once; the per-repo
+        // deep scans run in parallel (they only read git objects, no working-tree writes).
+        let mut by_repo: HashMap<String, HashSet<String>> = HashMap::new();
+        for s in selected {
+            by_repo.entry(s.repo).or_default().insert(s.branch);
         }
-    }
 
-    let outcomes = apply_branch_cleans(&plans, false, push);
+        let plans: Vec<_> = by_repo
+            .into_par_iter()
+            .flat_map(|(repo_str, branches)| {
+                let repo = PathBuf::from(&repo_str);
+                let findings = deep_scan_repo(&repo, &packs);
+                plan_branch_cleans(&findings, &packs, ts)
+                    .into_iter()
+                    .filter(|plan| branches.contains(&plan.branch))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        apply_branch_cleans(&plans, false, push)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     let mut summary = BranchCleanApplySummary {
         results: Vec::new(),
         cleaned: 0,

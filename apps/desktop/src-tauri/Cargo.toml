@@ -19,6 +19,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rayon = "1"
 wormward-core = { path = "../../../crates/wormward-core" }
 wormward-packs = { path = "../../../crates/wormward-packs" }
 wormward-doctor = { path = "../../../crates/wormward-doctor" }

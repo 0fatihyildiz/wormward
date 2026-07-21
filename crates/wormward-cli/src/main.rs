@@ -462,9 +462,19 @@ fn main() -> ExitCode {
                 // capability findings on a non-default branch) — surfaced, never cleaned.
                 branch_manual: Vec<wormward_core::Finding>,
             }
-            let mut works: Vec<RepoWork> = Vec::new();
+            // Discover once across all dirs (dedup overlapping roots), then scan repos in
+            // PARALLEL — the same rayon fan-out `scan` uses. The clean scan phase used to be
+            // sequential, which made a clean take a multiple of the scan the user just ran.
+            let mut repos: Vec<PathBuf> = Vec::new();
             for dir in &dirs {
-                for repo in discover_repos(dir) {
+                repos.extend(discover_repos(dir));
+            }
+            repos.sort();
+            repos.dedup();
+            use rayon::prelude::*;
+            let mut works: Vec<RepoWork> = repos
+                .into_par_iter()
+                .filter_map(|repo| {
                     let findings = scan_repo(&repo, &packs);
                     let plan = plan_remediation(&findings, &packs);
                     // Cross-branch: plan cleans for infected tips of other branches.
@@ -483,11 +493,13 @@ fn main() -> ExitCode {
                         && branch_plans.is_empty()
                         && branch_manual.is_empty()
                     {
-                        continue;
+                        return None;
                     }
-                    works.push(RepoWork { repo, findings, plan, branch_plans, branch_manual });
-                }
-            }
+                    Some(RepoWork { repo, findings, plan, branch_plans, branch_manual })
+                })
+                .collect();
+            // Parallel collection order is nondeterministic; keep output/prompt order stable.
+            works.sort_by(|a, b| a.repo.cmp(&b.repo));
 
             // Print every repo's plan (the "would …" lines) up front, for both dry-run
             // and apply. total_actions drives the dry-run exit code.
