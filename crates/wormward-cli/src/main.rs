@@ -64,6 +64,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = IocFormat::List)]
         format: IocFormat,
     },
+    /// Mine NEW threat intelligence from a directory of payloads: decoder names, version-tag
+    /// families, and typosquat package names not yet in the baseline — the self-updating loop.
+    Hunt {
+        #[arg(default_value = ".")]
+        dir: std::path::PathBuf,
+    },
     /// Check a single asset against the live OSM database.
     Check {
         /// report_type: package | repository | url | domain | ip | wallet | container
@@ -364,6 +370,34 @@ fn main() -> ExitCode {
             };
             print!("{out}");
             ExitCode::from(0)
+        }
+        Command::Hunt { dir } => {
+            use std::collections::BTreeSet;
+            use wormward_core::{baseline, extract_new_iocs, RepoFiles, WorkingTree};
+            let (kd, kf) = baseline();
+            let files = WorkingTree::new(&dir);
+            let (mut decoders, mut families, mut packages) =
+                (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+            for rel in files.paths() {
+                let Some(content) = files.read(rel) else { continue };
+                let n = extract_new_iocs(&content, &kd, &kf);
+                decoders.extend(n.decoders);
+                families.extend(n.version_families);
+                packages.extend(n.packages);
+            }
+            let total = decoders.len() + families.len() + packages.len();
+            println!("# wormward hunt — new intelligence in {}\n", dir.display());
+            let dump = |label: &str, set: &BTreeSet<String>| {
+                println!("[new {label}] ({})", set.len());
+                for v in set {
+                    println!("  {v}");
+                }
+            };
+            dump("decoders", &decoders);
+            dump("version-families", &families);
+            dump("typosquat-packages", &packages);
+            // Exit 1 when new intelligence is found, so CI/cron can alert on campaign evolution.
+            ExitCode::from(if total > 0 { 1 } else { 0 })
         }
         Command::Check { report_type, ecosystem, version, osm_token, identifier } => {
             let token = osm_token
