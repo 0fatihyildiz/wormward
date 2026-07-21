@@ -32,10 +32,12 @@ const CONFIG_EXTS: &[&str] = &["js", "mjs", "cjs", "ts"];
 const ENTRY_BASENAMES: &[&str] = &["index.js", "app.js", "truffle.js"];
 const PROP_EXTS: &[&str] = &["bat", "cmd", "sh", "ps1"];
 const ASSET_EXTS: &[&str] = &["woff", "woff2", "ttf", "otf", "eot", "png", "jpg", "jpeg", "gif", "ico"];
-// `node_modules` / `.wormward-backup` mirror the working-tree walk prune (walk::is_pruned_dir)
-// so a GitTree / ApiTree — whose path lists are NOT pre-pruned — scan the same file set the
-// WorkingTree does. Without this, a committed node_modules produces deep-scan-only phantom findings.
-const EXCLUDED_DIRS: &[&str] = &[
+// Shared with the working-tree walk (walk::is_pruned_dir): these dirs are pruned at WALK time so
+// multi-GB build outputs (a Rust target/, a bundler dist/) are never enumerated, AND still checked
+// per-path here so a GitTree / ApiTree — whose path lists are NOT pre-pruned — scans the same file
+// set the WorkingTree does. Without the per-path check, a committed node_modules produces
+// deep-scan-only phantom findings.
+pub(crate) const EXCLUDED_DIRS: &[&str] = &[
     "dist", "build", ".next", "out", "coverage", "vendor", "node_modules", ".wormward-backup",
     "target",
 ];

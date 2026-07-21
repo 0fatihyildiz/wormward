@@ -16,6 +16,7 @@ wormward-doctor = { path = "../wormward-doctor" }
 wormward-osm = { path = "../wormward-osm" }
 wormward-github = { path = "../wormward-github" }
 clap = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dialoguer = { workspace = true }
