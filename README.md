@@ -127,6 +127,19 @@ wormward export-rules --format sigma     > wormward.sigma.yml
 wormward export-rules --format suricata  > wormward.rules
 ```
 
+## MCP server (Claude Code / Cursor / Codex)
+
+Run wormward as an MCP server so AI coding assistants can drive its tools (scan, check-package,
+doctor, export-iocs, hunt, clean, harden) — read-only by default; the mutating tools are dry-run
+unless explicitly applied:
+
+```bash
+wormward mcp                          # stdio JSON-RPC MCP server
+claude mcp add wormward -- wormward mcp
+```
+
+See [docs/mcp.md](docs/mcp.md) for Cursor / Codex config and the full tool list.
+
 ## Pre-install package check
 
 Catch the delivery vector BEFORE `npm install` runs it — fetch a package's metadata + entry from the

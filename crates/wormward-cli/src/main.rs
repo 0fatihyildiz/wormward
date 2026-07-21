@@ -1,4 +1,5 @@
 mod doctor;
+mod mcp;
 mod report;
 mod select;
 
@@ -76,6 +77,9 @@ enum Command {
         /// Package name (optionally `name@version`).
         name: String,
     },
+    /// Run as an MCP (Model Context Protocol) stdio server so MCP clients — Claude Code, Cursor,
+    /// Codex — can drive wormward's tools. Speaks newline-delimited JSON-RPC on stdin/stdout.
+    Mcp,
     /// Check a single asset against the live OSM database.
     Check {
         /// report_type: package | repository | url | domain | ip | wallet | container
@@ -405,6 +409,7 @@ fn main() -> ExitCode {
             // Exit 1 when new intelligence is found, so CI/cron can alert on campaign evolution.
             ExitCode::from(if total > 0 { 1 } else { 0 })
         }
+        Command::Mcp => mcp::run(),
         Command::CheckPackage { name } => match wormward_osm::check_npm_package(&name) {
             Ok(c) if c.malicious => {
                 println!("MALICIOUS  {}@{} — {}", c.name, c.version, c.reason);
