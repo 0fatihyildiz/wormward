@@ -3,6 +3,7 @@ pub mod engine;
 pub mod finding;
 pub mod git;
 pub mod histrewrite;
+pub mod iocs;
 pub mod lockfile;
 pub mod matchers;
 pub mod osv;
@@ -19,6 +20,7 @@ pub mod walk;
 
 pub use engine::{SigHit, SignatureEngine};
 pub use finding::{Finding, FindingKind, OnlineVerdict, Severity};
+pub use iocs::{collect_iocs, to_ioc_list, to_npm_report, to_stix, Iocs};
 pub use histrewrite::{git_filter_repo_available, replace_text_expressions, rewrite_history};
 pub use lockfile::{check_lockfiles, parse_lockfile, version_matches, LockEntry};
 pub use osv::{osv_available, osv_scan, OsvHit};

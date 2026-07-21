@@ -127,6 +127,18 @@ wormward export-rules --format sigma     > wormward.sigma.yml
 wormward export-rules --format suricata  > wormward.rules
 ```
 
+## Export takedown IOCs
+
+Turn the detected campaign into disruption-ready artifacts — reporting the malicious packages cuts
+the delivery vector at the source:
+
+```bash
+wormward export-iocs --format list        # machine-readable feed (packages, domains, addresses)
+wormward export-iocs --format npm-report  # ready-to-submit npm abuse report (wholly-malicious pkgs;
+                                          #   version-pinned legit packages report versions, not removal)
+wormward export-iocs --format stix        # STIX 2.1 bundle for sharing with the ecosystem
+```
+
 ## CI integration
 
 Ship the read-only scan as a GitHub Action that fails the build on findings and uploads SARIF. It is

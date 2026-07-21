@@ -58,6 +58,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = RuleFormat::Yara)]
         format: RuleFormat,
     },
+    /// Export takedown-ready IOCs: a machine-readable feed, an npm abuse-report draft, or a
+    /// STIX 2.1 bundle (stdout). Reporting the malicious packages cuts the delivery vector.
+    ExportIocs {
+        #[arg(long, value_enum, default_value_t = IocFormat::List)]
+        format: IocFormat,
+    },
     /// Check a single asset against the live OSM database.
     Check {
         /// report_type: package | repository | url | domain | ip | wallet | container
@@ -188,6 +194,16 @@ enum RuleFormat {
     Yara,
     Sigma,
     Suricata,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum IocFormat {
+    /// Grouped machine-readable indicator feed (packages, domains, addresses, artifacts).
+    List,
+    /// Ready-to-submit npm abuse-report draft (the malicious packages).
+    NpmReport,
+    /// STIX 2.1 bundle of indicators, for sharing with the ecosystem.
+    Stix,
 }
 
 fn osm_base_url() -> String {
@@ -335,6 +351,16 @@ fn main() -> ExitCode {
                 RuleFormat::Yara => wormward_core::to_yara(&packs),
                 RuleFormat::Sigma => wormward_core::to_sigma(&packs),
                 RuleFormat::Suricata => wormward_core::to_suricata(&packs),
+            };
+            print!("{out}");
+            ExitCode::from(0)
+        }
+        Command::ExportIocs { format } => {
+            let packs = builtin_packs();
+            let out = match format {
+                IocFormat::List => wormward_core::to_ioc_list(&packs),
+                IocFormat::NpmReport => wormward_core::to_npm_report(&packs),
+                IocFormat::Stix => wormward_core::to_stix(&packs),
             };
             print!("{out}");
             ExitCode::from(0)
