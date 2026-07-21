@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use wormward_core::{
-    apply, apply_branch_cleans, deep_scan_repo, discover_repos, now_secs, plan_branch_cleans,
-    plan_remediation, restore as core_restore, scan_repo, scan_streaming, BranchCleanStatus,
-    Finding, RemediationAction, ScanReport,
+    apply_and_verify, apply_branch_cleans, deep_scan_repo, discover_repos, now_secs,
+    plan_branch_cleans, plan_remediation, restore as core_restore, scan_repo, scan_streaming,
+    BranchCleanStatus, Finding, RemediationAction, ScanReport,
 };
 use wormward_github::pipeline::{
     fix_pass, scan_pass_with_progress_cancellable, GithubRunOpts, ScanPass,
@@ -334,7 +334,9 @@ async fn clean_apply(repos: Vec<String>) -> Result<CleanSummary, String> {
                 if plan.actions.is_empty() {
                     return None;
                 }
-                Some(apply(repo, &plan.actions, true))
+                // apply_and_verify re-scans after applying and restores any file a strip couldn't
+                // fully clean — the local mirror of the GitHub fix path's revert-on-residual safety.
+                Some(apply_and_verify(repo, &plan.actions, &packs))
             })
             .collect();
         let mut summary = CleanSummary {

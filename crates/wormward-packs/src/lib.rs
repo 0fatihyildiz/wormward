@@ -607,6 +607,40 @@ mod tests {
     }
 
     #[test]
+    fn capability_only_config_is_auto_fixed() {
+        // A config caught ONLY by the capability engine (padding-injection worm tell; no pack
+        // content signature) must now be auto-fixable end to end: detected, planned as a strip,
+        // and cleaned by apply_and_verify — not left as "needs manual review".
+        use wormward_core::{apply_and_verify, plan_remediation};
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("v");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        // A NON-signature config name (so no pack target/signature matches) carrying the
+        // version-independent padding-injection structure the capability engine flags.
+        let pad = " ".repeat(2000);
+        fs::write(
+            repo.join("drizzle.config.mjs"),
+            format!("export default {{}};{pad}global.o='9-5334';var _$_beef=(function(a,b){{return eval(atob(a))}})('x',7);\n"),
+        )
+        .unwrap();
+        let packs = builtin_packs();
+        let findings = scan_repo(&repo, &packs);
+        assert!(
+            findings.iter().any(|f| f.file == Some(std::path::PathBuf::from("drizzle.config.mjs")) && f.remediable),
+            "capability-detected config must be flagged AND remediable, got {findings:?}"
+        );
+        let plan = plan_remediation(&findings, &packs);
+        assert!(!plan.actions.is_empty(), "must plan a strip action, got {:?}", plan.actions);
+        let res = apply_and_verify(&repo, &plan.actions, &packs);
+        assert!(!res.applied.is_empty(), "strip must apply and survive verify, skipped: {:?}", res.skipped);
+        // Re-scan: the config is clean now.
+        assert!(
+            scan_repo(&repo, &packs).iter().all(|f| f.file != Some(std::path::PathBuf::from("drizzle.config.mjs"))),
+            "config must be clean after the auto-fix"
+        );
+    }
+
+    #[test]
     fn date_skew_flags_antidated_commit() {
         use std::process::Command;
         let tmp = TempDir::new().unwrap();

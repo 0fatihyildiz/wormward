@@ -37,8 +37,8 @@ pub use git::{
 pub use matchers::{shannon_entropy, sha256_hex, ContentSignature, SignatureKind};
 pub use pack::{CampaignAnalyzer, Pack, PackError, PackManifest, ScannedFile};
 pub use remediate::{
-    action_for, apply, plan_remediation, restore, RemediationAction, RemediationPlan,
-    RemediationResult, RestoreResult,
+    action_for, apply, apply_and_verify, plan_remediation, restore, RemediationAction,
+    RemediationPlan, RemediationResult, RestoreResult,
 };
 pub use repo_files::{GitTree, RepoFiles, WorkingTree};
 pub use rewrite::{
