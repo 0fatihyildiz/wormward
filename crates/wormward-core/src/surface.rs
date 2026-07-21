@@ -43,6 +43,10 @@ pub(crate) const EXCLUDED_DIRS: &[&str] = &[
     // Next.js STATIC EXPORT output (`.next` is only the dev/build cache). Committed exports put
     // minified chunks under `<site>/_next/static/chunks/` — a real structural-injection FP class.
     "_next",
+    // Installed Python dependencies (a virtualenv's site-packages / share). The Python peer of
+    // node_modules — vendored, minified, not our source. A bundled Jupyter extension there tripped
+    // the capability engine's obfuscation/network heuristics (a real FP).
+    ".venv", "venv", "site-packages",
 ];
 
 const LIFECYCLE_KEYS: &[&str] = &[
@@ -259,6 +263,23 @@ mod tests {
         // Real source is NOT excluded.
         assert!(!is_excluded_path(Path::new("postcss.config.mjs")));
         assert!(!is_excluded_path(Path::new("src/index.js")));
+    }
+
+    #[test]
+    fn python_virtualenv_deps_excluded() {
+        // Installed Python deps live under a virtualenv's site-packages (or share/) — the same
+        // "vendored, minified, not our source" class as node_modules. A Plotly Jupyter extension
+        // bundle there tripped the capability engine's obfuscation/network heuristics (a real FP).
+        assert!(is_excluded_path(Path::new(
+            ".venv/lib/python3.12/site-packages/jupyterlab_plotly/nbextension/index.js"
+        )));
+        assert!(is_excluded_path(Path::new(
+            ".venv/share/jupyter/nbextensions/jupyterlab-plotly/index.js"
+        )));
+        assert!(is_excluded_path(Path::new("venv/lib/site-packages/pkg/x.js")));
+        assert!(is_excluded_path(Path::new("services/api/.venv/x/site-packages/dep/index.js")));
+        // Real source is NOT excluded just for mentioning venv in a name.
+        assert!(!is_excluded_path(Path::new("src/venv_helper.py")));
     }
 
     #[test]

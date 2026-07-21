@@ -72,6 +72,25 @@ lazy_re!(charcode_re, r"String\.fromCharCode\s*\(\s*\d+(?:\s*,\s*\d+){3,}");
 lazy_re!(decoder_re, r"_\$_[0-9a-f]{4,}");
 lazy_re!(evalish_re, r"\beval\s*\(|new\s+Function\s*\(|\batob\s*\(");
 
+/// True when `content` is a shell script (a `#!` shebang naming a POSIX shell). The obfuscation
+/// tells below are JavaScript constructs; in a shell script they are inert data — grep/regex
+/// pattern literals or example payloads in comments — as in a DEFENSIVE anti-worm hook that lists
+/// worm signatures to block. So JS `obfuscation` is not a concealment prior for a shell script; a
+/// genuinely malicious shell hook still fires via the behavioral worm tells (self-propagation,
+/// download-exec, wipe, exfil). A `#!/usr/bin/env node` hook is a JS host, not shell, so its
+/// obfuscation is real and still counts.
+fn is_shell_script(content: &str) -> bool {
+    let first = content.lines().next().unwrap_or("");
+    match first.trim_start().strip_prefix("#!") {
+        Some(rest) => {
+            let tok = rest.split_whitespace().last().unwrap_or("");
+            let name = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+            matches!(name, "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash")
+        }
+        None => false,
+    }
+}
+
 /// High-confidence lexical obfuscation: an injection marker with an eval/Function/atob sink,
 /// the ESM re-entry shim, or the family decoder-name / charcode-array tells. These are
 /// specific to injected payloads, so they alone may satisfy the FP-sensitive priors.
@@ -153,7 +172,15 @@ lazy_re!(
 fn starts_with_asset_magic(content: &str) -> bool {
     const MAGICS: &[&str] =
         &["wOF2", "wOFF", "OTTO", "ttcf", "true", "typ1", "GIF87a", "GIF89a", "RIFF"];
-    MAGICS.iter().any(|m| content.starts_with(m))
+    if MAGICS.iter().any(|m| content.starts_with(m)) {
+        return true;
+    }
+    // SVG is a legitimate (text/XML) vector image. A `.png`/`.gif` that is actually an SVG is a
+    // benign mislabel, not a fake-asset JS dropper — its incidental code-ish words (e.g. "function"
+    // in a <text> label) must not fire magic-mismatch. The fake-asset payload shape is whitespace +
+    // obfuscated JS, never well-formed XML markup.
+    let head = content.trim_start();
+    head.starts_with("<?xml") || head.starts_with("<svg")
 }
 
 fn magic_mismatch(content: &str, surface: Surface) -> bool {
@@ -605,7 +632,14 @@ pub fn score(content: &str, surface: Surface) -> CapabilityScore {
             ev.push(label.to_string());
         }
     };
-    mark(obfuscation(content), &mut s.obfuscation, "obfuscation", &mut s.evidence);
+    // JS obfuscation constructs are inert in a shell script (grep patterns / comment examples in a
+    // defensive hook), so they are not a concealment prior there — see `is_shell_script`.
+    mark(
+        obfuscation(content) && !is_shell_script(content),
+        &mut s.obfuscation,
+        "obfuscation",
+        &mut s.evidence,
+    );
     mark(high_entropy(content), &mut s.high_entropy, "high-entropy", &mut s.evidence);
     mark(
         credential_access(content, surface),
@@ -804,6 +838,45 @@ mod tests {
     fn magic_mismatch_only_on_binary_asset() {
         assert!(score("var x=require('fs');eval(y)", Surface::BinaryAsset).magic_mismatch);
         assert!(!score("var x=require('fs');eval(y)", Surface::ConfigFile).magic_mismatch);
+    }
+
+    #[test]
+    fn magic_mismatch_spares_svg_mislabeled_as_raster() {
+        // An SVG (XML) saved with a .png/.gif extension is a benign mislabel, not a fake-asset
+        // payload. A `<text>` label containing the word "function" must not make it a finding.
+        let svg = "<?xml version=\"1.0\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\"><text>state function</text></svg>";
+        assert!(!score(svg, Surface::BinaryAsset).magic_mismatch);
+        // Bare <svg> (no XML prolog) is also a real vector image.
+        assert!(!score("<svg><g><text>module.exports</text></g></svg>", Surface::BinaryAsset).magic_mismatch);
+        // A genuine fake-asset payload (no image/XML magic + JS) still fires.
+        assert!(score("   \n var _$_1e42=require('x')", Surface::BinaryAsset).magic_mismatch);
+    }
+
+    #[test]
+    fn defensive_shell_hook_listing_worm_signatures_not_flagged() {
+        // A bash pre-commit hook that greps FOR worm signatures (the _$_hex decoder id, .npmrc,
+        // fromCharCode) is a DETECTOR, not a payload — JS obfuscation constructs are inert data in
+        // a shell script. It must not trip the GitHook gate. This is the real FP on the user's own
+        // anti-worm hook installed via git-template across several repos.
+        // Faithful to the real trigger: the hook's COMMENTS carry example payloads (the `_$_hex`
+        // decoder id and `global.i='…'` version tag), and it greps for `.npmrc`.
+        let hook = "#!/usr/bin/env bash\nset -euo pipefail\n# obfuscator's mangled identifier scheme, e.g. var _$_913e=\n# campaign version marker, e.g. global.i='5-3-235'\nSTRICT=(\"_\\$_[0-9a-f]{4,8}\" \"String.fromCharCode(127)\")\nHEUR='(\\.npmrc|package\\.json)'\ngrep -qE \"$p\" && echo BLOCK\n";
+        let s = score(hook, Surface::GitHook);
+        assert!(!s.obfuscation, "JS obfuscation constructs in a shell script are grep patterns, not payload");
+        assert!(!gate(Surface::GitHook, &s), "a defensive detector hook must not be flagged: {:?}", s.evidence);
+    }
+
+    #[test]
+    fn malicious_hooks_still_fire() {
+        // A shell hook doing the git self-propagation conjunction is a real worm tell — still fires.
+        let evil_sh = "#!/bin/sh\ngit commit --amend --no-verify && git push -uf --no-verify\n";
+        assert!(gate(Surface::GitHook, &score(evil_sh, Surface::GitHook)));
+        // A NODE-shebang hook carrying an actual JS payload is a JS host, not shell, so the
+        // obfuscation suppression does not apply and it still fires.
+        let node_payload = "#!/usr/bin/env node\nglobal['x']=require('https');eval(atob('y'))\n";
+        let s = score(node_payload, Surface::GitHook);
+        assert!(s.obfuscation, "a node-shebang hook is a JS payload host, obfuscation must apply");
+        assert!(gate(Surface::GitHook, &s));
     }
 
     // --- new detectors (Task 5) ---
