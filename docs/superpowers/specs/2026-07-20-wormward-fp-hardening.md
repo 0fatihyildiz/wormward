@@ -182,6 +182,47 @@ argument) + executable JS.* Two of three is not "confirmed."
 
 ---
 
+## The mirror image — version-independent detection (false-NEGATIVE hardening)
+
+The same principle that kills false positives — *match structure, not per-instance constants* —
+also kills false **negatives**. A campaign that rotates its own constants each wave (the version
+tag `5-3-235` → `5-3-168` → `5-3-999`, the decoder `_$_8e2c` → `_$_3317`, the seed `3899501` →
+`3657078`) turns any constant-keyed signature into a next-wave miss. Detection must key on what the
+family *cannot* change without abandoning its technique.
+
+Three structural, version-independent detectors are the primary catch (per-version literals are kept
+only as **attribution**, to label *which* wave — never as the sole detection):
+
+1. **Padding-injection** (`capability.rs` `padding_injection`, a self-evident worm tell in `gate`):
+   a physical line with `\S … [ \t]{200,} … \S` — real content, a ≥200 space/tab run, then more
+   content. This is the injection's shape (`<legit code><~2000 spaces><obfuscated blob>` on the
+   file's last line) and no constant rotation removes it. It fires **even when the payload's
+   behavior is concealed** inside its obfuscated blob (so no plaintext network/spawn capability is
+   visible) — which was exactly the wave-3 gate miss. FP-safe *by construction*: minifiers strip
+   whitespace (no runs), lockfiles are short lines, and a base64/WASM blob is one contiguous token
+   with no interior run-then-code. Shared with the analyzer's confirm path, one predicate.
+2. **Generic version-tag / decoder / shim** (`analyzer.rs`, `capability.rs`): `global.<k>='5-3-*'`
+   (any suffix), the `_$_[0-9a-f]{4,}` decoder as a defined identifier, and the
+   `global[…]=require|module` ESM re-entry shim — all matched by shape, not by the specific string.
+3. **Structure over enumeration at the FILE layer too.** The wave-3 repos were reported clean
+   because the newly-targeted files (`metro.config.js`, `app.config.ts`, `seed.ts`, `migrate.ts`)
+   were in *neither* the pack's `target_files` allowlist *nor* `classify()`'s config-stem allowlist —
+   two enumerations that both failed on the same expansion. Fixed by generalizing both: **any**
+   `*.config.{js,cjs,mjs,ts}` is a `ConfigFile` surface (`classify`) and a pack target (`*.config.*`
+   globs), plus the known `seed`/`migrate` script names. A clean config of any name still never
+   fires — the gate requires a concealment prior or a worm tell.
+
+Remediation is structural to match: cut the payload at the ≥200-space padding run (or the generic
+marker/decoder), and remove the injected `createRequire` shim **only if no genuine `require(`
+remains** — so a config that legitimately uses `createRequire` for CJS interop is not broken.
+
+**Acceptance** (`wormward-packs` + `capability_integration`): a `5-3-168`/`_$_3317` payload (in no
+signature list) and a hypothetical `5-3-999-zz` payload are both DETECTED and CLEANED across the
+expanded file set and on non-default branch tips (`--deep`); minified bundles, `yarn.lock`,
+`public/assets/` bundled copies, and `@rive-app` WASM `.mjs` (base64 containing `MDy`) are NOT.
+
+---
+
 ## Checklist for adding a new signature (avoid re-introducing FPs)
 
 Before adding any literal/regex IOC, confirm:

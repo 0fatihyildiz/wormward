@@ -41,6 +41,15 @@ pub struct CapabilityScore {
     /// variation-selector/tag stego run). A self-evident worm tell — hidden control characters are
     /// effectively never legitimate in source code.
     pub invisible_unicode: bool,
+    /// A physical line carrying `\S … [ \t]{200,} … \S` — a long horizontal-whitespace run with
+    /// real content on BOTH sides of it. This is the PolinRider injection structure
+    /// (`<legit code>` + ~2000 spaces + obfuscated blob on the file's last line) and is
+    /// version-independent: it survives every rotation of the version tag / decoder name / seed.
+    /// FP-safe by construction — minifiers strip whitespace (no runs), lockfiles are short lines,
+    /// and a base64/WASM blob is one contiguous token with no interior space run followed by code.
+    /// A self-evident worm tell: deliberate mid-line padding to push a payload off-screen is never
+    /// legitimate in an auto-run source file.
+    pub padding_injection: bool,
     pub evidence: Vec<String>,
 }
 
@@ -381,6 +390,43 @@ fn destructive_wipe(content: &str) -> bool {
     wipe_re().is_match(content)
 }
 
+// --- PaddingInjection (version-independent structural tell) ---
+/// True if any physical line contains a run of ≥200 space/tab characters with real (non-space)
+/// content on BOTH sides of it — the `\S … [ \t]{200,} … \S` shape. This is the strongest
+/// version-independent PolinRider signal: the family appends `<legit code>` + ~2000 spaces +
+/// an obfuscated blob to a config's last line, and no rotation of the version string / decoder
+/// name / seed changes that structure. FP-safe by construction (see the struct-field doc).
+///
+/// Public so the campaign analyzer (`wormward-packs`) shares the exact same structural predicate —
+/// one definition, so the capability gate and the analyzer's "confirmed" reason never drift.
+pub fn padding_injection(content: &str) -> bool {
+    content.lines().any(line_has_padding_run)
+}
+
+/// One line's test: a ≥200-long space/tab run that has a non-whitespace char somewhere before it
+/// AND a non-whitespace char somewhere after it, on the same physical line. Requiring content on
+/// BOTH sides is what makes it FP-safe: pure indentation (leading run) and a trailing alignment
+/// pad (no content after) do not qualify — only a run wedged BETWEEN two pieces of content, which
+/// is the injection's `code<pad>payload` shape.
+fn line_has_padding_run(line: &str) -> bool {
+    let mut run = 0usize;
+    let mut content_before_run = false;
+    for b in line.bytes() {
+        if b == b' ' || b == b'\t' {
+            run += 1;
+        } else {
+            // A non-whitespace byte: if we just closed a ≥200 run that had content before it,
+            // this byte is the content AFTER the run — the injection shape is complete.
+            if run >= 200 && content_before_run {
+                return true;
+            }
+            run = 0;
+            content_before_run = true;
+        }
+    }
+    false
+}
+
 /// The double-base64 exfil-staging blob shape: content begins `eyJ` (base64 of
 /// `{"`) and contains `==`. A standalone repo-level check (not a `Surface`).
 pub fn is_exfil_staging(content: &str) -> bool {
@@ -486,6 +532,12 @@ pub fn score(content: &str, surface: Surface) -> CapabilityScore {
         "invisible-unicode",
         &mut s.evidence,
     );
+    // Scored FIRST among the tells conceptually, but pushed here so it takes the top evidence slot
+    // for the injection class: it is the most specific, version-independent PolinRider signal.
+    if padding_injection(content) {
+        s.padding_injection = true;
+        s.evidence.insert(0, "padding-injection".to_string());
+    }
     s
 }
 
@@ -510,9 +562,15 @@ pub fn gate(surface: Surface, s: &CapabilityScore) -> bool {
     let concealed = s.obfuscation || s.trailing_code;
     // Self-evident worm tells — effectively never in legitimate automation, so they fire without
     // a concealment prior. Invisible/bidi-override Unicode (Trojan-Source / Glassworm stego) joins
-    // them: hidden control-character runs in source are never legitimate.
-    let worm_tell =
-        s.propagation || s.destructive_wipe || s.credential_exfil || s.invisible_unicode;
+    // them: hidden control-character runs in source are never legitimate. Padding-injection joins
+    // them too: a `code<200+ spaces>payload` line is the PolinRider injection structure itself —
+    // it must fire even when the payload's behavior is concealed inside its obfuscated blob (so no
+    // plaintext behavioral capability is visible), which is exactly the wave-3 miss.
+    let worm_tell = s.propagation
+        || s.destructive_wipe
+        || s.credential_exfil
+        || s.invisible_unicode
+        || s.padding_injection;
     match surface {
         // Config/entry files, one-hop dropped scripts, and every auto-run script surface
         // (lifecycle, workflow, git hook, propagation script) all require a concealment prior
@@ -744,6 +802,65 @@ mod tests {
     fn exfil_staging_double_base64() {
         assert!(is_exfil_staging("eyJhIjoiYiJ9\n==trailing"));
         assert!(!is_exfil_staging("{\"a\":\"b\"}"));
+    }
+
+    // --- PaddingInjection (version-independent structural tell) ---
+    #[test]
+    fn padding_injection_detected_on_code_pad_payload_line() {
+        // The PolinRider injection shape: legit code, ~2000 spaces, then an obfuscated blob, all on
+        // one physical line. Version-independent — no marker/decoder/seed constant is consulted.
+        let pad = " ".repeat(2000);
+        let line = format!("export default {{}};{pad}global.o='5-3-168-du';var _$_3317=eval(x);");
+        assert!(score(&line, Surface::ConfigFile).padding_injection);
+    }
+
+    #[test]
+    fn padding_injection_is_version_independent() {
+        // A hypothetical FUTURE wave with an all-new version tag and decoder name still trips —
+        // the structure, not the constants, is what fires.
+        let pad = "\t".repeat(300); // tabs count too
+        let line = format!("module.exports={{}};{pad}global.z='5-3-999-zz';var _$_ffff=atob(q);");
+        assert!(score(&line, Surface::ConfigFile).padding_injection);
+    }
+
+    #[test]
+    fn padding_injection_fp_safe_on_minified_and_lockfile_and_wasm() {
+        // Minified bundle: no whitespace runs at all.
+        let minified = "var a=1;function f(){return a+1};export default{f};".repeat(50);
+        assert!(!score(&minified, Surface::ConfigFile).padding_injection);
+        // yarn.lock: short lines, integrity hashes — no 200-run.
+        let lock = "# yarn lockfile v1\nfoo@^1.0.0:\n  version \"1.0.2\"\n  integrity sha512-abcDEF/1234==\n";
+        assert!(!score(lock, Surface::ConfigFile).padding_injection);
+        // @rive-app WASM glue: one long base64 token (no interior space run + trailing code).
+        let wasm = format!("var w='{}';export default w;", "AGFzbQEAAAABpMDyAL".repeat(400));
+        assert!(!score(&wasm, Surface::ConfigFile).padding_injection);
+    }
+
+    #[test]
+    fn padding_injection_needs_content_on_both_sides() {
+        // Pure deep indentation (a run with content only AFTER it) is not the injection shape.
+        let indented = format!("{}return x;", " ".repeat(400));
+        assert!(!score(&indented, Surface::ConfigFile).padding_injection);
+        // A trailing alignment pad (content only BEFORE the run, nothing after) is not it either.
+        let trailing = format!("const X = 1;{}", " ".repeat(400));
+        assert!(!score(&trailing, Surface::ConfigFile).padding_injection);
+        // A run just under the 200 threshold does not fire.
+        let short = format!("a{}b", " ".repeat(199));
+        assert!(!score(&short, Surface::ConfigFile).padding_injection);
+    }
+
+    #[test]
+    fn gate_padding_injection_fires_as_worm_tell() {
+        // The whole point: a padded payload conceals its behavior inside the blob, so `behavioral`
+        // is false in the raw text. Padding-injection must fire the gate ON ITS OWN (worm tell) on
+        // every auto-run surface — otherwise the concealed-behavior wave slips through.
+        assert!(gate(Surface::ConfigFile, &sc(|s| s.padding_injection = true)));
+        assert!(gate(Surface::DerivedScript, &sc(|s| s.padding_injection = true)));
+        assert!(gate(Surface::LifecycleScript, &sc(|s| s.padding_injection = true)));
+        // And end-to-end from real content on a ConfigFile.
+        let pad = " ".repeat(2000);
+        let cfg = format!("export default {{}};{pad}global.o='5-3-168-du';var _$_3317=eval(x);");
+        assert!(gate(Surface::ConfigFile, &score(&cfg, Surface::ConfigFile)));
     }
 
     // --- gate matrix (Task 6) ---

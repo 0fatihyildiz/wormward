@@ -142,6 +142,13 @@ pub fn strip_marker_matches(content: &str, markers: &[String]) -> bool {
 /// cut leaves behind (e.g. the PolinRider `createRequire` ESM shim at the top of the file). Each
 /// pattern is a `re:` regex or a literal substring, matched against the line; an invalid regex
 /// never matches. A no-op when `patterns` is empty.
+///
+/// One exception, version-independent and structural: a `createRequire` ESM shim line is removed
+/// ONLY when no genuine `require(` call survives the payload cut. The worm injects the shim so its
+/// appended payload can call `require()`; once the payload is gone the shim is dead and is removed.
+/// But a config may ALSO use `createRequire` for its own legitimate CJS interop — if a real
+/// `require(` call remains, the shim is load-bearing and is kept, so cleaning never breaks a
+/// legitimately-clean-after-strip config.
 fn remove_matching_lines(content: &str, patterns: &[String]) -> String {
     if patterns.is_empty() {
         return content.to_string();
@@ -152,7 +159,22 @@ fn remove_matching_lines(content: &str, patterns: &[String]) -> String {
             None => line.contains(p.as_str()),
         })
     };
-    let kept: Vec<&str> = content.lines().filter(|l| !matches(l)).collect();
+    // A genuine `require(` CALL on a line that is NOT itself an injected/removable line means the
+    // surviving config still needs `require` defined — so a require-providing shim must be kept.
+    // `createRequire(` is capital-R, so it never counts as a lowercase `require(` call here.
+    let genuine_require_remains =
+        content.lines().any(|l| !matches(l) && l.contains("require("));
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|l| {
+            if !matches(l) {
+                return true; // ordinary line — keep
+            }
+            // An injected line is dropped, UNLESS it is the require-providing shim and a genuine
+            // require( call still depends on it.
+            genuine_require_remains && l.contains("createRequire")
+        })
+        .collect();
     let mut out = kept.join("\n");
     if !out.is_empty() {
         out.push('\n');
@@ -473,6 +495,46 @@ mod tests {
         assert!(cleaned.contains("import path from 'path';"));
         assert!(cleaned.contains("const nextConfig = { output: 'standalone' };"));
         assert!(cleaned.contains("export default nextConfig;"));
+    }
+
+    #[test]
+    fn strip_keeps_createrequire_shim_when_legit_require_remains() {
+        // Task: remove the worm-added createRequire shim ONLY IF no other `require(` remains. Here
+        // the config legitimately calls require() for CJS interop; after the payload is cut that
+        // call survives, so the shim MUST be kept — removing it would leave `require` undefined and
+        // break the otherwise-clean config.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let padding = " ".repeat(240);
+        let content = format!(
+            "import {{ createRequire }} from 'module';\n\
+             const require = createRequire(import.meta.url);\n\
+             const legacy = require('./legacy-plugin');\n\
+             export default {{ plugins: [legacy] }};{padding}global.i='5-3-168';var _$_46e0=[];global[_$_46e0[0]]=require;"
+        );
+        fs::write(repo.join("vite.config.mjs"), &content).unwrap();
+        let a = RemediationAction::StripPayload {
+            file: PathBuf::from("vite.config.mjs"),
+            markers: vec![r"re:\x20{200,}".into(), "global['!']=".into()],
+            strip_lines: vec![
+                "import { createRequire } from 'module'".into(),
+                "createRequire(import.meta.url)".into(),
+            ],
+        };
+        apply(repo, &[a], false);
+        let cleaned = fs::read_to_string(repo.join("vite.config.mjs")).unwrap();
+        // Payload gone.
+        assert!(!cleaned.contains("_$_46e0"), "payload must be gone:\n{cleaned}");
+        assert!(!cleaned.contains("global.i="), "version marker must be gone:\n{cleaned}");
+        // Legit require call + the shim it depends on are KEPT.
+        assert!(
+            cleaned.contains("require('./legacy-plugin')"),
+            "legit require call must be preserved:\n{cleaned}"
+        );
+        assert!(
+            cleaned.contains("const require = createRequire(import.meta.url)"),
+            "shim must be kept when a genuine require( still remains:\n{cleaned}"
+        );
     }
 
     #[test]

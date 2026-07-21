@@ -14,20 +14,23 @@ references:
 severity: critical
 
 target_files:
-  - "postcss.config.mjs"
-  - "postcss.config.js"
-  - "tailwind.config.js"
-  - "eslint.config.mjs"
-  - "next.config.mjs"
-  - "next.config.ts"
-  - "babel.config.js"
-  - "jest.config.js"
-  - "vite.config.js"
-  - "vite.config.mjs"
-  - "astro.config.mjs"
-  - "webpack.config.js"
-  - "vue.config.js"
-  - "gridsome.config.js"
+  # Version-independent config coverage: ANY *.config.{js,cjs,mjs,ts} is an auto-run build/config
+  # file. The family rotates WHICH config it infects between waves (postcss/vite/next → metro/app/
+  # drizzle/playwright/svelte/…); a per-name allowlist is as brittle as a per-version signature, so
+  # detection would false-negative on the next wave's target file. Globs match at any monorepo depth
+  # (build_globset adds a `**/` variant). This gives the campaign-labeled analyzer + remediation a
+  # shot at every config; a CLEAN config never confirms (analyzer veto) or strips.
+  - "*.config.js"
+  - "*.config.cjs"
+  - "*.config.mjs"
+  - "*.config.ts"
+  # DB seed / migration scripts the family also injects (run via package scripts / ts-node, no
+  # `.config` in the name so not covered by the globs above).
+  - "seed.ts"
+  - "seed.js"
+  - "migrate.ts"
+  - "migrate.js"
+  # Entry files and non-`*.config` toolchain configs kept explicit (not matched by the globs).
   - "truffle.js"
   - "App.js"
   - "index.js"

@@ -135,6 +135,14 @@ impl PolinriderAnalyzer {
         if strong_decoder && has_seed {
             return Some("obfuscation: decoder + shuffle seed".to_string());
         }
+        // Structural fallback (version-independent): the injection's physical shape — legit code, a
+        // long horizontal-whitespace run, then the obfuscated blob on one line. With the JS-code
+        // veto already passed, this alone confirms, so a wave that rotates the decoder name / marker
+        // / seed out of recognition is still caught by the padding it cannot drop (the padding is
+        // what hides the payload off-screen). Reuses the capability engine's single predicate.
+        if wormward_core::capability::padding_injection(content) {
+            return Some("padding-injection: code + long whitespace pad + trailing blob".to_string());
+        }
         None
     }
 }
@@ -256,6 +264,28 @@ mod tests {
         let payload =
             "global.o='5-3-235-du';var _$_8e2c=eval(atob('Zm9v'));var z=String.fromCharCode(120);";
         assert_eq!(PolinriderAnalyzer.analyze(&scanned(payload)).len(), 1);
+    }
+
+    #[test]
+    fn confirms_padding_injection_with_renamed_decoder_and_no_marker() {
+        // Version-independence at the analyzer layer: a FUTURE wave renames the decoder (no
+        // `_$_hex` / `MDy`), drops the recognizable version-tag marker and the IIFE seed, but keeps
+        // the injection STRUCTURE — legit code + a long space pad + an obfuscated blob with a JS
+        // code token, all on the last line. The structural padding signal alone confirms; no
+        // per-version literal is consulted, so it survives every rotation.
+        let pad = " ".repeat(2000);
+        let payload =
+            format!("export default {{}};{pad}var q=(function(a){{return eval(atob(a))}})('cmVx');");
+        assert_eq!(PolinriderAnalyzer.analyze(&scanned(&payload)).len(), 1);
+    }
+
+    #[test]
+    fn no_finding_on_padding_without_code_token() {
+        // A long space run with NO JS-code token (e.g. a data/text file that happens to have wide
+        // whitespace) must NOT confirm — the hard veto still applies before the padding path.
+        let pad = " ".repeat(2000);
+        let benign = format!("column_a{pad}column_b\nrow_1{pad}row_2\n");
+        assert!(PolinriderAnalyzer.analyze(&scanned(&benign)).is_empty());
     }
 
     #[test]

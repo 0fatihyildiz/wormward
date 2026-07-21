@@ -154,3 +154,62 @@ fn clean_repo_silent() {
         ),
     ]));
 }
+
+// --- Version-independent structural detection (padding-injection) ---
+// Regression for the wave-3 miss: the family rotates the version tag / decoder name / seed each
+// wave, so signatures keyed on those constants false-negative on the next wave. Detection must key
+// on the injection STRUCTURE — a `<code><200+ spaces><obfuscated blob>` line — which no rotation
+// removes. All assertions below use `scan_capabilities` with NO pack loaded, so they prove the
+// campaign-agnostic engine alone catches every wave.
+
+/// The wave-3 payload shape parameterized by its (rotating) constants — proves the CONSTANTS never
+/// matter, only the structure.
+fn wave_line(version_tag: &str, decoder: &str, seed: &str) -> String {
+    let pad = " ".repeat(2000);
+    format!(
+        "export default {{}};{pad}global.o='{version_tag}';var {decoder}=(function(a,b){{return eval(atob(a))}})('cmVx',{seed});"
+    )
+}
+
+#[test]
+fn padding_injection_is_version_independent_across_waves() {
+    // Wave 1-2 constants, wave-3 constants, and an all-new hypothetical future wave — same fire.
+    assert!(fires(&[("postcss.config.mjs", &wave_line("5-3-235-du", "_$_8e2c", "3899501"))]));
+    assert!(fires(&[("next.config.ts", &wave_line("5-3-168-du", "_$_3317", "3657078"))]));
+    assert!(
+        fires(&[("vite.config.js", &wave_line("5-3-999-zz", "_$_ffff", "1234567"))]),
+        "a hypothetical FUTURE wave (all-new constants, same structure) must still be detected"
+    );
+}
+
+#[test]
+fn padding_injection_fires_on_previously_invisible_config_surfaces() {
+    // The exact wave-3 miss: these files are in NEITHER the old stem allowlist NOR the pack target
+    // list, so both passes skipped them. Now classified as ConfigFile via the generic `*.config.*`
+    // rule (+ seed/migrate script names), so the campaign-agnostic engine scores them.
+    let line = wave_line("5-3-168-du", "_$_3317", "3657078");
+    for f in ["metro.config.js", "app.config.ts", "drizzle.config.ts", "seed.ts", "db/migrate.ts"] {
+        assert!(fires(&[(f, &line)]), "wave-3 payload in {f} must be detected");
+    }
+}
+
+#[test]
+fn padding_injection_fp_safe_on_bundles_lockfiles_and_wasm() {
+    let pad = " ".repeat(2000);
+    // A file that WOULD fire if scanned (payload + padding), but sits in a bundler asset-output dir
+    // / Capacitor native mirror — excluded, so exclusion (not luck) keeps it silent.
+    let payload = format!("export default {{}};{pad}global.o='5-3-168-du';var _$_3317=eval(x);");
+    assert!(!fires(&[("public/assets/index.js", &payload)]), "bundled asset copy must be excluded");
+    assert!(
+        !fires(&[("ios/App/App/public/index.js", &payload)]),
+        "Capacitor iOS mirror must be excluded"
+    );
+    // A lockfile with an incidental long run — excluded by basename regardless of content.
+    assert!(!fires(&[("yarn.lock", &format!("# yarn lockfile v1\nfoo:{pad}bar\n"))]));
+    // @rive-app WASM glue: legit ESM whose base64 blob contains "MDy" and no code-then-pad line.
+    let wasm = format!("var w='{}';export default w;", "AGFzbQEAAAABpMDyAL".repeat(400));
+    assert!(!fires(&[("rive.config.mjs", &wasm)]), "WASM base64 glue must not be flagged");
+    // A minified config bundle: no whitespace runs anywhere.
+    let minified = "var a=1;function f(){return a};export default{f};".repeat(80);
+    assert!(!fires(&[("rollup.config.mjs", &minified)]), "minified bundle must not be flagged");
+}

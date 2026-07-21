@@ -776,4 +776,97 @@ mod tests {
             .iter()
             .any(|x| x.signature_id == "pkg:composer:thiio/kubernetes-php-sdk@1.0.0"));
     }
+
+    // --- wave-3 acceptance: version-independent detect + structural clean over the expanded set ---
+    const WAVE3_NAMES: &[&str] = &["postcss.config.mjs", "metro.config.js", "app.config.ts", "seed.ts"];
+
+    fn wave3_file() -> String {
+        // version 5-3-168, decoders _$_3317/_$_46e0, seed 3657078 — NONE in any signature list.
+        let pad = " ".repeat(2000);
+        let shim = "import { createRequire } from 'module';\nconst require = createRequire(import.meta.url);\n";
+        let legit = "const config = { plugins: [] };\n";
+        let blob = "global.o='5-3-168-du';global.i='5-3-168';var _$_3317=(function(a,b){return eval(atob(a))})('cmVx',3657078);var _$_46e0=String.fromCharCode(127);global['r']=require;";
+        format!("{shim}{legit}export default config;{pad}{blob}")
+    }
+
+    #[test]
+    fn wave3_detected_cleaned_and_verifies_clean() {
+        use std::path::Path;
+        use wormward_core::remediate::{action_for, apply};
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("victim");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        for name in WAVE3_NAMES {
+            fs::write(repo.join(name), wave3_file()).unwrap();
+        }
+        let packs = builtin_packs();
+
+        // DETECT: a remediable polinrider finding on every file, despite all-novel constants and
+        // two of the files (metro.config.js, app.config.ts, seed.ts) not being in any per-name list.
+        let findings = scan_repo(&repo, &packs);
+        for name in WAVE3_NAMES {
+            assert!(
+                findings.iter().any(|f| f.file.as_deref() == Some(Path::new(name))
+                    && f.campaign == "polinrider"
+                    && f.remediable),
+                "{name} must have a remediable polinrider finding; got {findings:?}"
+            );
+        }
+
+        // CLEAN: apply every remediation action (duplicates on one file are idempotently skipped).
+        let actions: Vec<_> = findings.iter().filter_map(|f| action_for(f, &packs)).collect();
+        apply(&repo, &actions, false);
+
+        // VERIFY: legit config kept, all payload/padding/shim gone, and a re-scan is clean.
+        for name in WAVE3_NAMES {
+            let cleaned = fs::read_to_string(repo.join(name)).unwrap();
+            assert!(cleaned.contains("const config = { plugins: [] };"), "{name} legit kept:\n{cleaned}");
+            assert!(!cleaned.contains("_$_"), "{name} decoder gone:\n{cleaned}");
+            assert!(!cleaned.contains("5-3-168"), "{name} version tag gone:\n{cleaned}");
+            assert!(!cleaned.contains("createRequire"), "{name} injected shim gone:\n{cleaned}");
+            assert!(
+                !wormward_core::capability::padding_injection(&cleaned),
+                "{name} padding structure gone:\n{cleaned}"
+            );
+        }
+        let after = scan_repo(&repo, &packs);
+        assert!(after.is_empty(), "re-scan after clean must be empty: {after:?}");
+    }
+
+    #[test]
+    fn deep_scan_detects_wave3_on_non_default_branch() {
+        // The re-infection lived on non-default branches too, so --deep must cover every branch tip.
+        use std::path::Path;
+        use std::process::Command;
+        use wormward_core::deep_scan_repo;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git")
+                .arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status()
+                .unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("metro.config.js"), "export default {};\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "clean"]);
+        git(&repo, &["checkout", "-q", "-b", "release/2.0"]);
+        fs::write(repo.join("metro.config.js"), wave3_file()).unwrap();
+        git(&repo, &["commit", "-q", "-am", "payload"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        // Working tree (main) is clean — the re-infection is only on the release branch tip.
+        assert!(scan_repo(&repo, &builtin_packs()).is_empty(), "main working tree must be clean");
+        let deep = deep_scan_repo(&repo, &builtin_packs());
+        assert!(
+            deep.iter().any(|f| f.git_ref.as_deref() == Some("release/2.0")
+                && f.campaign == "polinrider"),
+            "wave-3 payload on a non-default branch tip must be found by --deep: {deep:?}"
+        );
+    }
 }

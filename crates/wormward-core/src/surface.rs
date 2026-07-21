@@ -23,10 +23,10 @@ pub enum Surface {
     BinaryAsset,
 }
 
-const CONFIG_STEMS: &[&str] = &[
-    "postcss", "vite", "next", "tailwind", "eslint", "svelte", "nuxt", "webpack", "rollup",
-    "babel", "astro", "vitest", "jest", "remix", "vue", "gridsome",
-];
+// Any `*.config.{js,cjs,mjs,ts}` is now treated as a ConfigFile surface (see `classify`), so no
+// per-stem allowlist is needed. These are the non-`*.config` auto-run script names the family is
+// known to also inject into — they run via package scripts / ts-node without user intent.
+const AUTORUN_SCRIPT_STEMS: &[&str] = &["seed", "migrate"];
 const CONFIG_EXTS: &[&str] = &["js", "mjs", "cjs", "ts"];
 // `App.js` lowercases to `app.js`.
 const ENTRY_BASENAMES: &[&str] = &["index.js", "app.js", "truffle.js"];
@@ -60,6 +60,12 @@ pub fn is_excluded_path(path: &Path) -> bool {
     if bn.contains(".min.") {
         return true;
     }
+    // Source maps: generated build artifacts — enormous, high-entropy JSON, never source. And
+    // pnpm/CAS `<hash>-index.json` store metadata (paths + integrity hashes, not code). Neither is
+    // an auto-run surface; scanning them is pure FP/noise.
+    if bn.ends_with(".map") || bn.ends_with("-index.json") {
+        return true;
+    }
     // Lockfiles are inert data — package names, URLs, and SHA/integrity hashes, no executable code.
     // Their hashes tripped the decoder/shuffle-seed matcher (a "MDy" substring in base64, digit runs
     // inside a tarball SHA). Never content-scan them; they map to no auto-run surface. (Lockfiles are
@@ -85,6 +91,17 @@ pub fn is_excluded_path(path: &Path) -> bool {
         || path_str.contains("/.bun/install/cache/")
         || path_str.contains("/.yarn/cache/")
         || path_str.contains("/.yarn/unplugged/")
+    {
+        return true;
+    }
+    // Bundler asset output and Capacitor native mirrors carry minified/bundled COPIES of the app
+    // (a built `index.js`, hashed asset chunks). We scan the SOURCE config, never the mirror — a
+    // bundled copy would false-positive (minified/base64) and duplicate the source finding.
+    // Lowercased because the iOS mirror path is `ios/App/App/public/` (capitalized).
+    let path_lower = path_str.to_lowercase();
+    if path_lower.contains("/public/assets/")
+        || path_lower.contains("/ios/app/app/public/")
+        || path_lower.contains("/android/app/src/main/assets/public/")
     {
         return true;
     }
@@ -130,12 +147,22 @@ pub fn classify(path: &Path) -> Option<Surface> {
     // ConfigFile: toolchain configs, gatsby, .eslintrc.{js,cjs}, entry files
     if CONFIG_EXTS.contains(&ext.as_str()) {
         let stem = bn.trim_end_matches(&format!(".{ext}"));
+        // ANY `*.config.{js,cjs,mjs,ts}` is an auto-run config surface — not just an allowlisted
+        // stem. The family rotates WHICH build/config file it infects (metro/app/drizzle/
+        // playwright/svelte/…); enumerating stems is the same brittleness as enumerating version
+        // strings. FP-safe: the capability gate still requires a concealment prior or a worm tell,
+        // so a CLEAN config of any name never fires.
         if let Some(base) = stem.strip_suffix(".config") {
-            if CONFIG_STEMS.contains(&base) {
+            if !base.is_empty() {
                 return Some(Surface::ConfigFile);
             }
         }
         if stem == "gatsby-config" || stem == "gatsby-node" {
+            return Some(Surface::ConfigFile);
+        }
+        // DB seed / migration scripts run without user intent (package scripts, ts-node) and are a
+        // known injection host for this family.
+        if AUTORUN_SCRIPT_STEMS.contains(&stem) {
             return Some(Surface::ConfigFile);
         }
     }
@@ -231,6 +258,47 @@ mod tests {
     #[test]
     fn config_nested() {
         assert_eq!(c("packages/web/vite.config.ts"), Some(Surface::ConfigFile));
+    }
+
+    #[test]
+    fn config_generic_any_config_stem() {
+        // Version-independence at the FILE layer: the family rotates WHICH build/config file it
+        // infects (metro/app/drizzle/playwright/…). Keying on a fixed stem allowlist is the same
+        // brittleness as keying on a fixed version string — any `*.config.{js,cjs,mjs,ts}` is an
+        // auto-run config surface. (metro/app/drizzle/playwright are NOT in CONFIG_STEMS.)
+        assert_eq!(c("metro.config.js"), Some(Surface::ConfigFile));
+        assert_eq!(c("app.config.ts"), Some(Surface::ConfigFile));
+        assert_eq!(c("drizzle.config.ts"), Some(Surface::ConfigFile));
+        assert_eq!(c("apps/mobile/playwright.config.mjs"), Some(Surface::ConfigFile));
+    }
+
+    #[test]
+    fn config_known_autorun_scripts() {
+        // The family also hides in DB seed/migration scripts, which run via package scripts /
+        // ts-node without user intent. Classify the well-known names so the capability engine
+        // scores them (a clean seed.ts stays silent — the gate needs a concealment prior/worm tell).
+        assert_eq!(c("seed.ts"), Some(Surface::ConfigFile));
+        assert_eq!(c("prisma/seed.js"), Some(Surface::ConfigFile));
+        assert_eq!(c("db/migrate.ts"), Some(Surface::ConfigFile));
+    }
+
+    #[test]
+    fn excludes_sourcemaps_cas_metadata_and_bundled_assets() {
+        // Source maps: generated, huge, high-entropy JSON — never source, must not be scanned.
+        assert!(is_excluded_path(Path::new("dist/app.js.map")));
+        assert!(is_excluded_path(Path::new("public/index.css.map")));
+        // pnpm/CAS `<hash>-index.json` metadata anywhere (not only under a store path).
+        assert!(is_excluded_path(Path::new("some/dir/abcdef123-index.json")));
+        // Bundler asset output + Capacitor native mirrors carry minified/bundled COPIES of source;
+        // scan the SOURCE config, not the mirror, or a bundled `index.js` copy false-positives.
+        assert!(is_excluded_path(Path::new("public/assets/index-a1b2c3.js")));
+        assert!(is_excluded_path(Path::new("ios/App/App/public/index.js")));
+        assert!(is_excluded_path(Path::new(
+            "android/app/src/main/assets/public/index.js"
+        )));
+        // A real source config is still scanned.
+        assert!(!is_excluded_path(Path::new("metro.config.js")));
+        assert!(!is_excluded_path(Path::new("src/app.config.ts")));
     }
     #[test]
     fn config_eslintrc() {
