@@ -152,7 +152,7 @@ fn snippet(cmd: &str) -> String {
 /// error so the caller degrades gracefully.
 #[cfg(not(target_os = "windows"))]
 pub fn list_processes() -> Vec<(u32, String)> {
-    let out = match std::process::Command::new("ps").args(["-Awwo", "pid=,command="]).output() {
+    let out = match wormward_core::proc::command("ps").args(["-Awwo", "pid=,command="]).output() {
         Ok(o) if o.status.success() => o.stdout,
         _ => return Vec::new(),
     };
@@ -364,7 +364,7 @@ fn count_mcp_servers(json: &str) -> usize {
 }
 
 fn command_exists(bin: &str) -> bool {
-    std::process::Command::new(bin)
+    wormward_core::proc::command(bin)
         .arg("--version")
         .output()
         .map(|o| o.status.success())
@@ -372,7 +372,7 @@ fn command_exists(bin: &str) -> bool {
 }
 
 fn ignore_scripts_check(tool: &str) -> TriggerCheck {
-    let value = std::process::Command::new(tool)
+    let value = wormward_core::proc::command(tool)
         .args(["config", "get", "ignore-scripts"])
         .output()
         .ok()
@@ -457,7 +457,7 @@ pub fn fix_triggers() -> Vec<String> {
         if tool == "pnpm" && !command_exists("pnpm") {
             continue;
         }
-        let ok = std::process::Command::new(tool)
+        let ok = wormward_core::proc::command(tool)
             .args(["config", "set", "ignore-scripts", "true"])
             .status()
             .map(|s| s.success())
@@ -725,7 +725,7 @@ fn persistence_items() -> Vec<(PathBuf, String)> {
             }
         }
     }
-    if let Ok(o) = std::process::Command::new("crontab").arg("-l").output() {
+    if let Ok(o) = wormward_core::proc::command("crontab").arg("-l").output() {
         if o.status.success() {
             items.push((PathBuf::from("crontab"), String::from_utf8_lossy(&o.stdout).into_owned()));
         }
@@ -735,7 +735,7 @@ fn persistence_items() -> Vec<(PathBuf, String)> {
 
 /// Live established TCP connections (one line per connection) via `lsof`.
 fn tcp_connection_lines() -> Vec<String> {
-    match std::process::Command::new("lsof").args(["-nP", "-iTCP", "-sTCP:ESTABLISHED"]).output() {
+    match wormward_core::proc::command("lsof").args(["-nP", "-iTCP", "-sTCP:ESTABLISHED"]).output() {
         Ok(o) if o.status.success() => {
             String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect()
         }
@@ -751,7 +751,7 @@ fn global_package_names() -> Vec<String> {
             continue;
         }
         if let Ok(o) =
-            std::process::Command::new(tool).args(["ls", "-g", "--depth=0", "--parseable"]).output()
+            wormward_core::proc::command(tool).args(["ls", "-g", "--depth=0", "--parseable"]).output()
         {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
                 if let Some(idx) = line.rfind("node_modules/") {

@@ -9,14 +9,13 @@
 //! caller must pass `dry_run = false` (behind an explicit `--yes`) to actually rewrite.
 
 use std::path::Path;
-use std::process::Command;
 
 use crate::matchers::SignatureKind;
 use crate::pack::Pack;
 
 /// True if `git filter-repo` is installed (it is a separate tool from git).
 pub fn git_filter_repo_available() -> bool {
-    Command::new("git")
+    crate::proc::git()
         .args(["filter-repo", "--version"])
         .output()
         .map(|o| o.status.success())
@@ -61,7 +60,7 @@ pub fn rewrite_history(repo: &Path, packs: &[Pack], dry_run: bool) -> Result<Str
     if dry_run {
         args.push("--dry-run");
     }
-    let out = Command::new("git").args(&args).output().map_err(|e| e.to_string());
+    let out = crate::proc::git().args(&args).output().map_err(|e| e.to_string());
     let _ = std::fs::remove_file(&expr_file);
     let out = out?;
     if out.status.success() {

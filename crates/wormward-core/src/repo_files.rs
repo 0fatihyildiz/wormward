@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 
@@ -73,7 +73,7 @@ pub struct GitTree {
 impl GitTree {
     /// Build a file source for a commit's tree, reading blobs via git (no checkout).
     pub fn new(repo: &Path, commit: &str) -> Option<Self> {
-        let out = Command::new("git")
+        let out = crate::proc::git()
             .arg("-C")
             .arg(repo)
             // -z: NUL-separated, and disables git's C-quoting of non-ASCII/special
@@ -153,7 +153,7 @@ pub(crate) struct CatFile {
 
 impl CatFile {
     fn spawn(repo: &Path) -> Option<CatFile> {
-        let mut child = Command::new("git")
+        let mut child = crate::proc::git()
             .arg("-C")
             .arg(repo)
             .args(["cat-file", "--batch"])
@@ -206,6 +206,7 @@ impl Drop for CatFile {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use tempfile::TempDir;
 
     fn git(repo: &Path, args: &[&str]) {
