@@ -70,6 +70,12 @@ enum Command {
         #[arg(default_value = ".")]
         dir: std::path::PathBuf,
     },
+    /// PRE-INSTALL vector check: fetch an npm package's metadata + entry from the registry (no
+    /// install, no code execution) and flag dropper behaviour before it ever runs. Exit 1 if malicious.
+    CheckPackage {
+        /// Package name (optionally `name@version`).
+        name: String,
+    },
     /// Check a single asset against the live OSM database.
     Check {
         /// report_type: package | repository | url | domain | ip | wallet | container
@@ -398,6 +404,41 @@ fn main() -> ExitCode {
             dump("typosquat-packages", &packages);
             // Exit 1 when new intelligence is found, so CI/cron can alert on campaign evolution.
             ExitCode::from(if total > 0 { 1 } else { 0 })
+        }
+        Command::CheckPackage { name } => {
+            // `name` or `name@version`; a scoped name keeps its leading `@`.
+            let (pkg, ver) = match name.rfind('@') {
+                Some(i) if i > 0 => (&name[..i], &name[i + 1..]),
+                _ => (name.as_str(), "latest"),
+            };
+            let registry = std::env::var("WORMWARD_NPM_REGISTRY")
+                .unwrap_or_else(|_| "https://registry.npmjs.org".into());
+            let meta_url = format!("{registry}/{pkg}/{ver}");
+            let body = match ureq::get(&meta_url).timeout(std::time::Duration::from_secs(20)).call() {
+                Ok(r) => r.into_string().unwrap_or_default(),
+                Err(e) => {
+                    eprintln!("failed to fetch {pkg}@{ver}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            let version = v.get("version").and_then(|x| x.as_str()).unwrap_or(ver);
+            let main = v.get("main").and_then(|x| x.as_str()).unwrap_or("index.js");
+            // Fetch just the entry file (no tarball extraction) via a per-file CDN.
+            let cdn = std::env::var("WORMWARD_UNPKG").unwrap_or_else(|_| "https://unpkg.com".into());
+            let entry_url = format!("{cdn}/{pkg}@{version}/{main}");
+            let entry = ureq::get(&entry_url)
+                .timeout(std::time::Duration::from_secs(20))
+                .call()
+                .ok()
+                .and_then(|r| r.into_string().ok());
+            if wormward_core::package_dropper_verdict(&body, entry.as_deref()) {
+                println!("MALICIOUS  {pkg}@{version} — dropper behaviour detected pre-install");
+                ExitCode::from(1)
+            } else {
+                println!("clean      {pkg}@{version} — no dropper behaviour observed");
+                ExitCode::from(0)
+            }
         }
         Command::Check { report_type, ecosystem, version, osm_token, identifier } => {
             let token = osm_token

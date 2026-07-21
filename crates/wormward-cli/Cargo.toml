@@ -19,6 +19,7 @@ clap = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+ureq = { workspace = true }
 dialoguer = { workspace = true }
 
 [dev-dependencies]

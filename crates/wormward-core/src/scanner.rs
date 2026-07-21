@@ -500,13 +500,33 @@ fn dedup_capability_against_packs(findings: &mut Vec<Finding>) {
 /// (1) the injected-payload structure (a `_$_hex` decoder / ≥200-space padding run), or (2) a
 /// lifecycle (install) script that trips the surface gate (download-and-exec + concealment). A
 /// legit look-alike plugin has neither, so it never becomes a finding.
-fn package_dropper_behavior(dir: &Path) -> bool {
-    let pj = std::fs::read_to_string(dir.join("package.json")).unwrap_or_default();
-    for (_key, script) in lifecycle_scripts(&pj) {
+/// Pure dropper-behaviour verdict given a package's `package.json` text and (optionally) its main
+/// entry-file content. The single source of truth for "is this npm package a dropper", reused by the
+/// installed-package check (reads from disk) and the online pre-install check (fetches from the
+/// registry) so the two never drift. Only two FP-safe signals qualify: an install script that trips
+/// the surface gate, or the injected-payload structure in the entry.
+pub fn package_dropper_verdict(package_json: &str, entry: Option<&str>) -> bool {
+    for (_key, script) in lifecycle_scripts(package_json) {
         if gate(Surface::LifecycleScript, &score(&script, Surface::LifecycleScript)) {
             return true;
         }
     }
+    if let Some(content) = entry {
+        if content.len() <= MAX_CONTENT_BYTES
+            && !looks_binary(content)
+            && crate::capability::injected_payload(content)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does an INSTALLED npm package (a `node_modules/<name>` dir on disk) exhibit dropper behaviour?
+/// The FP-safe corroborator for a typosquat NAME hit — a legit look-alike plugin has none. Reads the
+/// package.json and candidate entry files from disk and defers to [`package_dropper_verdict`].
+fn package_dropper_behavior(dir: &Path) -> bool {
+    let pj = std::fs::read_to_string(dir.join("package.json")).unwrap_or_default();
     let main = serde_json::from_str::<serde_json::Value>(&pj)
         .ok()
         .and_then(|v| v.get("main").and_then(|m| m.as_str()).map(String::from));
@@ -514,18 +534,13 @@ fn package_dropper_behavior(dir: &Path) -> bool {
     if let Some(m) = main {
         candidates.insert(0, m);
     }
-    for cand in candidates {
-        let Ok(content) = std::fs::read_to_string(dir.join(&cand)) else {
-            continue;
-        };
-        if content.len() > MAX_CONTENT_BYTES || looks_binary(&content) {
-            continue;
-        }
-        if crate::capability::injected_payload(&content) {
-            return true;
-        }
+    if package_dropper_verdict(&pj, None) {
+        return true;
     }
-    false
+    candidates
+        .iter()
+        .filter_map(|c| std::fs::read_to_string(dir.join(c)).ok())
+        .any(|content| package_dropper_verdict(&pj, Some(&content)))
 }
 
 /// Delivery-vector detection: flag npm dependencies whose NAME is a likely typosquat of a popular
@@ -1363,6 +1378,19 @@ mod tests {
         assert!(f
             .iter()
             .any(|x| x.kind == FindingKind::Capability && x.file == Some(PathBuf::from("setup_bun.js"))));
+    }
+
+    #[test]
+    fn package_dropper_verdict_pure_signals() {
+        // Malicious install script: OBFUSCATED (decoder) + behavioral (spawn) -> dropper. (A bare
+        // `curl|bash` postinstall is deliberately NOT flagged — legit installs do that.)
+        let pj_bad = r#"{"scripts":{"postinstall":"node -e \"var _$_a1b2=atob('x');require('child_process').exec('id')\""}}"#;
+        assert!(package_dropper_verdict(pj_bad, None), "obfuscated+spawn install script is a dropper");
+        // Obfuscated entry (decoder) -> dropper.
+        assert!(package_dropper_verdict("{}", Some("var _$_1e42=(function(a){return eval(a)})('x');")));
+        // Clean package with a normal build script + benign entry -> not a dropper.
+        let pj_ok = r#"{"scripts":{"build":"tsc","test":"jest","postinstall":"curl https://x | bash"}}"#;
+        assert!(!package_dropper_verdict(pj_ok, Some("module.exports = function(){ return 1; };")));
     }
 
     #[test]

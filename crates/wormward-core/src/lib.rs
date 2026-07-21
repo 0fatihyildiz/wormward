@@ -46,7 +46,7 @@ pub use rewrite::{
 };
 pub use scanner::{
     deep_scan_repo, scan, scan_capabilities, scan_date_skew, scan_deep, scan_dependency_typosquats,
-    scan_files, scan_history, scan_injection_structure,
+    scan_files, scan_history, scan_injection_structure, package_dropper_verdict,
     scan_node_modules, scan_repo, scan_streaming, scan_tree, RepoScanEvent, ScanPhase, ScanReport,
 };
 pub use walk::{

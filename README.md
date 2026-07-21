@@ -127,6 +127,19 @@ wormward export-rules --format sigma     > wormward.sigma.yml
 wormward export-rules --format suricata  > wormward.rules
 ```
 
+## Pre-install package check
+
+Catch the delivery vector BEFORE `npm install` runs it — fetch a package's metadata + entry from the
+registry (no install, no code execution) and flag dropper behaviour:
+
+```bash
+wormward check-package tailwindcss-style-animate   # exit 1 if malicious, 0 if clean
+wormward check-package left-pad@1.3.0
+```
+
+Reuses the same FP-safe detectors as the repo scan (an obfuscated install script or the injected
+payload structure in the entry), so a legit look-alike never trips.
+
 ## Export takedown IOCs
 
 Turn the detected campaign into disruption-ready artifacts — reporting the malicious packages cuts
