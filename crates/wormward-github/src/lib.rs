@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +63,7 @@ pub fn resolve_token(explicit: Option<&str>) -> Result<String, GithubError> {
         }
     }
     // Fall back to the gh CLI.
-    if let Ok(out) = Command::new("gh").args(["auth", "token"]).output() {
+    if let Ok(out) = wormward_core::proc::command("gh").args(["auth", "token"]).output() {
         if out.status.success() {
             let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !t.is_empty() {

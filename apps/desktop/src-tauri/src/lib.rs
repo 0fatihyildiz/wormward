@@ -545,8 +545,13 @@ pub struct GithubFixView {
 /// so the frontend can fall back to "scan all orgs".
 #[tauri::command]
 async fn github_orgs(token: Option<String>) -> Result<Vec<String>, String> {
-    let token = resolve_token(token.as_deref()).map_err(|e| e.to_string())?;
-    GitHubHost::new(token).list_orgs().map_err(|e| e.to_string())
+    // Network call (and possibly a `gh auth token` subprocess) — keep it off the async executor.
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = resolve_token(token.as_deref()).map_err(|e| e.to_string())?;
+        GitHubHost::new(token).list_orgs().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -559,24 +564,33 @@ async fn github_scan(
     cancel: tauri::State<'_, GithubScanCancel>,
 ) -> Result<Vec<GithubRepoView>, String> {
     let token = resolve_token(token.as_deref()).map_err(|e| e.to_string())?;
-    let host = GitHubHost::new(token.clone());
-    let packs = builtin_packs();
-    let opts = GithubRunOpts {
-        clone_dir: None,
-        include_forks,
-        fix: false,
-        push: false,
-        yes: false,
-        orgs,
-    };
     // Fresh run: clear any stale cancel request from a previous scan.
     cancel.0.store(false, Ordering::Relaxed);
     let flag: Arc<AtomicBool> = cancel.0.clone();
-    let scan = scan_pass_with_progress_cancellable(&opts, &host, &packs, &token, &flag, &|p| {
-        // Best-effort: a failed emit must never fail the scan.
-        let _ = window.emit("github-scan-progress", &p);
+    // The account scan is long, network-bound work; run it on a blocking thread so the async
+    // executor stays free — otherwise the Stop command queues behind the scan (the same bug the
+    // local `scan` command fixed with spawn_blocking) and the UI stutters for its whole duration.
+    let scan_token = token.clone();
+    let scan = tauri::async_runtime::spawn_blocking(move || {
+        let host = GitHubHost::new(scan_token.clone());
+        let packs = builtin_packs();
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs,
+        };
+        scan_pass_with_progress_cancellable(&opts, &host, &packs, &scan_token, &flag, &|p| {
+            // Best-effort: a failed emit must never fail the scan.
+            let _ = window.emit("github-scan-progress", &p);
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
+    let packs = builtin_packs();
     let fixable: HashSet<String> = scan.fixable_full_names(&packs).into_iter().collect();
 
     let mut views = Vec::new();
@@ -610,48 +624,53 @@ async fn github_fix(
     selected: Vec<String>,
     state: tauri::State<'_, GithubScanState>,
 ) -> Result<Vec<GithubFixView>, String> {
-    let packs = builtin_packs();
-    let opts = GithubRunOpts {
-        clone_dir: None,
-        include_forks: false,
-        fix: true,
-        push: true,
-        yes: true,
-        // Fix reuses the cached scan; no re-listing, so orgs are irrelevant here.
-        orgs: vec![],
-    };
     let sel: HashSet<String> = selected.into_iter().collect();
 
-    let mut guard = state.lock().map_err(|e| e.to_string())?;
-    let cache = guard
-        .as_ref()
+    // Take the cache out of managed state up front: the state resets whether the fix succeeds
+    // or not (a stale token/finding set must never be reused; the frontend re-scans before any
+    // subsequent fix), and taking ownership lets the clone-heavy fix run on a blocking thread
+    // without holding the state mutex across it.
+    let cache = state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .take()
         .ok_or_else(|| "no scan available; run a GitHub scan first".to_string())?;
-    let outcomes = fix_pass(&cache.scan, &opts, &packs, &cache.token, Some(&sel));
 
-    let views = outcomes
-        .into_iter()
-        .filter(|o| sel.contains(&o.repo.full_name))
-        .map(|o| GithubFixView {
-            // Mirror the CLI's per-repo resolution (github_exit_code): resolved only when a
-            // fix was actually pushed AND no non-remediable finding survives on origin —
-            // not merely "some actions ran". Otherwise the GUI reports `fixed` while a
-            // non-remediable infection is still live.
-            fixed: o.error.is_none()
-                && !o.pushed.is_empty()
-                && o.findings.iter().all(|f| f.remediable),
-            full_name: o.repo.full_name,
-            pushed: o.pushed,
-            actions: o.actions,
-            error: o.error,
-            manual_review: o.manual_review,
-        })
-        .collect();
+    tauri::async_runtime::spawn_blocking(move || {
+        let packs = builtin_packs();
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: true,
+            // Fix reuses the cached scan; no re-listing, so orgs are irrelevant here.
+            orgs: vec![],
+        };
+        let outcomes = fix_pass(&cache.scan, &opts, &packs, &cache.token, Some(&sel));
 
-    // fix_pass's on-demand clones are already gone (its temp dir is dropped on return).
-    // Reset the state so a stale token/finding set can't be reused; the frontend
-    // re-scans before any subsequent fix.
-    *guard = None;
-    Ok(views)
+        // fix_pass's on-demand clones are already gone (its temp dir is dropped on return).
+        outcomes
+            .into_iter()
+            .filter(|o| sel.contains(&o.repo.full_name))
+            .map(|o| GithubFixView {
+                // Mirror the CLI's per-repo resolution (github_exit_code): resolved only when a
+                // fix was actually pushed AND no non-remediable finding survives on origin —
+                // not merely "some actions ran". Otherwise the GUI reports `fixed` while a
+                // non-remediable infection is still live.
+                fixed: o.error.is_none()
+                    && !o.pushed.is_empty()
+                    && o.findings.iter().all(|f| f.remediable),
+                full_name: o.repo.full_name,
+                pushed: o.pushed,
+                actions: o.actions,
+                error: o.error,
+                manual_review: o.manual_review,
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Machine-level PolinRider check (running loader, tainted caches, trigger paths). Runs on a

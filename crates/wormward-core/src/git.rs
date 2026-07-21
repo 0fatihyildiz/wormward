@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub fn reflog_has_amend(repo: &Path) -> bool {
-    let output = Command::new("git")
+    let output = crate::proc::git()
         .arg("-C")
         .arg(repo)
         .arg("reflog")
@@ -18,7 +17,7 @@ pub fn reflog_has_amend(repo: &Path) -> bool {
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let out = Command::new("git")
+    let out = crate::proc::git()
         .arg("-C")
         .arg(repo)
         // Hardening: disable repo hooks so a malicious hook planted in a scanned repo cannot
@@ -90,7 +89,7 @@ pub fn force_push_with_lease_to(repo: &Path, remote: &str, branch: &str) -> Resu
 
 /// Run git and capture trimmed stdout on success.
 fn run_git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+    let out = crate::proc::git()
         .arg("-C")
         .arg(repo)
         .args(args)

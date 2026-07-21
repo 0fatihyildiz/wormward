@@ -2200,6 +2200,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "wormward-core",
  "wormward-packs",
 ]
 

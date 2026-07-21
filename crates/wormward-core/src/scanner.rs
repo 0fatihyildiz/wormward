@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A never-set cancel flag, so the non-cancellable public entry points can delegate to the
@@ -812,7 +811,7 @@ pub fn scan(roots: &[PathBuf], packs: &[Pack]) -> ScanReport {
 fn branch_commits(repo: &Path) -> Vec<(String, String)> {
     // Format: "<oid> <short refname> <symref>". oids and refnames contain no spaces, so the
     // fields split cleanly; `symref` is non-empty only for symbolic refs.
-    let out = Command::new("git")
+    let out = crate::proc::git()
         .arg("-C")
         .arg(repo)
         .args([
@@ -846,7 +845,7 @@ fn branch_commits(repo: &Path) -> Vec<(String, String)> {
 }
 
 fn head_commit(repo: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = crate::proc::git()
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "HEAD"])
@@ -861,7 +860,7 @@ fn head_commit(repo: &Path) -> Option<String> {
 /// Paths that differ between two commits (`git diff --name-only <base> <tip>`). NUL-delimited so
 /// special/non-ASCII paths survive. Commit-to-commit (no working-tree stat), so it stays cheap.
 fn diff_paths(repo: &Path, base: &str, tip: &str) -> Vec<PathBuf> {
-    let out = Command::new("git")
+    let out = crate::proc::git()
         .arg("-C")
         .arg(repo)
         .args(["diff", "--name-only", "-z", base, tip])
@@ -1097,7 +1096,7 @@ pub fn scan_history(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
         if findings.len() >= MAX_HISTORY_HITS {
             break;
         }
-        let out = Command::new("git")
+        let out = crate::proc::git()
             .arg("-C")
             .arg(repo)
             .args(["log", "--all", "-S", &marker, "--format=%H%x1f%aI%x1f%an%x1f%s"])
@@ -1154,7 +1153,7 @@ const MAX_DATE_SKEW_HITS: usize = 100;
 /// (Medium, non-remediable); a large gap can also be a legitimate long-delayed rebase, so the
 /// evidence says so. Campaign-agnostic (no pack needed).
 pub fn scan_date_skew(repo: &Path) -> Vec<Finding> {
-    let out = Command::new("git")
+    let out = crate::proc::git()
         .arg("-C")
         .arg(repo)
         .args(["log", "--all", "--no-show-signature", "--format=%H%x1f%at%x1f%ct%x1f%an"])

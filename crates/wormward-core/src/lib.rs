@@ -9,6 +9,7 @@ pub mod lockfile;
 pub mod matchers;
 pub mod osv;
 pub mod pack;
+pub mod proc;
 pub mod remediate;
 pub mod repo_files;
 pub mod rewrite;

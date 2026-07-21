@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Never-set cancel flag so the non-cancellable public scan can delegate to the cancellable one.
@@ -59,7 +58,7 @@ fn describe_action(a: &RemediationAction) -> String {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<(), String> {
-    let out = Command::new("git")
+    let out = wormward_core::proc::git()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -99,7 +98,7 @@ fn redact(msg: String, token: &str) -> String {
 fn has_staged_changes(dir: &Path) -> bool {
     // `git diff --cached --quiet` exits 0 when nothing is staged, 1 when staged changes
     // exist. Treat a spawn failure as "no changes" so we skip the commit rather than error.
-    Command::new("git")
+    wormward_core::proc::git()
         .arg("-C")
         .arg(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -209,9 +208,16 @@ pub struct ScanProgress {
 /// Clone all branches of `repo` into `dest`, authenticated via the token so private
 /// repos work (and the resulting origin can be pushed to). GIT_TERMINAL_PROMPT=0 so
 /// an auth failure fails fast instead of hanging a rayon worker. Errors are redacted.
-fn clone_repo(repo: &RepoRef, dest: &Path, token: &str) -> Result<(), String> {
-    let out = Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
+///
+/// `blobless` clones with `--filter=blob:none`: refs and history come down without any blob
+/// content, and checkout materializes only the default tip's files — the right shape for the
+/// FIX path, which touches nothing but the default working tree (a full clone downloads every
+/// blob on every branch first). The fallback SCAN path must NOT use it: its deep scan cat-files
+/// arbitrary branch blobs, and each read would become its own lazy network fetch. A server
+/// without filter support just ignores the flag (git warns and does a full clone).
+fn clone_repo(repo: &RepoRef, dest: &Path, token: &str, blobless: bool) -> Result<(), String> {
+    let mut cmd = wormward_core::proc::git();
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
         // Ignore a hostile /etc/gitconfig (it could set a global hooksPath or url-insteadOf).
         .env("GIT_CONFIG_NOSYSTEM", "1")
         // Belt-and-suspenders with --template=: no hook can run against OUR temp clone.
@@ -220,10 +226,11 @@ fn clone_repo(repo: &RepoRef, dest: &Path, token: &str) -> Result<(), String> {
         // --template= (empty): machine-level git templates would otherwise copy their
         // hooks into OUR temp clone, and the local re-scan would flag those hooks as
         // findings about the repo. Hooks are local artifacts, never repo content.
-        .args(["clone", "--no-single-branch", "--template=", "-q"])
-        .arg(authed_url(&repo.clone_url, token))
-        .arg(dest)
-        .output();
+        .args(["clone", "--no-single-branch", "--template=", "-q"]);
+    if blobless {
+        cmd.arg("--filter=blob:none");
+    }
+    let out = cmd.arg(authed_url(&repo.clone_url, token)).arg(dest).output();
     match out {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(redact(
@@ -248,7 +255,8 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
         }
     };
     let dest = tmp.path().join(sanitize_full_name(&repo.full_name));
-    if let Err(e) = clone_repo(repo, &dest, token) {
+    // Full clone (not blobless): the deep scan below reads blobs from every branch tip.
+    if let Err(e) = clone_repo(repo, &dest, token, false) {
         out.error = Some(e);
         return out;
     }
@@ -398,25 +406,36 @@ pub fn scan_pass_with_progress_cancellable(
     let done_counter = AtomicUsize::new(0);
     // `collect::<Result<Vec<_>, _>>()` lets rayon short-circuit cooperatively on the
     // first Err (a rate limit) instead of scanning every repo before propagating it.
-    let scanned = repos
-        .par_iter()
-        .map(|repo| {
-            // Cancelled: skip the network-heavy scan and report the repo clean.
-            let result = if cancel.load(Ordering::Relaxed) {
-                Ok(ScannedRepo {
-                    repo: repo.clone(),
-                    findings: Vec::new(),
-                    error: None,
-                    auto_fixable: false,
-                })
-            } else {
-                api_scan_repo(repo, host, packs, &cache, token)
-            };
-            let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            on_progress(ScanProgress { done, total, repo: repo.full_name.clone() });
-            result
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let scan_all = || {
+        repos
+            .par_iter()
+            .map(|repo| {
+                // Cancelled: skip the network-heavy scan and report the repo clean.
+                let result = if cancel.load(Ordering::Relaxed) {
+                    Ok(ScannedRepo {
+                        repo: repo.clone(),
+                        findings: Vec::new(),
+                        error: None,
+                        auto_fixable: false,
+                    })
+                } else {
+                    api_scan_repo(repo, host, packs, &cache, token)
+                };
+                let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                on_progress(ScanProgress { done, total, repo: repo.full_name.clone() });
+                result
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    // The per-repo scan is NETWORK-bound (branch list + tree + blob fetches per repo), so the
+    // global rayon pool — sized to CPU cores for the local scanner — badly under-parallelizes
+    // it: most workers just sleep on HTTP latency. Fan out on a dedicated wider pool instead,
+    // capped at 32 concurrent repos (well under GitHub's ~100-concurrent secondary-rate-limit
+    // guidance). A pool-build failure falls back to the global pool rather than failing the scan.
+    let scanned = match rayon::ThreadPoolBuilder::new().num_threads(total.clamp(1, 32)).build() {
+        Ok(pool) => pool.install(scan_all),
+        Err(_) => scan_all(),
+    }?;
     Ok(ScanPass { repos: scanned })
 }
 
@@ -465,7 +484,9 @@ fn fix_scanned(
         return outcome;
     };
     let dest = base.join(sanitize_full_name(&sr.repo.full_name));
-    if let Err(e) = clone_repo(&sr.repo, &dest, token) {
+    // Blobless: the fix only edits/commits/pushes the default working tree, so downloading
+    // every blob of every branch (the old full clone) was the fix path's dominant wait.
+    if let Err(e) = clone_repo(&sr.repo, &dest, token, true) {
         outcome.error = Some(e);
         return outcome;
     }

@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+wormward-core = { path = "../wormward-core" }
 wormward-packs = { path = "../wormward-packs" }
 serde = { workspace = true }
 serde_json = { workspace = true }

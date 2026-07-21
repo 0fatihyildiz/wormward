@@ -3,7 +3,6 @@
 //! a signal beyond our static `bad_packages` list. Absent binary ⇒ empty (never a hard failure).
 
 use std::path::Path;
-use std::process::Command;
 
 /// A malicious-package advisory reported by osv-scanner.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,7 +38,7 @@ pub fn parse_osv_json(json: &str) -> Vec<OsvHit> {
 }
 
 fn command_exists(bin: &str) -> bool {
-    Command::new(bin).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    crate::proc::command(bin).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// Recursively gate `dir`'s lockfiles against OSV. Returns empty (with no error) when `osv-scanner`
@@ -49,7 +48,7 @@ pub fn osv_scan(dir: &Path) -> Vec<OsvHit> {
     if !command_exists("osv-scanner") {
         return Vec::new();
     }
-    match Command::new("osv-scanner").args(["--format", "json", "-r"]).arg(dir).output() {
+    match crate::proc::command("osv-scanner").args(["--format", "json", "-r"]).arg(dir).output() {
         Ok(o) => parse_osv_json(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => Vec::new(),
     }
