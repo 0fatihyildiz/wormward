@@ -14,6 +14,7 @@ pub mod rules;
 pub mod sarif;
 pub mod scanner;
 pub mod surface;
+pub mod typosquat;
 pub mod walk;
 
 pub use engine::{SigHit, SignatureEngine};
@@ -40,8 +41,8 @@ pub use rewrite::{
     BranchCleanStatus,
 };
 pub use scanner::{
-    deep_scan_repo, scan, scan_capabilities, scan_date_skew, scan_deep, scan_files, scan_history,
-    scan_injection_structure,
+    deep_scan_repo, scan, scan_capabilities, scan_date_skew, scan_deep, scan_dependency_typosquats,
+    scan_files, scan_history, scan_injection_structure,
     scan_node_modules, scan_repo, scan_streaming, scan_tree, RepoScanEvent, ScanPhase, ScanReport,
 };
 pub use walk::{

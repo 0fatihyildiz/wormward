@@ -239,6 +239,31 @@ Two findings drove the hardening above:
   repos, caught by the `temp_auto_push.bat` artifact). The sole residual source-code miss is one
   payload inside a `vendor/` dir — deliberately excluded as third-party code (accepted trade-off).
 
+### Delivery-vector detection — dependency-name typosquats (`typosquat.rs`, `scan_dependency_typosquats`)
+
+To catch the *delivery* packages (`tailwindcss-style-animate`, `chalk-logger`, …) beyond the static
+`bad_packages` list, a dependency whose NAME resembles a popular package is flagged — but only when
+FP-safe. The design decision that makes it FP-safe: **the name is a weak signal; behaviour is the
+discriminator.**
+
+- **A one-edit misspelling** of a popular name (`expres`, `lodahs`) is a strong-enough name signal to
+  surface as a suppressed community lead (`pkg-community:` id, off unless `--include-community`).
+- **A decoration** (`<popular>-<word>`) NEVER produces a name-only finding — it fires only when the
+  installed package also shows dropper behaviour, at which point it is a visible **Medium**.
+- **Dropper behaviour** = the injected-payload structure (`_$_hex` decoder / padding run) or a
+  malicious install script — both mathematically absent from legitimate code.
+- Names a pack already tracks are skipped (the version-aware lockfile/node_modules checks own them),
+  so the pass is purely additive and never overrides a version pin.
+
+The FP-safety was proven by **auditing the matcher against 3,366 real npm package names** pulled from
+the live registry across the exact worst-case ecosystems (`react`, `tailwind`, `chalk`, `eslint`,
+`vue`, …). This caught a real FP class — `react`/`next`/`vite`/`eslint` have huge legit `<root>-<word>`
+plugin ecosystems (`react-icons`, `lucide-react`, …) — which was fixed by removing those roots as
+decoration bases. Even so, ~300 legit packages (`chalk-cli`, `prettier-plugin-tailwindcss`, hundreds
+of `tailwindcss-*` plugins) still match the deliberately-broad decoration rule; the regression test
+`real_legit_lookalikes_installed_clean_produce_no_findings` installs a representative sample **clean**
+and asserts **zero** findings, so the behaviour gate — not the name — is what ever fires.
+
 **Acceptance** (`wormward-packs` + `capability_integration`): a `5-3-168`/`_$_3317` payload (in no
 signature list) and a hypothetical `5-3-999-zz` payload are both DETECTED and CLEANED across the
 expanded file set and on non-default branch tips (`--deep`); minified bundles, `yarn.lock`,

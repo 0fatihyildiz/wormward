@@ -493,6 +493,135 @@ fn dedup_capability_against_packs(findings: &mut Vec<Finding>) {
     });
 }
 
+/// Does an INSTALLED npm package (a `node_modules/<name>` dir on disk) exhibit dropper behaviour?
+/// This is the FP-safe corroborator for a typosquat NAME hit — and it must be provably safe, because
+/// the name matcher is deliberately broad (hundreds of legit `tailwindcss-*`/`chalk-*` plugins match
+/// the decoration rule). Only two signals qualify, both mathematically absent from legitimate code:
+/// (1) the injected-payload structure (a `_$_hex` decoder / ≥200-space padding run), or (2) a
+/// lifecycle (install) script that trips the surface gate (download-and-exec + concealment). A
+/// legit look-alike plugin has neither, so it never becomes a finding.
+fn package_dropper_behavior(dir: &Path) -> bool {
+    let pj = std::fs::read_to_string(dir.join("package.json")).unwrap_or_default();
+    for (_key, script) in lifecycle_scripts(&pj) {
+        if gate(Surface::LifecycleScript, &score(&script, Surface::LifecycleScript)) {
+            return true;
+        }
+    }
+    let main = serde_json::from_str::<serde_json::Value>(&pj)
+        .ok()
+        .and_then(|v| v.get("main").and_then(|m| m.as_str()).map(String::from));
+    let mut candidates = vec!["index.js".to_string(), "index.mjs".to_string(), "index.cjs".to_string()];
+    if let Some(m) = main {
+        candidates.insert(0, m);
+    }
+    for cand in candidates {
+        let Ok(content) = std::fs::read_to_string(dir.join(&cand)) else {
+            continue;
+        };
+        if content.len() > MAX_CONTENT_BYTES || looks_binary(&content) {
+            continue;
+        }
+        if crate::capability::injected_payload(&content) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Delivery-vector detection: flag npm dependencies whose NAME is a likely typosquat of a popular
+/// package. The name alone is a WEAK signal (the ecosystem is full of `<tool>-<plugin>` names), so
+/// a hit is promoted to a visible **Medium** finding ONLY when the installed package also shows
+/// dropper behaviour ([`package_dropper_behavior`]); a name-only hit (package not installed, or
+/// clean) becomes a suppressed community lead (`pkg-community:` id) instead. This catches the
+/// PolinRider *delivery* packages (`tailwindcss-style-animate`, `chalk-logger`, …) structurally —
+/// no static name list — while never false-positiving on a legit look-alike dependency.
+pub fn scan_dependency_typosquats(
+    repo: &Path,
+    files: &dyn RepoFiles,
+    packs: &[Pack],
+) -> Vec<Finding> {
+    // Names a pack already tracks (version-aware) are that pack's domain — the lockfile / node_modules
+    // checks handle them authoritatively (and respect version pins). Skip them here so this pass is
+    // purely ADDITIVE: it only surfaces typosquats NOT yet in any pack, and never overrides a pack's
+    // version-pinning decision (which would be a false positive on a deliberately-safe version).
+    let known: HashSet<&str> = packs
+        .iter()
+        .filter_map(|p| p.manifest.bad_packages.get("npm"))
+        .flat_map(|v| v.iter().map(|b| b.name.as_str()))
+        .collect();
+    // Collect declared + locked npm dependency names.
+    let mut names: HashSet<String> = HashSet::new();
+    for rel in files.paths() {
+        let bn = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if bn == "package.json" {
+            if let Some(c) = files.read(rel) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&c) {
+                    for field in ["dependencies", "devDependencies", "optionalDependencies"] {
+                        if let Some(o) = v.get(field).and_then(|x| x.as_object()) {
+                            names.extend(o.keys().cloned());
+                        }
+                    }
+                }
+            }
+        } else if crate::lockfile::LOCKFILES.iter().any(|(f, eco)| *f == bn && *eco == "npm") {
+            if let Some(c) = files.read(rel) {
+                for e in crate::lockfile::parse_lockfile(bn, &c) {
+                    names.insert(e.name);
+                }
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    for name in names {
+        if known.contains(name.as_str()) {
+            continue; // a pack already covers this name, version-aware
+        }
+        let Some(hit) = crate::typosquat::typosquat_of(&name) else {
+            continue;
+        };
+        let pkg_dir = repo.join("node_modules").join(&name);
+        let malicious = pkg_dir.is_dir() && package_dropper_behavior(&pkg_dir);
+        let (severity, signature_id, evidence) = if malicious {
+            // Corroborated (either name-signal kind) → visible Medium.
+            (
+                Severity::Medium,
+                format!("typosquat:{name}"),
+                format!(
+                    "dependency '{name}' is a likely typosquat of '{}' AND the installed package shows dropper behaviour",
+                    hit.of
+                ),
+            )
+        } else if hit.kind == crate::typosquat::TyposquatKind::Misspelling {
+            // A one-edit misspelling of a popular name is a strong-enough NAME signal to surface as
+            // a suppressed community lead even without behavioural corroboration.
+            (
+                Severity::Low,
+                format!("pkg-community:typosquat:{name}"),
+                format!("dependency '{name}' name-resembles '{}' (community lead — no dropper behaviour observed)", hit.of),
+            )
+        } else {
+            // A DECORATION with no dropper behaviour is too weak to report at all — the legit
+            // ecosystem is full of `<root>-<word>` names, so a name-only decoration lead would be a
+            // false positive. Corroboration (the Medium branch) is the only way it surfaces.
+            continue;
+        };
+        findings.push(Finding {
+            campaign: "polinrider".into(),
+            severity,
+            repo: repo.to_path_buf(),
+            file: Some(PathBuf::from("package.json")),
+            signature_id,
+            kind: FindingKind::NpmPackage,
+            evidence,
+            remediable: false,
+            online: None,
+            git_ref: None,
+        });
+    }
+    findings
+}
+
 /// Code-file extensions the repo-wide injection pass reads. The PolinRider payload is appended JS/TS
 /// (obfuscated blob), so only source that can host it is scanned — keeps the extra I/O bounded and
 /// avoids reading data/binary assets.
@@ -614,6 +743,11 @@ fn scan_repo_inner(repo: &Path, packs: &[Pack], cancel: &AtomicBool) -> Vec<Find
     // Installed dependencies (node_modules) are pruned from the general walk; scan them targeted.
     if !cancel.load(Ordering::Relaxed) {
         findings.extend(scan_node_modules(repo, packs));
+    }
+    // Delivery-vector: dependency-name typosquats corroborated by installed-package dropper
+    // behaviour (working-tree only — needs package.json/lockfiles + node_modules on disk).
+    if !cancel.load(Ordering::Relaxed) {
+        findings.extend(scan_dependency_typosquats(repo, &working, packs));
     }
 
     if !cancel.load(Ordering::Relaxed) && !findings.is_empty() && reflog_has_amend(repo) {
@@ -1229,6 +1363,125 @@ mod tests {
         assert!(f
             .iter()
             .any(|x| x.kind == FindingKind::Capability && x.file == Some(PathBuf::from("setup_bun.js"))));
+    }
+
+    #[test]
+    fn typosquat_dependency_with_dropper_is_medium() {
+        // Delivery-vector detection: a dependency whose NAME is a typosquat of a popular package
+        // AND whose installed package shows dropper behaviour (obfuscated entry) -> visible Medium.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"tailwindcss-style-animate":"1.0.0","react":"18.0.0"}}"#,
+        )
+        .unwrap();
+        let pkg = repo.join("node_modules").join("tailwindcss-style-animate");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"tailwindcss-style-animate","version":"1.0.0","main":"index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            pkg.join("index.js"),
+            "var _$_1e42=(function(a,b){return eval(atob(a))})('x',1234567);global['r']=require;",
+        )
+        .unwrap();
+        let files = WorkingTree::new(&repo);
+        let f = scan_dependency_typosquats(&repo, &files, &[]);
+        let hit = f.iter().find(|x| x.signature_id == "typosquat:tailwindcss-style-animate");
+        assert!(hit.is_some(), "malicious typosquat dependency must be Medium-flagged: {f:?}");
+        assert_eq!(hit.unwrap().severity, Severity::Medium);
+        assert!(!f.iter().any(|x| x.signature_id.contains("react")), "legit react must not flag");
+    }
+
+    #[test]
+    fn misspelling_without_dropper_is_community_low() {
+        // A one-edit MISSPELLING of a popular name is a strong-enough name signal to surface as a
+        // suppressed community lead even without behaviour — but never a default-visible Medium.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        // `tailwindcs` = `tailwindcss` minus one char (edit distance 1) -> Misspelling.
+        fs::write(repo.join("package.json"), r#"{"dependencies":{"tailwindcs":"1.0.0"}}"#).unwrap();
+        let files = WorkingTree::new(&repo);
+        let f = scan_dependency_typosquats(&repo, &files, &[]);
+        assert!(
+            f.iter().any(|x| x.signature_id == "pkg-community:typosquat:tailwindcs"),
+            "misspelling must surface as a community lead: {f:?}"
+        );
+        assert!(!f.iter().any(|x| x.severity == Severity::Medium), "no behaviour -> not Medium");
+    }
+
+    #[test]
+    fn real_legit_lookalikes_installed_clean_produce_no_findings() {
+        // Adversarial real-npm audit: ~300 legit packages match the (deliberately broad) decoration
+        // matcher — chalk-cli, prettier-plugin-tailwindcss, element-theme-chalk, hundreds of
+        // tailwindcss-* plugins. Installed and CLEAN, every one must produce ZERO findings; the
+        // behaviour gate is the sole discriminator. A dropper-bearing one of the SAME names fires.
+        const LEGIT: &[&str] = &[
+            "chalk-cli", "chalk-table", "chalk-template", "chalk-pipe", "console-chalk",
+            "winston-chalk", "element-theme-chalk", "theme-chalk", "prettier-plugin-tailwindcss",
+            "tailwindcss-line-clamp", "tailwindcss-animate-x", "tailwind-scrollbar-hide",
+            "tailwind-styled-components", "vue-tailwind", "tailwindcss-motion",
+            "tailwindcss-radix-colors", "css-to-tailwindcss", "monaco-tailwindcss",
+        ];
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        let deps: String =
+            LEGIT.iter().map(|n| format!("\"{n}\":\"1.0.0\"")).collect::<Vec<_>>().join(",");
+        fs::write(repo.join("package.json"), format!("{{\"dependencies\":{{{deps}}}}}")).unwrap();
+        for n in LEGIT {
+            let pkg = repo.join("node_modules").join(n);
+            fs::create_dir_all(&pkg).unwrap();
+            fs::write(pkg.join("package.json"), format!("{{\"name\":\"{n}\",\"version\":\"1.0.0\"}}"))
+                .unwrap();
+            fs::write(pkg.join("index.js"), "module.exports = function(){ return 'ok'; };\n").unwrap();
+        }
+        let f = scan_dependency_typosquats(&repo, &WorkingTree::new(&repo), &[]);
+        assert!(f.is_empty(), "clean legit look-alikes must produce zero findings: {f:?}");
+
+        // Discrimination control: same name set, but now one carries a dropper -> Medium.
+        fs::write(
+            repo.join("node_modules").join("tailwindcss-motion").join("index.js"),
+            "var _$_1e42=(function(a,b){return eval(atob(a))})('x',1234567);",
+        )
+        .unwrap();
+        let f2 = scan_dependency_typosquats(&repo, &WorkingTree::new(&repo), &[]);
+        assert!(
+            f2.iter().any(|x| x.signature_id == "typosquat:tailwindcss-motion"
+                && x.severity == Severity::Medium),
+            "a dropper-bearing look-alike must fire Medium: {f2:?}"
+        );
+    }
+
+    #[test]
+    fn decoration_without_dropper_is_not_flagged() {
+        // FP guard: a `<root>-<word>` DECORATION with no dropper behaviour must produce NO finding
+        // at all (not even a community lead) — the legit ecosystem is full of such names.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        // clean, uninstalled decoration-shaped dependency
+        fs::write(repo.join("package.json"), r#"{"dependencies":{"tailwind-gridhelper":"1.0.0"}}"#)
+            .unwrap();
+        let files = WorkingTree::new(&repo);
+        let f = scan_dependency_typosquats(&repo, &files, &[]);
+        assert!(f.is_empty(), "uncorroborated decoration must not be flagged: {f:?}");
+    }
+
+    #[test]
+    fn legit_lookalike_dependency_never_flagged() {
+        // Real, popular look-alike packages must produce NO finding at all (allowlist + scope rules).
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"tailwindcss-animate":"1.0.0","tailwind-merge":"2.0.0","@tailwindcss/typography":"0.5.0","eslint-plugin-react":"7.0.0"}}"#,
+        )
+        .unwrap();
+        let files = WorkingTree::new(&repo);
+        let f = scan_dependency_typosquats(&repo, &files, &[]);
+        assert!(f.is_empty(), "legit look-alike dependencies must never be flagged: {f:?}");
     }
 
     #[test]
