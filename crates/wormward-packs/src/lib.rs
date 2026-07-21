@@ -834,6 +834,40 @@ mod tests {
     }
 
     #[test]
+    fn non_config_source_payload_detected_and_cleaned() {
+        // GitHub-corpus gap: ~14% of infected repos carried the payload only in ARBITRARY source
+        // (server.js, routes/*.js, Gruntfile.js, controllers…), never a recognized config. The
+        // repo-wide structural pass must detect it (version-independent — note the non-`5-3` tag)
+        // and it must clean like any other injection, leaving the legit source intact.
+        use std::path::Path;
+        use wormward_core::remediate::{action_for, apply};
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("victim");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let pad = " ".repeat(2000);
+        let legit = "const express = require('express');\nconst app = express();\napp.get('/', (r,s)=>s.send('ok'));\n";
+        let blob = "global['!']='9-5334';var _$_1e42=(function(a,b){return eval(atob(a))})('x',1234567);";
+        fs::write(repo.join("src/server.js"), format!("{legit}module.exports = app;{pad}{blob}")).unwrap();
+        let packs = builtin_packs();
+
+        let findings = scan_repo(&repo, &packs);
+        let hit = findings.iter().find(|f| f.file.as_deref() == Some(Path::new("src/server.js")));
+        assert!(hit.is_some(), "payload in src/server.js must be detected: {findings:?}");
+        assert!(hit.unwrap().remediable, "structural finding must be remediable");
+        assert_eq!(hit.unwrap().campaign, "polinrider");
+
+        let actions: Vec<_> = findings.iter().filter_map(|f| action_for(f, &packs)).collect();
+        apply(&repo, &actions, false);
+        let cleaned = fs::read_to_string(repo.join("src/server.js")).unwrap();
+        assert!(cleaned.contains("const app = express();"), "legit server code kept:\n{cleaned}");
+        assert!(cleaned.contains("module.exports = app;"), "export kept:\n{cleaned}");
+        assert!(!cleaned.contains("_$_1e42"), "decoder gone:\n{cleaned}");
+        assert!(!cleaned.contains("global['!']"), "marker gone:\n{cleaned}");
+        assert!(scan_repo(&repo, &packs).is_empty(), "re-scan after clean must be empty");
+    }
+
+    #[test]
     fn deep_scan_detects_wave3_on_non_default_branch() {
         // The re-infection lived on non-default branches too, so --deep must cover every branch tip.
         use std::path::Path;

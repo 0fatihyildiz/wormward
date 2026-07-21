@@ -212,9 +212,32 @@ only as **attribution**, to label *which* wave — never as the sole detection):
    globs), plus the known `seed`/`migrate` script names. A clean config of any name still never
    fires — the gate requires a concealment prior or a worm tell.
 
+4. **Repo-wide structural catch-all** (`scanner.rs` `scan_injection_structure`). The surface/target
+   passes only read recognized configs and entry files, but the family appends its payload to the
+   last line of ARBITRARY executable source — `server.js`, `routes/*.js`, `Gruntfile.js`,
+   `.prettierrc.mjs`, controllers, entry points. This pass reads every non-excluded, non-binary code
+   file and fires on `capability::injected_payload` (a padding-run line or a `_$_hex` decoder
+   identifier), both FP-safe by construction. Attributed to `polinrider` and remediable via the same
+   structural strip; deduped against surface findings so a flagged config is not double-reported.
+
 Remediation is structural to match: cut the payload at the ≥200-space padding run (or the generic
 marker/decoder), and remove the injected `createRequire` shim **only if no genuine `require(`
 remains** — so a config that legitimately uses `createRequire` for CJS interop is not broken.
+
+### Corpus evidence (GitHub, 2026-07-21)
+
+An IOC-seeded GitHub code-search sweep (wallets / C2 domains / dropper filenames / decoder /
+malicious packages, rate-limit-paced, clone-free scan) surfaced **762 confirmed-infected repos**.
+Two findings drove the hardening above:
+
+- **Version tags rotate constantly.** The originally-tracked `5-3-*` family is a *minority*; the
+  corpus is dominated by `8-*`, `9-*`, and `10-*` tags (8-270, 9-4365, 9-0674, 9-5607, 10-590, …
+  dozens of distinct prefixes). A signature keyed on `5-3-*` would false-negative on the majority;
+  the `_$_[0-9a-f]{4,}` decoder (2,768 files) and the padding structure catch them all.
+- **~14% of infections lived only in non-config source.** Before the repo-wide pass, wormward
+  detected 573/762 repos; the structural catch-all took that to 643/762 (the rest are dropper-only
+  repos, caught by the `temp_auto_push.bat` artifact). The sole residual source-code miss is one
+  payload inside a `vendor/` dir — deliberately excluded as third-party code (accepted trade-off).
 
 **Acceptance** (`wormward-packs` + `capability_integration`): a `5-3-168`/`_$_3317` payload (in no
 signature list) and a hypothetical `5-3-999-zz` payload are both DETECTED and CLEANED across the

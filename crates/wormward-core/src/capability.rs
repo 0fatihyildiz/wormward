@@ -427,6 +427,19 @@ fn line_has_padding_run(line: &str) -> bool {
     false
 }
 
+/// Version-independent injected-payload structural tells for a REPO-WIDE scan — any text file, not
+/// only a recognized auto-run surface. The PolinRider family appends its payload to the last line of
+/// whatever file it infects: not just recognized configs but arbitrary executable source
+/// (`server.js`, `routes/*.js`, `Gruntfile.js`, `.prettierrc.mjs`, controllers, entry points…),
+/// which the surface-scoped passes never read. Fires on the padding-injection line or a `_$_hex`
+/// decoder identifier — both FP-safe by construction: a ≥200-space mid-line run never occurs in
+/// legitimate source (minifiers strip whitespace), and `_$_[0-9a-f]{4,}` cannot appear in base64
+/// (it has `$`) and is not a legitimate identifier convention. The caller excludes minified /
+/// build-output / vendored files, so this only adds coverage of the family's non-config hosts.
+pub fn injected_payload(content: &str) -> bool {
+    padding_injection(content) || decoder_re().is_match(content)
+}
+
 /// The double-base64 exfil-staging blob shape: content begins `eyJ` (base64 of
 /// `{"`) and contains `==`. A standalone repo-level check (not a `Surface`).
 pub fn is_exfil_staging(content: &str) -> bool {

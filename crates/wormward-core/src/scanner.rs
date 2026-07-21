@@ -493,6 +493,73 @@ fn dedup_capability_against_packs(findings: &mut Vec<Finding>) {
     });
 }
 
+/// Code-file extensions the repo-wide injection pass reads. The PolinRider payload is appended JS/TS
+/// (obfuscated blob), so only source that can host it is scanned — keeps the extra I/O bounded and
+/// avoids reading data/binary assets.
+const INJECTION_SCAN_EXTS: &[&str] =
+    &["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts", "vue", "svelte", "astro"];
+
+/// Repo-wide structural injection catch-all. The surface/target passes only read recognized configs
+/// and entry files, but PolinRider appends its payload to the last line of ARBITRARY executable
+/// source — `server.js`, `routes/*.js`, `Gruntfile.js`, `.prettierrc.mjs`, controllers, entry points
+/// — which those passes never see (in a 692-repo GitHub corpus, ~14% of infections lived only in
+/// such files). This pass reads every non-excluded, non-binary code file and fires on the
+/// version-independent injection structure ([`crate::capability::injected_payload`]): a padding-run
+/// line or a `_$_hex` decoder identifier, both FP-safe by construction. Findings are attributed to
+/// `polinrider` as `Analyzer`, so they route through the structural strip; the caller dedups against
+/// surface findings so an already-flagged config is not double-reported.
+pub fn scan_injection_structure(repo: &Path, files: &dyn RepoFiles) -> Vec<Finding> {
+    scan_injection_structure_inner(repo, files, &NEVER)
+}
+
+fn scan_injection_structure_inner(
+    repo: &Path,
+    files: &dyn RepoFiles,
+    cancel: &AtomicBool,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for rel in files.paths() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if is_excluded_path(rel) {
+            continue;
+        }
+        let ext = rel
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !INJECTION_SCAN_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        let content = match files.read(rel) {
+            Some(c) => c,
+            None => continue,
+        };
+        if content.len() > MAX_CONTENT_BYTES || looks_binary(&content) {
+            continue;
+        }
+        if crate::capability::injected_payload(&content) {
+            findings.push(Finding {
+                campaign: "polinrider".into(),
+                severity: Severity::Critical,
+                repo: repo.to_path_buf(),
+                file: Some(rel.clone()),
+                signature_id: "injection:structural".into(),
+                kind: FindingKind::Analyzer,
+                evidence:
+                    "injected payload structure (padding run / decoder identifier) in a non-config source file"
+                        .into(),
+                remediable: true,
+                online: None,
+                git_ref: None,
+            });
+        }
+    }
+    findings
+}
+
 /// Full campaign + capability scan over any file source (a working tree, a branch tip, or
 /// a clone-free API tree), deduped. This is the single shared body so every scan path —
 /// local (`scan_repo`), deep (`deep_scan_repo`), and GitHub API (`wormward-github`) — runs
@@ -515,6 +582,15 @@ fn scan_tree_inner(
     let mut findings = scan_files_inner(repo, files, packs, cancel);
     findings.extend(scan_capabilities_inner(repo, files, cancel));
     dedup_capability_against_packs(&mut findings);
+    // Repo-wide structural catch-all for the family's NON-config hosts (arbitrary source files no
+    // surface/target pass reads). Add a structural finding only for files not already covered, so a
+    // config the surface passes flagged is not double-reported.
+    let covered: HashSet<PathBuf> = findings.iter().filter_map(|f| f.file.clone()).collect();
+    for f in scan_injection_structure_inner(repo, files, cancel) {
+        if f.file.as_ref().map(|p| !covered.contains(p)).unwrap_or(true) {
+            findings.push(f);
+        }
+    }
     // Capability findings default to non-remediable, but a few (e.g. a malicious .vscode/tasks.json)
     // now map to a delete action. Re-stamp uniformly so the `remediable` flag tracks the single
     // action_for source of truth for every finding kind, not just the pack-pass ones.
@@ -1153,6 +1229,83 @@ mod tests {
         assert!(f
             .iter()
             .any(|x| x.kind == FindingKind::Capability && x.file == Some(PathBuf::from("setup_bun.js"))));
+    }
+
+    #[test]
+    fn injection_structure_flags_payload_in_non_config_source() {
+        // Corpus gap (84 of 692 infected repos): PolinRider appends its payload to arbitrary
+        // executable source (server.js, routes/*.js, Gruntfile.js, .prettierrc.mjs, controllers…),
+        // which the surface/target passes never read. The repo-wide structural pass catches it
+        // version-independently. Note the NON-`5-3` version tag (`9-5334`) seen in the wild — the
+        // structure, not the constant, is what fires.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        let pad = " ".repeat(2000);
+        fs::write(
+            repo.join("server.js"),
+            format!(
+                "const app = require('express')();\nmodule.exports = app;{pad}global['!']='9-5334';var _$_1e42=(function(a,b){{return eval(atob(a))}})('x',1234567);"
+            ),
+        )
+        .unwrap();
+        fs::write(repo.join("clean.js"), "const x = 1;\nmodule.exports = { x };\n").unwrap();
+        let files = WorkingTree::new(&repo);
+        let f = scan_injection_structure(&repo, &files);
+        assert!(
+            f.iter().any(|x| x.file == Some(PathBuf::from("server.js"))),
+            "payload in non-config server.js must be flagged: {f:?}"
+        );
+        assert!(
+            !f.iter().any(|x| x.file == Some(PathBuf::from("clean.js"))),
+            "a clean source file must not be flagged"
+        );
+    }
+
+    #[test]
+    fn injection_structure_skips_minified_and_excluded() {
+        // FP-safety: a minified bundle (no whitespace runs, no `_$_hex` decoder) and anything in a
+        // build-output dir must not fire, or the repo-wide pass would be noisy on generated code.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        let minified = "var a=1;function f(){return a};module.exports={f};".repeat(80);
+        fs::write(repo.join("bundle.js"), &minified).unwrap();
+        fs::create_dir_all(repo.join("dist")).unwrap();
+        let pad = " ".repeat(2000);
+        fs::write(
+            repo.join("dist").join("app.js"),
+            format!("module.exports={{}};{pad}var _$_1e42=eval(x);"),
+        )
+        .unwrap();
+        let files = WorkingTree::new(&repo);
+        let f = scan_injection_structure(&repo, &files);
+        assert!(f.is_empty(), "minified + build-output must not fire: {f:?}");
+    }
+
+    #[test]
+    fn injection_structure_does_not_duplicate_surface_findings() {
+        // A config already flagged by the surface passes must NOT also receive a redundant
+        // repo-wide `injection:structural` finding (dedup by file).
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        let pad = " ".repeat(2000);
+        fs::write(
+            repo.join("postcss.config.mjs"),
+            format!(
+                "export default {{}};{pad}global['!']='9-5334';var _$_1e42=(function(a,b){{return a}})('x',1234567);"
+            ),
+        )
+        .unwrap();
+        let files = WorkingTree::new(&repo);
+        let all = scan_tree(&repo, &files, &[literal_pack()]);
+        assert!(
+            all.iter().any(|x| x.file == Some(PathBuf::from("postcss.config.mjs"))),
+            "the config must still be detected"
+        );
+        assert!(
+            !all.iter().any(|x| x.file == Some(PathBuf::from("postcss.config.mjs"))
+                && x.signature_id == "injection:structural"),
+            "a surface-covered file must not also get the repo-wide structural finding: {all:?}"
+        );
     }
 
     #[test]
