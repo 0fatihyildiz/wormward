@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Finding } from "../types";
+  import { fixClass, fixLabel } from "../findings";
 
   let { finding }: { finding: Finding } = $props();
 
@@ -15,14 +16,18 @@
   const where = $derived(
     finding.file ? (finding.excerpt ? `${finding.file}:${finding.excerpt.line}` : finding.file) : finding.repo,
   );
-  const label = $derived(finding.remediable ? "Removable automatically" : "Needs your attention");
+  // auto / branch / manual — the pill must match what the results-screen buttons can do:
+  // a branch-tip finding is NOT one-click removable, so it can't read "Removable automatically".
+  const cls = $derived(fixClass(finding));
+  const label = $derived(fixLabel(finding));
+  const pillTone = $derived(cls === "auto" ? "ok" : cls === "branch" ? "info" : "warn");
 </script>
 
 <div class="finding-card">
   <div class="fc-top">
     <span class="fc-title sev-{finding.severity}">{title}</span>
     <span class="fc-where mono">{where}</span>
-    <span class="fc-label {finding.remediable ? 'ok' : 'warn'}">{label}</span>
+    <span class="fc-label {pillTone}">{label}</span>
   </div>
   <details class="fc-details">
     <summary>Details</summary>
@@ -65,6 +70,7 @@
   .fc-label { font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 999px; margin-left: auto; white-space: nowrap; }
   .fc-label.ok { background: var(--ok-tint); color: var(--ok); }
   .fc-label.warn { background: var(--warn-tint); color: var(--warn); }
+  .fc-label.info { background: var(--info-tint, rgba(80,140,255,.14)); color: var(--info, #4c7dff); }
   .fc-details > summary { cursor: pointer; color: var(--muted); font-size: 12px; width: fit-content; }
   .fc-details > summary:hover { color: var(--fg); }
   .fc-dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 10px 0 0; }

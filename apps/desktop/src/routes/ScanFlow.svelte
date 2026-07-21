@@ -2,11 +2,13 @@
   import { onMount } from "svelte";
   import { app, fail, clearErrors, go, notify } from "../lib/state.svelte";
   import { device } from "../lib/platform";
-  import { scan, doctor, cancelScan, cleanApply } from "../lib/api";
+  import { scan, doctor, cancelScan, cleanApply, cleanBranchesApply } from "../lib/api";
   import { listen } from "@tauri-apps/api/event";
   import GuidedProgress from "../lib/components/GuidedProgress.svelte";
   import FindingCard from "../lib/components/FindingCard.svelte";
   import type { ScanProgress, Finding } from "../lib/types";
+  import { fixClass, branchSelections } from "../lib/findings";
+  import { dialog } from "../lib/modal";
 
   const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
 
@@ -18,6 +20,9 @@
 
   // --- results / clean ---
   let removedSummary = $state("");
+  // What the indeterminate "cleaning" step announces — differs for a working-tree strip vs a
+  // branch rewrite+force-push, so the progress copy is never misleading.
+  let cleaningLabel = $state("Removing threats safely…");
 
   // C5: the guided flow advances by mutating app.flow (not app.view), so App.svelte's
   // view-level focus effect never fires on scanning→results→cleaning→clean. Only one flow
@@ -28,14 +33,17 @@
   const findings = $derived(report?.findings ?? []);
   const total = $derived(findings.length);
   const cancelled = $derived(report?.cancelled ?? false);
-  // Branch-tip findings (git_ref set) have no working-tree clean action — cleanPreview
-  // produces no plan for them, so the "Remove threats safely" button can't touch them.
-  // They're only reachable via Advanced → branch cleaning, so they must count toward
-  // "manual" (need your review), not "removable" — otherwise the summary promises an
-  // automatic removal the UI has no button for.
-  const removableFindings = $derived(findings.filter((f) => f.remediable && !f.git_ref));
+  // Every finding is exactly one of: auto (working-tree, one-click strip), branch (payload on
+  // a branch TIP — fixable only by rewriting history + force-pushing), or manual (no auto fix).
+  // The pill on each card and these counts share fixClass(), so they can never disagree again.
+  const removableFindings = $derived(findings.filter((f) => fixClass(f) === "auto"));
+  const branchFindings = $derived(findings.filter((f) => fixClass(f) === "branch"));
   const removable = $derived(removableFindings.length);
-  const manual = $derived(total - removable);
+  const branchFixable = $derived(branchFindings.length);
+  const manual = $derived(total - removable - branchFixable);
+  // Unique (repo, branch) pairs the branch cleaner targets, and the distinct remotes affected.
+  const branchTargets = $derived(branchSelections(findings));
+  const branchRepos = $derived([...new Set(branchFindings.map((f) => f.repo))]);
 
   const SEV_RANK: Record<string, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
   const rank = (s: string) => SEV_RANK[s] ?? 0;
@@ -123,6 +131,7 @@
   }
 
   async function removeThreats() {
+    cleaningLabel = "Removing threats safely…";
     app.flow = "cleaning";
     clearErrors();
     try {
@@ -136,6 +145,35 @@
       removedSummary =
         `Removed ${s.applied} ${plural(s.applied, "threat", "threats")} across ${s.repos} ${plural(s.repos, "place", "places")}.` +
         (s.backups.length ? " A backup was saved." : "");
+      app.flow = "clean";
+    } catch (e) {
+      fail(e);
+      app.flow = "results";
+    }
+  }
+
+  // Branch-tip cleaning force-pushes rewritten history to the remote, so it is gated behind an
+  // explicit confirmation (never silent). The old tip of each branch is preserved in a
+  // refs/wormward-backup/… ref, so a cleaned push is recoverable.
+  let confirmingBranches = $state(false);
+
+  async function cleanBranches() {
+    confirmingBranches = false;
+    cleaningLabel = "Rewriting and force-pushing clean branch tips…";
+    app.flow = "cleaning";
+    clearErrors();
+    try {
+      // push=true: these infections live on remote-tracking tips (origin/*), which can only be
+      // cleaned by force-pushing the rewrite back — a local-only rewrite would be reported skipped.
+      const s = await cleanBranchesApply(branchTargets, true);
+      const osmToken = localStorage.getItem("osm_token") || undefined;
+      app.report = await scan(app.dirs, true, app.online && !!osmToken, osmToken, app.history, app.community, app.osv);
+      app.lastScanAt = Date.now();
+      removedSummary =
+        `Cleaned ${s.cleaned} ${plural(s.cleaned, "branch", "branches")}` +
+        (s.skipped ? `, ${s.skipped} skipped` : "") +
+        (s.failed ? `, ${s.failed} failed` : "") +
+        ". The old tip of each is kept in a wormward-backup ref.";
       app.flow = "clean";
     } catch (e) {
       fail(e);
@@ -221,11 +259,23 @@
           </div>
         </div>
       {:else}
-        <p class="flow-summary"><strong>{total} {plural(total, "threat", "threats")} found.</strong> {removable} can be removed safely and automatically; {manual} need your review.</p>
+        <p class="flow-summary">
+          <strong>{total} {plural(total, "threat", "threats")} found.</strong>
+          {removable} can be removed safely and automatically;
+          {#if branchFixable > 0}{branchFixable} live on branch tips (fixable by rewriting &amp; force-pushing);{/if}
+          {manual} need your review.
+        </p>
 
-        {#if fixableRepos.length}
+        {#if fixableRepos.length || branchTargets.length}
           <div class="flow-actions">
-            <button class="btn primary" onclick={removeThreats}>Remove threats safely</button>
+            {#if fixableRepos.length}
+              <button class="btn primary" onclick={removeThreats}>Remove threats safely</button>
+            {/if}
+            {#if branchTargets.length}
+              <button class="btn danger" onclick={() => (confirmingBranches = true)}>
+                Clean {branchTargets.length} infected {plural(branchTargets.length, "branch", "branches")} (force-push)
+              </button>
+            {/if}
           </div>
         {/if}
 
@@ -250,10 +300,38 @@
     </section>
   {/if}
 
+  {#if confirmingBranches}
+    <div class="modal-backdrop">
+      <div
+        class="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="sf-branch-clean-title"
+        tabindex="-1"
+        use:dialog={() => (confirmingBranches = false)}
+      >
+        <h3 id="sf-branch-clean-title">Clean infected branches?</h3>
+        <p class="lede">
+          These payloads are on the branch tips of {branchRepos.length}
+          {plural(branchRepos.length, "repository", "repositories")}, not in your local files.
+          wormward will rewrite {branchTargets.length}
+          {plural(branchTargets.length, "branch tip", "branch tips")} with a clean commit and
+          <strong>force-push</strong> to the remote. The old tip of each is preserved in a
+          <code>refs/wormward-backup/…</code> ref, so this is recoverable.
+        </p>
+        <p class="crit small"><strong>This overwrites remote history</strong> on your GitHub remotes.</p>
+        <div class="flow-actions">
+          <button class="btn ghost" onclick={() => (confirmingBranches = false)}>Cancel</button>
+          <button class="btn danger" onclick={cleanBranches}>Clean &amp; force-push</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if app.flow === "cleaning"}
     <section class="flow-step">
       <h1 class="flow-title" tabindex="-1" bind:this={stepHeadingEl}>Removing threats…</h1>
-      <GuidedProgress label="Removing threats safely…" indeterminate={true} />
+      <GuidedProgress label={cleaningLabel} indeterminate={true} />
     </section>
   {/if}
 
