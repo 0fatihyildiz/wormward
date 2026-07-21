@@ -290,11 +290,17 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
 
 /// Blob count above which a repo is scanned via a shallow clone instead of per-blob REST. The
 /// repo-wide injection pass reads every code file, so the API path issues up to one `GET
-/// /git/blobs` per file per branch tip — hundreds/thousands of round-trips that are both slow and
-/// exhaust the 5000/hr REST quota (the "rate limit / refused" the user hit). Above this, one
-/// shallow packfile transfer is dramatically faster and spends almost no quota. Chosen well below
-/// the point where REST amplification dominates, and far under GitHub's own ~100k truncation cap.
-const BIG_TREE_BLOBS: usize = 2000;
+/// /git/blobs` per file per branch tip — a burst of round-trips that is slow AND, across an
+/// account, exhausts the 5000/hr REST quota and trips the secondary rate limit (the "refused"
+/// error). Kept low so any non-trivial repo takes the single-packfile clone path instead of
+/// bursting hundreds of blob reads; a small repo under this stays on the cheaper API path.
+const BIG_TREE_BLOBS: usize = 300;
+
+/// How many repos to scan concurrently over the API. The scan is network-bound so some parallelism
+/// helps, but GitHub's secondary rate limit keys off concurrency + burstiness — so keep this modest
+/// (paired with `call`'s per-request backoff) rather than maximizing it. Lowered from an earlier,
+/// too-aggressive 32 that reliably tripped the secondary limit on multi-repo accounts.
+const GITHUB_SCAN_CONCURRENCY: usize = 8;
 
 /// Whether a tip's tree should be scanned via a clone rather than per-blob REST: GitHub truncated
 /// the listing (too large to enumerate over the API at all), or it has more blobs than the REST
@@ -458,12 +464,16 @@ pub fn scan_pass_with_progress_cancellable(
             })
             .collect::<Result<Vec<_>, _>>()
     };
-    // The per-repo scan is NETWORK-bound (branch list + tree + blob fetches per repo), so the
-    // global rayon pool — sized to CPU cores for the local scanner — badly under-parallelizes
-    // it: most workers just sleep on HTTP latency. Fan out on a dedicated wider pool instead,
-    // capped at 32 concurrent repos (well under GitHub's ~100-concurrent secondary-rate-limit
-    // guidance). A pool-build failure falls back to the global pool rather than failing the scan.
-    let scanned = match rayon::ThreadPoolBuilder::new().num_threads(total.clamp(1, 32)).build() {
+    // The per-repo scan is NETWORK-bound, so a dedicated pool (not the CPU-sized global one) keeps
+    // workers from idling on HTTP latency. But GitHub's SECONDARY rate limit triggers on
+    // concurrency + burst, not just total volume — 32-way fanout, each firing a burst of blob
+    // reads, reliably tripped it. Cap at GITHUB_SCAN_CONCURRENCY (a modest number, well under
+    // GitHub's ~100-concurrent ceiling and paired with per-request backoff in `call`) so the sweep
+    // stays fast without provoking the limit. A pool-build failure falls back to the global pool.
+    let scanned = match rayon::ThreadPoolBuilder::new()
+        .num_threads(total.clamp(1, GITHUB_SCAN_CONCURRENCY))
+        .build()
+    {
         Ok(pool) => pool.install(scan_all),
         Err(_) => scan_all(),
     }?;
