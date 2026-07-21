@@ -39,7 +39,7 @@ const ASSET_EXTS: &[&str] = &["woff", "woff2", "ttf", "otf", "eot", "png", "jpg"
 // deep-scan-only phantom findings.
 pub(crate) const EXCLUDED_DIRS: &[&str] = &[
     "dist", "build", ".next", "out", "coverage", "vendor", "node_modules", ".wormward-backup",
-    "target",
+    "target", ".output", ".nuxt",
 ];
 
 const LIFECYCLE_KEYS: &[&str] = &[
@@ -344,6 +344,9 @@ mod tests {
     #[test]
     fn excludes_build_dirs() {
         assert!(is_excluded_path(Path::new("dist/postcss.config.js")));
+        assert!(is_excluded_path(Path::new("apps/api/.output/server/index.mjs")));
+        assert!(is_excluded_path(Path::new(".nuxt/dist/server/server.mjs")));
+
         assert!(is_excluded_path(Path::new("app.min.js")));
         assert!(!is_excluded_path(Path::new("src/index.js")));
     }

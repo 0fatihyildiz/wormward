@@ -129,7 +129,14 @@ fn network_egress(content: &str) -> bool {
 }
 
 // --- ProcessSpawn ---
-lazy_re!(spawn_re, r"child_process|\bspawn\s*\(|\bexecSync\s*\(|\bexec\s*\(|Bun\.spawn(?:Sync)?\s*\(");
+// Process-spawn tokens. The bare `exec(` alternative was REMOVED: it matched a JS regex/string
+// `.exec()` (`/re/.exec(s)`, `str.match`…), which false-positives on legit parsers/minified bundles
+// (e.g. `@babel/parser`). Real child-process execution always references `child_process` (the import)
+// or a spawn/execSync/execFile/Bun.spawn API, so dropping bare `exec(` loses no real detection.
+lazy_re!(
+    spawn_re,
+    r"child_process|\bspawn(?:Sync)?\s*\(|\bexecSync\s*\(|\bexecFile(?:Sync)?\s*\(|Bun\.spawn(?:Sync)?\s*\("
+);
 fn process_spawn(content: &str) -> bool {
     spawn_re().is_match(content)
 }
@@ -480,12 +487,13 @@ fn appended_obfuscated_blob(content: &str) -> bool {
     if last.len() < median.saturating_mul(4) {
         return false;
     }
-    // And executable-obfuscated — name-independent tells only.
-    let exec_sink = ["eval(", "Function(", "atob(", "unescape(", "String.fromCharCode", "charCodeAt"]
+    // And the blob line must contain an EXECUTION sink — a decoded string has to run somehow. Only
+    // these name-independent tells qualify. (A large inline string-array alone is NOT enough: legit
+    // minified/bundled code — e.g. a big `dist/*.js` chunk — is one giant string-array-bearing line,
+    // and firing on that false-positives. A real appended payload EXECUTES what it decodes.)
+    ["eval(", "Function(", "atob(", "unescape(", "String.fromCharCode", "charCodeAt"]
         .iter()
-        .any(|t| last.contains(t));
-    let string_array = last.matches("','").count() >= 6 || last.matches("\",\"").count() >= 6;
-    exec_sink || (string_array && last.contains('('))
+        .any(|t| last.contains(t))
 }
 
 /// Version-independent injected-payload structural tells for a REPO-WIDE scan — any text file, not
@@ -726,6 +734,17 @@ mod tests {
     #[test]
     fn process_spawn_detected() {
         assert!(score("child_process.spawn('node',['-e',code])", Surface::DerivedScript).process_spawn);
+        assert!(score("const cp=require('child_process');cp.exec('id')", Surface::DerivedScript).process_spawn);
+        assert!(score("import {execSync} from 'child_process';execSync('ls')", Surface::DerivedScript).process_spawn);
+    }
+
+    #[test]
+    fn regex_exec_is_not_process_spawn() {
+        // FP hunt (real, dominant class): a JS regex/string `.exec()` must NOT read as process spawn.
+        // `@babel/parser` and countless legit parsers call `re.exec(str)`; combined with trailing
+        // code that tripped the ConfigFile gate -> false positive. child_process is the real tell.
+        assert!(!score("const m = /foo(bar)/.exec(input); return m && m[1];", Surface::ConfigFile).process_spawn);
+        assert!(!score("while ((match = pattern.exec(src)) !== null) { tokens.push(match); }", Surface::DerivedScript).process_spawn);
     }
     #[test]
     fn magic_mismatch_spares_real_asset_magic() {
@@ -973,11 +992,17 @@ mod tests {
     }
 
     #[test]
-    fn appended_blob_string_array_variant() {
-        // A string-array obfuscator tail (no eval literal, no `_$_`) on the last line still trips.
+    fn appended_blob_string_array_tail_without_exec_is_fp_safe() {
+        // FP hunt (real): a legit minified/bundled file is one giant string-array-bearing last line
+        // with readable code above it (e.g. `@react-native/debugger-frontend/dist/**.js`). A large
+        // string-array WITHOUT an execution sink on that line must NOT fire — only an appended blob
+        // that EXECUTES (eval/Function/atob/charcode) does. This was a real appended-blob FP class.
         let arr = vec!["'zx'"; 120].join(",");
-        let file = format!("import a from 'x';\nexport default {{}};\nfunction real(){{ return 1; }}\nvar _a=[{arr}];_a.forEach(x=>run(x));");
-        assert!(appended_obfuscated_blob(&file), "string-array tail must be caught");
+        let file = format!("import a from 'x';\nexport default {{}};\nfunction real(){{ return 1; }}\nvar _a=[{arr}];_a.map(String);");
+        assert!(!appended_obfuscated_blob(&file), "a string-array tail with no exec sink must not fire");
+        // But the same shape WITH an execution sink is still caught.
+        let evil = format!("import a from 'x';\nexport default {{}};\nfunction real(){{ return 1; }}\nvar _a=[{arr}];eval(_a.join(''));");
+        assert!(appended_obfuscated_blob(&evil), "string-array + eval on the tail is still a payload");
     }
 
     #[test]
