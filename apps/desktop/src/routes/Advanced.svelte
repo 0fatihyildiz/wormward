@@ -62,6 +62,20 @@
     if (iocOutput) await navigator.clipboard.writeText(iocOutput);
   }
 
+  // ---------------- MCP: connect AI assistants (static setup info) ----------------
+  async function copy(text: string) {
+    await navigator.clipboard.writeText(text);
+  }
+  const mcpClaude = "claude mcp add wormward -- wormward mcp";
+  const mcpJson = `{
+  "mcpServers": {
+    "wormward": { "command": "wormward", "args": ["mcp"] }
+  }
+}`;
+  const mcpCodexToml = `[mcp_servers.wormward]
+command = "wormward"
+args = ["mcp"]`;
+
   const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
 
   // ---------------- GitHub account: scan + fix & force-push ----------------
@@ -345,6 +359,41 @@
         >{iocOutput}</textarea
       >
     {/if}
+  </section>
+
+  <!-- MCP: connect AI assistants -->
+  <section class="card">
+    <h2>Connect AI assistants (MCP)</h2>
+    <p class="lede">
+      Run wormward as an MCP server so Claude Code, Cursor, or Codex can drive its tools — scan,
+      check-package, doctor, export-iocs, hunt, list-packs (read-only), plus clean/harden (dry-run
+      unless explicitly applied). The assistant spawns <span class="mono">wormward mcp</span> itself;
+      nothing runs here.
+    </p>
+
+    <p class="muted small" style="margin-bottom: 4px">Claude Code</p>
+    <div class="row" style="gap: 8px; align-items: flex-start">
+      <pre
+        class="mono"
+        style="flex: 1; margin: 0; padding: 8px 10px; background: #101217; border-radius: 6px; overflow-x: auto">{mcpClaude}</pre>
+      <button class="btn ghost sm" onclick={() => copy(mcpClaude)}>Copy</button>
+    </div>
+
+    <p class="muted small" style="margin: 12px 0 4px">Cursor — <span class="mono">.cursor/mcp.json</span></p>
+    <div class="row" style="gap: 8px; align-items: flex-start">
+      <pre
+        class="mono"
+        style="flex: 1; margin: 0; padding: 8px 10px; background: #101217; border-radius: 6px; overflow-x: auto">{mcpJson}</pre>
+      <button class="btn ghost sm" onclick={() => copy(mcpJson)}>Copy</button>
+    </div>
+
+    <p class="muted small" style="margin: 12px 0 4px">Codex — <span class="mono">~/.codex/config.toml</span></p>
+    <div class="row" style="gap: 8px; align-items: flex-start">
+      <pre
+        class="mono"
+        style="flex: 1; margin: 0; padding: 8px 10px; background: #101217; border-radius: 6px; overflow-x: auto">{mcpCodexToml}</pre>
+      <button class="btn ghost sm" onclick={() => copy(mcpCodexToml)}>Copy</button>
+    </div>
   </section>
 
   <!-- GitHub account -->
