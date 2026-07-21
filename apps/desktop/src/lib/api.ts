@@ -12,6 +12,7 @@ import type {
   GithubRepoView,
   GithubFixView,
   DoctorReport,
+  PackageCheck,
 } from "./types";
 
 export const scan = (
@@ -74,3 +75,12 @@ export async function pickDirs(): Promise<string[]> {
   if (!sel) return [];
   return Array.isArray(sel) ? sel : [sel];
 }
+
+// Export takedown-ready IOCs (feed / npm abuse-report / STIX 2.1).
+export const exportIocs = (format: "list" | "npm-report" | "stix") =>
+  invoke<string>("export_iocs", { format });
+
+// Pre-install delivery-vector check for a single npm package (no install, no execution).
+export const checkPackage = (name: string) =>
+  invoke<PackageCheck>("check_package", { name });
+

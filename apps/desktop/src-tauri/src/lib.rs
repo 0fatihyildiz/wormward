@@ -14,7 +14,7 @@ use wormward_github::pipeline::{
     fix_pass, scan_pass_with_progress_cancellable, GithubRunOpts, ScanPass,
 };
 use wormward_github::{resolve_token, GitHubHost, RepoHost};
-use wormward_osm::{enrich, OsmClient};
+use wormward_osm::{check_npm_package, enrich, OsmClient, PackageCheck};
 use wormward_packs::builtin_packs;
 
 /// The findings from a GitHub `scan_pass` (API-based, no clones), plus the exact token
@@ -257,6 +257,25 @@ fn list_packs() -> Vec<PackInfo> {
             description: p.manifest.description,
         })
         .collect()
+}
+
+/// Export takedown-ready IOCs from the loaded packs as a machine-readable feed (`list`), an npm
+/// abuse-report draft (`npm-report`), or a STIX 2.1 bundle (`stix`).
+#[tauri::command]
+fn export_iocs(format: String) -> String {
+    let packs = builtin_packs();
+    match format.as_str() {
+        "npm-report" => wormward_core::to_npm_report(&packs),
+        "stix" => wormward_core::to_stix(&packs),
+        _ => wormward_core::to_ioc_list(&packs),
+    }
+}
+
+/// Pre-install delivery-vector check: fetch an npm package's metadata + entry (no install, no
+/// execution) and flag dropper behaviour before it ever runs.
+#[tauri::command]
+fn check_package(name: String) -> Result<PackageCheck, String> {
+    check_npm_package(name.trim()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -747,7 +766,9 @@ pub fn run() {
             doctor,
             doctor_clear_cache,
             doctor_harden_triggers,
-            cancel_github_scan
+            cancel_github_scan,
+            export_iocs,
+            check_package
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wormward desktop");

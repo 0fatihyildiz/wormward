@@ -8,6 +8,8 @@
     cleanBranchesPreview,
     cleanBranchesApply,
     restore,
+    exportIocs,
+    checkPackage,
   } from "../lib/api";
   import { dialog } from "../lib/modal";
   import { listen } from "@tauri-apps/api/event";
@@ -18,7 +20,47 @@
     BranchCleanPreview,
     BranchSelection,
     BranchCleanResult,
+    PackageCheck,
   } from "../lib/types";
+
+  // ---------------- Threat-intel tools: pre-install package check + IOC export ----------------
+  let pkgName = $state("");
+  let pkgResult = $state<PackageCheck | null>(null);
+  let pkgBusy = $state(false);
+  let iocFormat = $state<"list" | "npm-report" | "stix">("npm-report");
+  let iocOutput = $state("");
+  let iocBusy = $state(false);
+
+  async function runCheckPackage() {
+    const name = pkgName.trim();
+    if (!name) return;
+    pkgBusy = true;
+    pkgResult = null;
+    clearErrors();
+    try {
+      pkgResult = await checkPackage(name);
+    } catch (e) {
+      fail(e);
+    } finally {
+      pkgBusy = false;
+    }
+  }
+
+  async function runExportIocs() {
+    iocBusy = true;
+    clearErrors();
+    try {
+      iocOutput = await exportIocs(iocFormat);
+    } catch (e) {
+      fail(e);
+    } finally {
+      iocBusy = false;
+    }
+  }
+
+  async function copyIocs() {
+    if (iocOutput) await navigator.clipboard.writeText(iocOutput);
+  }
 
   const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
 
@@ -241,6 +283,69 @@
       clearly labeled and asks you to confirm — most people never need this screen.
     </p>
   </div>
+
+  <!-- Pre-install package check -->
+  <section class="card">
+    <h2>Pre-install package check</h2>
+    <p class="lede">
+      Check an npm package <strong>before</strong> you install it — wormward fetches its metadata and
+      entry file (no install, no code execution) and flags dropper behaviour.
+    </p>
+    <div class="row" style="gap: 8px; align-items: center">
+      <input
+        aria-label="npm package name"
+        placeholder="package name — e.g. left-pad or name@1.2.3"
+        spellcheck="false"
+        autocomplete="off"
+        bind:value={pkgName}
+        onkeydown={(e) => e.key === "Enter" && runCheckPackage()}
+        style="flex: 1"
+      />
+      <button class="btn primary" onclick={runCheckPackage} disabled={pkgBusy || !pkgName.trim()}>
+        {pkgBusy ? "Checking…" : "Check"}
+      </button>
+    </div>
+    {#if pkgResult}
+      <p style="margin-top: 12px">
+        {#if pkgResult.malicious}
+          <strong class="warn-text">⚠ MALICIOUS</strong>
+        {:else}
+          <strong style="color: var(--ok)">✓ clean</strong>
+        {/if}
+        <span class="mono">{pkgResult.name}@{pkgResult.version}</span>
+        <span class="muted">— {pkgResult.reason}</span>
+      </p>
+    {/if}
+  </section>
+
+  <!-- Export takedown IOCs -->
+  <section class="card">
+    <h2>Export takedown IOCs</h2>
+    <p class="lede">
+      Turn the tracked campaigns into disruption-ready artifacts. Reporting the malicious packages to
+      npm cuts the delivery vector at the source; the STIX bundle is for sharing with the ecosystem.
+    </p>
+    <div class="row" style="gap: 8px; align-items: center">
+      <select bind:value={iocFormat} aria-label="IOC export format" style="flex: 1">
+        <option value="npm-report">npm abuse report</option>
+        <option value="stix">STIX 2.1 bundle</option>
+        <option value="list">IOC feed</option>
+      </select>
+      <button class="btn" onclick={runExportIocs} disabled={iocBusy}>
+        {iocBusy ? "…" : "Generate"}
+      </button>
+      <button class="btn ghost" onclick={copyIocs} disabled={!iocOutput}>Copy</button>
+    </div>
+    {#if iocOutput}
+      <textarea
+        class="mono"
+        readonly
+        rows="10"
+        style="margin-top: 12px; width: 100%; resize: vertical"
+        >{iocOutput}</textarea
+      >
+    {/if}
+  </section>
 
   <!-- GitHub account -->
   <section class="card">

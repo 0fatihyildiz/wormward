@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use wormward_core::{Finding, FindingKind, OnlineVerdict};
 
 #[derive(Debug, Clone)]
@@ -86,6 +86,59 @@ impl OsmClient {
     }
 }
 
+/// Result of a pre-install package check.
+#[derive(Debug, Clone, Serialize)]
+pub struct PackageCheck {
+    pub name: String,
+    pub version: String,
+    pub malicious: bool,
+    pub reason: String,
+}
+
+/// Pre-install delivery-vector check: fetch an npm package's metadata + entry file from the registry
+/// / a per-file CDN (no install, no code execution) and run the FP-safe dropper verdict. Shared by
+/// the CLI (`check-package`) and the desktop GUI so they never drift.
+pub fn check_npm_package(name: &str) -> Result<PackageCheck, OsmError> {
+    check_npm_package_at(name, "https://registry.npmjs.org", "https://unpkg.com")
+}
+
+/// Like [`check_npm_package`] but with explicit registry / per-file-CDN base URLs (for testing).
+pub fn check_npm_package_at(name: &str, registry: &str, cdn: &str) -> Result<PackageCheck, OsmError> {
+    // `name` or `name@version`; a scoped name keeps its leading `@`.
+    let (pkg, ver) = match name.rfind('@') {
+        Some(i) if i > 0 => (&name[..i], &name[i + 1..]),
+        _ => (name, "latest"),
+    };
+    let meta_url = format!("{registry}/{pkg}/{ver}");
+    let body = ureq::get(&meta_url)
+        .timeout(std::time::Duration::from_secs(20))
+        .call()
+        .map_err(|e| OsmError::Network(e.to_string()))?
+        .into_string()
+        .map_err(|e| OsmError::Decode(e.to_string()))?;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let version = v.get("version").and_then(|x| x.as_str()).unwrap_or(ver).to_string();
+    let main = v.get("main").and_then(|x| x.as_str()).unwrap_or("index.js");
+    // Fetch just the entry file (no tarball extraction). A 404 → treat as no entry (metadata-only).
+    let entry_url = format!("{cdn}/{pkg}@{version}/{main}");
+    let entry = ureq::get(&entry_url)
+        .timeout(std::time::Duration::from_secs(20))
+        .call()
+        .ok()
+        .and_then(|r| r.into_string().ok());
+    let malicious = wormward_core::package_dropper_verdict(&body, entry.as_deref());
+    Ok(PackageCheck {
+        name: pkg.to_string(),
+        version,
+        malicious,
+        reason: if malicious {
+            "dropper behaviour detected pre-install".into()
+        } else {
+            "no dropper behaviour observed".into()
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +151,37 @@ mod tests {
             ecosystem: eco.map(|s| s.into()),
             version: None,
         }
+    }
+
+    #[test]
+    fn check_npm_package_flags_dropper_and_spares_clean() {
+        let reg = MockServer::start();
+        let cdn = MockServer::start();
+        // Malicious: entry file carries the injected-payload structure.
+        reg.mock(|when, then| {
+            when.method(GET).path("/evil/latest");
+            then.status(200).json_body(serde_json::json!({"version":"1.0.0","main":"index.js"}));
+        });
+        cdn.mock(|when, then| {
+            when.method(GET).path("/evil@1.0.0/index.js");
+            then.status(200).body("var _$_1e42=(function(a){return eval(a)})('x');");
+        });
+        let r = check_npm_package_at("evil", &reg.base_url(), &cdn.base_url()).unwrap();
+        assert!(r.malicious, "dropper entry must be flagged");
+        // Clean: benign entry, benign scripts.
+        reg.mock(|when, then| {
+            when.method(GET).path("/good/latest");
+            then.status(200).json_body(
+                serde_json::json!({"version":"2.0.0","main":"index.js","scripts":{"build":"tsc"}}),
+            );
+        });
+        cdn.mock(|when, then| {
+            when.method(GET).path("/good@2.0.0/index.js");
+            then.status(200).body("module.exports = function(){ return 1; };");
+        });
+        let r2 = check_npm_package_at("good", &reg.base_url(), &cdn.base_url()).unwrap();
+        assert!(!r2.malicious, "clean package must not be flagged");
+        assert_eq!(r2.version, "2.0.0");
     }
 
     #[test]

@@ -135,3 +135,11 @@ export interface DoctorReport {
   /** Distinct cache dirs holding tainted files — the deletable units. */
   cache_dirs: string[];
 }
+
+/** Result of a pre-install package check (`check_package`). */
+export interface PackageCheck {
+  name: string;
+  version: string;
+  malicious: boolean;
+  reason: string;
+}
