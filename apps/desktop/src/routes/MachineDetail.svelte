@@ -107,10 +107,10 @@
   {#if !machineSupported}
     <div class="state">
       <span class="glyph">◎</span>
-      <h2>Machine check is macOS-only for now</h2>
+      <h2>Machine check isn't available on this platform yet</h2>
       <p class="muted micro">
         Wormward's machine check — running threats, infected toolchain caches, and re-infection
-        triggers — is built for macOS. Your code is still scanned normally from Home.
+        triggers — runs on macOS and Windows. Your code is still scanned normally from Home.
       </p>
     </div>
   {:else if !report && !running}

@@ -148,8 +148,9 @@ fn snippet(cmd: &str) -> String {
     }
 }
 
-/// Enumerate running processes as `(pid, full command line)` via `ps`. Returns empty on a
-/// platform without `ps` (e.g. Windows) or on error, so the caller degrades gracefully.
+/// Enumerate running processes as `(pid, full command line)`. Uses `ps` on Unix; returns empty on
+/// error so the caller degrades gracefully.
+#[cfg(not(target_os = "windows"))]
 pub fn list_processes() -> Vec<(u32, String)> {
     let out = match std::process::Command::new("ps").args(["-Awwo", "pid=,command="]).output() {
         Ok(o) if o.status.success() => o.stdout,
@@ -159,6 +160,28 @@ pub fn list_processes() -> Vec<(u32, String)> {
         .lines()
         .filter_map(|line| {
             let (pid, cmd) = line.trim_start().split_once(' ')?;
+            Some((pid.trim().parse().ok()?, cmd.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Windows: a PowerShell CIM query yields the pid + FULL command line (tab-separated) — which
+/// `tasklist` alone cannot. Returns empty if PowerShell is unavailable or errors.
+#[cfg(target_os = "windows")]
+pub fn list_processes() -> Vec<(u32, String)> {
+    let script =
+        "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }";
+    let out = match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| {
+            let (pid, cmd) = line.split_once('\t')?;
             Some((pid.trim().parse().ok()?, cmd.trim().to_string()))
         })
         .collect()
@@ -177,7 +200,11 @@ pub fn scan_contents(files: &[(PathBuf, String)]) -> Vec<CacheHit> {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    // Windows uses USERPROFILE; macOS/Linux use HOME.
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 /// Candidate toolchain dirs that hold worm-EXECUTED artifacts: the npx exec cache (where `npx`
@@ -200,9 +227,29 @@ pub fn candidate_cache_dirs(home: &Path) -> Vec<PathBuf> {
 }
 
 /// Toolchain dirs (present ones only) that may hold worm-executed artifacts — machine-level state
-/// the repo scan does not cover.
+/// the repo scan does not cover. macOS/Linux resolve from `$HOME`; Windows from the standard
+/// `%APPDATA%`/`%LOCALAPPDATA%` toolchain locations.
+#[cfg(not(target_os = "windows"))]
 pub fn cache_targets() -> Vec<PathBuf> {
     candidate_cache_dirs(&home_dir()).into_iter().filter(|p| p.is_dir()).collect()
+}
+
+#[cfg(target_os = "windows")]
+pub fn cache_targets() -> Vec<PathBuf> {
+    let home = home_dir();
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let mut dirs = vec![home.join(".node-gyp")];
+    if let Some(a) = &appdata {
+        dirs.push(a.join("npm-cache").join("_npx")); // older npm cache location
+        dirs.push(a.join("npm").join("node_modules")); // global `npm i -g` install tree
+    }
+    if let Some(l) = &local {
+        dirs.push(l.join("npm-cache").join("_npx")); // newer npm cache location
+        dirs.push(l.join("Microsoft").join("TypeScript")); // TypeScript ATA cache
+        dirs.push(l.join("pnpm").join("global")); // pnpm global installs
+    }
+    dirs.into_iter().filter(|p| p.is_dir()).collect()
 }
 
 /// Inert package-manager metadata that must never be content-scanned (lockfiles + pnpm store
