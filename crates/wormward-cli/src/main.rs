@@ -1067,10 +1067,15 @@ fn main() -> ExitCode {
                 println!("  would install ~/.git-hooks/pre-commit and print the command to enable it");
             }
 
-            println!("\n== /etc/hosts C2 sinkhole (apply yourself with sudo) ==");
+            let hosts = doctor::hosts_file_path();
+            println!("\n== {hosts} C2 sinkhole (apply yourself, elevated) ==");
             print!("{}", doctor::hosts_sinkhole_block(&doctor::sinkhole_domains()));
-            println!("  Apply: append the block above to /etc/hosts (needs sudo), then flush DNS:");
-            println!("      sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder");
+            println!("  Apply: append the block above to {hosts} (needs admin/sudo), then flush DNS:");
+            if cfg!(target_os = "windows") {
+                println!("      ipconfig /flushdns");
+            } else {
+                println!("      sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder");
+            }
             if !apply {
                 println!("\n(dry-run — re-run `wormward harden --apply` to make the safe local changes)");
             }
