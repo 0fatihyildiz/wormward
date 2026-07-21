@@ -405,9 +405,13 @@ pub fn padding_injection(content: &str) -> bool {
 
 /// One line's test: a ≥200-long space/tab run that has a non-whitespace char somewhere before it
 /// AND a non-whitespace char somewhere after it, on the same physical line. Requiring content on
-/// BOTH sides is what makes it FP-safe: pure indentation (leading run) and a trailing alignment
-/// pad (no content after) do not qualify — only a run wedged BETWEEN two pieces of content, which
-/// is the injection's `code<pad>payload` shape.
+/// BOTH sides rules out pure indentation and trailing alignment pads.
+///
+/// The one legitimate source of a `content<big pad>content` line is a WIDE MARKDOWN TABLE: a short
+/// cell padded to align the next `|` column delimiter (`| cell<600 spaces>|`). Those are excluded
+/// by ignoring a run whose closing byte is `|` — the injection's payload is obfuscated code
+/// (`global.x=…;var _$_hex=eval(…)`), never a table column delimiter, so this keeps the real
+/// `code<pad>payload` shape while dropping the doc-table false positives.
 fn line_has_padding_run(line: &str) -> bool {
     let mut run = 0usize;
     let mut content_before_run = false;
@@ -415,9 +419,10 @@ fn line_has_padding_run(line: &str) -> bool {
         if b == b' ' || b == b'\t' {
             run += 1;
         } else {
-            // A non-whitespace byte: if we just closed a ≥200 run that had content before it,
-            // this byte is the content AFTER the run — the injection shape is complete.
-            if run >= 200 && content_before_run {
+            // A non-whitespace byte closes the run: if it followed a ≥200 run with content before
+            // it, it is the content AFTER the pad — the injection shape is complete. A `|` there is
+            // a markdown table column boundary (aligned cell), not an obfuscated payload; skip it.
+            if run >= 200 && content_before_run && b != b'|' {
                 return true;
             }
             run = 0;
@@ -847,6 +852,24 @@ mod tests {
         // @rive-app WASM glue: one long base64 token (no interior space run + trailing code).
         let wasm = format!("var w='{}';export default w;", "AGFzbQEAAAABpMDyAL".repeat(400));
         assert!(!score(&wasm, Surface::ConfigFile).padding_injection);
+    }
+
+    #[test]
+    fn padding_injection_fp_safe_on_padded_markdown_table() {
+        // A wide markdown table aligns short cells with a long space pad, then closes the column
+        // with `|`. That is `content<200+ pad>|` — the same both-sides shape as an injection, but
+        // the byte after the pad is a table delimiter, not an obfuscated payload. Must NOT fire.
+        let pad = " ".repeat(600);
+        let table =
+            format!("| Option{pad}| Effect |\n| **name**?: _string_{pad}| As described above. |\n");
+        assert!(!padding_injection(&table));
+        assert!(!score(&table, Surface::ConfigFile).padding_injection);
+        // The real injection — an obfuscated payload after the pad (not a `|`) — must still fire.
+        let inj = format!(
+            "export default {{}};{}global.o='5-3-168';var _$_3317=eval(x);",
+            " ".repeat(2000)
+        );
+        assert!(padding_injection(&inj));
     }
 
     #[test]
