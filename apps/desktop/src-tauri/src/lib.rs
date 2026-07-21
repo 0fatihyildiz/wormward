@@ -196,6 +196,7 @@ async fn scan(
                             remediable: false,
                             online: None,
                             git_ref: None,
+                            excerpt: None,
                         });
                     }
                 }
