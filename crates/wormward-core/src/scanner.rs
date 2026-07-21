@@ -739,9 +739,15 @@ fn scan_repo_inner(repo: &Path, packs: &[Pack], cancel: &AtomicBool) -> Vec<Find
     let mut findings = scan_tree_inner(repo, &working, packs, cancel);
     // .git/hooks is a working-tree-only surface (absent from a GitTree / ApiTree).
     findings.extend(scan_git_hooks(repo));
-    // Installed dependencies (node_modules) are pruned from the general walk; scan them targeted.
+    // Installed dependencies (node_modules) are pruned from the general walk; scan them targeted —
+    // now including pnpm's `.pnpm` virtual store (transitive deps) and the bun install cache.
     if !cancel.load(Ordering::Relaxed) {
         findings.extend(scan_node_modules(repo, packs));
+    }
+    // Build-output dirs (.output/.next/dist/build) are excluded from the general walk; scan them with
+    // the STRICT hidden-payload fingerprint so a dropper hidden in a server bundle is still caught.
+    if !cancel.load(Ordering::Relaxed) {
+        findings.extend(scan_build_output(repo, packs));
     }
     // Delivery-vector: dependency-name typosquats corroborated by installed-package dropper
     // behaviour (working-tree only — needs package.json/lockfiles + node_modules on disk).
@@ -926,6 +932,67 @@ pub fn deep_scan_repo_cancellable(
 
 /// Cap on installed packages scanned, so a giant `node_modules` can't stall the scan.
 const MAX_NODE_MODULES_PKGS: usize = 5_000;
+const MAX_BUILD_OUTPUT_FILES: usize = 20_000;
+
+/// Scan BUILD-OUTPUT dirs (`.output`, `.next`, `dist`, `build`) for a hidden payload — e.g. a dropper
+/// written into `.output/server/*.mjs`, which EXECUTES on the server. These dirs are excluded from
+/// the general walk (full of legit minified/generated code that false-positives the structural
+/// detectors), so this uses the STRICT [`CampaignAnalyzer::hidden_payload`] fingerprint (a decoder /
+/// version-tag marker only), which is FP-clean on generated code.
+fn scan_build_output(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
+    const BUILD_DIRS: &[&str] = &[".output", ".next", "dist", "build"];
+    const EXTS: &[&str] = &["js", "mjs", "cjs"];
+    let mut findings = Vec::new();
+    let mut count = 0usize;
+    for bd in BUILD_DIRS {
+        let mut stack = vec![repo.join(bd)];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+                if !EXTS.contains(&ext) {
+                    continue;
+                }
+                if count >= MAX_BUILD_OUTPUT_FILES {
+                    return findings;
+                }
+                let Ok(content) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
+                if content.len() > MAX_CONTENT_BYTES || looks_binary(&content) {
+                    continue;
+                }
+                count += 1;
+                for pack in packs {
+                    let Some(analyzer) = &pack.analyzer else { continue };
+                    if let Some(reason) = analyzer.hidden_payload(&content) {
+                        let rel = p.strip_prefix(repo).unwrap_or(&p).to_path_buf();
+                        findings.push(Finding {
+                            campaign: analyzer.id().to_string(),
+                            severity: Severity::Critical,
+                            repo: repo.to_path_buf(),
+                            file: Some(rel),
+                            signature_id: "hidden-payload:build-output".into(),
+                            kind: FindingKind::Analyzer,
+                            evidence: reason,
+                            remediable: false,
+                            online: None,
+                            git_ref: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    findings
+}
 
 /// Scan installed dependencies under `node_modules/` for malicious packages (name+version vs
 /// `bad_packages`) and for an injected payload in each package's entrypoint (via the analyzer). The
@@ -933,31 +1000,70 @@ const MAX_NODE_MODULES_PKGS: usize = 5_000;
 /// package's `package.json` + entrypoint, so a dropper shipped *inside a dependency* is still
 /// caught. Working-tree only — git trees have no `node_modules`. Findings are advisory
 /// (non-remediable): the fix is to reinstall the dependency clean, not to strip an installed file.
-pub fn scan_node_modules(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
-    let root = repo.join("node_modules");
-    if !root.is_dir() {
-        return Vec::new();
-    }
-    // Top-level packages plus one level of @scope.
-    let mut pkg_dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&root) {
-        for e in entries.flatten() {
-            let p = e.path();
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.starts_with('.') || !p.is_dir() {
-                continue;
+/// Package dirs directly under a `node_modules`-like root: top-level names plus one level of
+/// `@scope`. Skips dot-dirs (`.bin`, `.pnpm` — handled separately) and non-dirs.
+fn direct_package_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || !p.is_dir() {
+            continue;
+        }
+        if name.starts_with('@') {
+            if let Ok(scoped) = std::fs::read_dir(&p) {
+                out.extend(scoped.flatten().map(|s| s.path()).filter(|s| s.is_dir()));
             }
-            if name.starts_with('@') {
-                if let Ok(scoped) = std::fs::read_dir(&p) {
-                    pkg_dirs.extend(scoped.flatten().map(|s| s.path()).filter(|s| s.is_dir()));
-                }
-            } else {
-                pkg_dirs.push(p);
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Package dirs that live in normally-EXCLUDED cache layouts a direct `node_modules` walk misses:
+/// pnpm's `node_modules/.pnpm/<pkg>@ver/node_modules/<pkg>` (where TRANSITIVE deps actually live)
+/// and bun's `.bun/install/cache/<pkg>@ver@@@N`. Scanning these closes the "malware hides in the
+/// cache / a transitive dep" gap — they carry a real `package.json` + entrypoint, so the same
+/// precise entrypoint-analyzer pass covers them without the structural-FP flood.
+fn cache_package_dirs(repo: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    // pnpm virtual store: each `<pkg>@ver` dir holds the package under its own `node_modules/`.
+    let pnpm = repo.join("node_modules").join(".pnpm");
+    if let Ok(entries) = std::fs::read_dir(&pnpm) {
+        for e in entries.flatten() {
+            let nm = e.path().join("node_modules");
+            if nm.is_dir() {
+                out.extend(direct_package_dirs(&nm));
             }
         }
     }
+    // bun global-ish install cache at the repo root: `<pkg>@ver@@@N` (+ `@scope/…`) package dirs.
+    out.extend(direct_package_dirs(&repo.join(".bun").join("install").join("cache")));
+    out
+}
+
+pub fn scan_node_modules(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
+    let root = repo.join("node_modules");
+    let bun_cache = repo.join(".bun").join("install").join("cache");
+    if !root.is_dir() && !bun_cache.is_dir() {
+        return Vec::new();
+    }
+    // Directly-installed packages + the cache/virtual-store packages (pnpm `.pnpm`, bun cache) that
+    // a top-level walk skips. Dedup by canonical path so a pnpm top-level symlink and its `.pnpm`
+    // target are scanned once.
+    let mut pkg_dirs: Vec<PathBuf> = direct_package_dirs(&root);
+    pkg_dirs.extend(cache_package_dirs(repo));
+    let mut seen_canon: HashSet<PathBuf> = HashSet::new();
+    pkg_dirs.retain(|d| {
+        let canon = std::fs::canonicalize(d).unwrap_or_else(|_| d.clone());
+        seen_canon.insert(canon)
+    });
     let total = pkg_dirs.len();
     let mut findings = Vec::new();
     for dir in pkg_dirs.into_iter().take(MAX_NODE_MODULES_PKGS) {

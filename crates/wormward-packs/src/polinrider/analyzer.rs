@@ -152,6 +152,21 @@ impl CampaignAnalyzer for PolinriderAnalyzer {
         "polinrider"
     }
 
+    /// STRICT fingerprint for scanning generated / cached code (build output, pnpm/bun caches). Only
+    /// the `_$_hex`/`MDy` DECODER qualifies — a base64-impossible identifier that never occurs in
+    /// legit code (verified 0 hits across an 832-file legit-bundle corpus), gated by the JS-code veto.
+    /// The version-tag MARKER is deliberately EXCLUDED here: legit UMD libraries assign to
+    /// `global.X = require(...)` (e.g. `chai`), which the marker matches — fine on a real source
+    /// surface (there it needs a co-occurring decoder), but a false positive when every file is
+    /// generated code. The padding / entropy / appended-blob heuristics are excluded for the same
+    /// reason (a probe FP'd on `prettier`'s generated Flow parser via a padding run).
+    fn hidden_payload(&self, content: &str) -> Option<String> {
+        if has_js_code_token(content) && decoder_re().is_match(content) {
+            return Some("polinrider decoder fingerprint in generated or cached code".into());
+        }
+        None
+    }
+
     fn analyze(&self, file: &ScannedFile) -> Vec<Finding> {
         match Self::confirm(&file.content) {
             Some(reason) => vec![Finding {
@@ -291,6 +306,24 @@ mod tests {
     #[test]
     fn no_finding_when_only_marker() {
         assert!(PolinriderAnalyzer.analyze(&scanned("global['!']='8-270-2';")).is_empty());
+    }
+
+    #[test]
+    fn hidden_payload_strict_is_decoder_only_and_fp_safe() {
+        let a = PolinriderAnalyzer;
+        // Fires on the decoder fingerprint (with a code token).
+        assert!(a.hidden_payload("var _$_1e42=(function(a){return eval(a)})('x');").is_some());
+        // Does NOT fire on a legit UMD global export (the real `chai` FP class).
+        assert!(a
+            .hidden_payload("global.should = require('./should');\nmodule.exports = chai;")
+            .is_none());
+        // Does NOT fire on padding-alone — legit generated code (prettier's Flow parser) has padding.
+        let pad = " ".repeat(2000);
+        assert!(a
+            .hidden_payload(&format!("export default {{}};{pad}function f(){{return eval(x)}}"))
+            .is_none());
+        // Clean generated code is silent.
+        assert!(a.hidden_payload("module.exports = function(){ return 1; };").is_none());
     }
 
     #[test]

@@ -94,6 +94,16 @@ pub struct ScannedFile {
 pub trait CampaignAnalyzer: Send + Sync {
     fn id(&self) -> &str;
     fn analyze(&self, file: &ScannedFile) -> Vec<Finding>;
+    /// A STRICT payload fingerprint for scanning normally-EXCLUDED / generated code — build output
+    /// (`.output`/`.next`/`dist`/`build`) and package caches (pnpm `.pnpm/`, `.bun/install/cache/`).
+    /// Those locations are full of legit minified/generated code that trips the structural detectors
+    /// (the whole-machine probe proved 452/832 legit bundles fire the capability gate), so this must
+    /// fire ONLY on tells that never occur in legit code — a decoder DEFINITION or a version-tag
+    /// marker — never on structural heuristics (padding / entropy) that legit bundles trip. Returns a
+    /// reason on a hit, or `None`. Default: never fires.
+    fn hidden_payload(&self, _content: &str) -> Option<String> {
+        None
+    }
 }
 
 pub struct Pack {

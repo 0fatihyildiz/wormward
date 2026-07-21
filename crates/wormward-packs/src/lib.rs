@@ -868,6 +868,66 @@ mod tests {
     }
 
     #[test]
+    fn hidden_payload_in_build_output_is_detected() {
+        // A dropper written into a Nuxt/Nitro server bundle (`.output/server/*.mjs`) EXECUTES on the
+        // server. `.output` is excluded from the general walk, so the strict hidden-payload pass must
+        // still catch it.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("app");
+        fs::create_dir_all(repo.join(".output/server")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join(".output/server/index.mjs"),
+            "export default {};\nvar _$_1e42=(function(a){return eval(atob(a))})('x');",
+        )
+        .unwrap();
+        let f = scan_repo(&repo, &builtin_packs());
+        assert!(
+            f.iter().any(|x| x.signature_id == "hidden-payload:build-output"
+                && x.campaign == "polinrider"),
+            "hidden payload in build output must be detected: {f:?}"
+        );
+    }
+
+    #[test]
+    fn legit_build_output_not_flagged() {
+        // A legit generated server bundle (UMD global export, regex .exec, no decoder) must stay silent.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("app");
+        fs::create_dir_all(repo.join(".output/server")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join(".output/server/index.mjs"),
+            "global.should = require('chai');\nfunction re(s){ return /x/.exec(s); }\nmodule.exports = app;",
+        )
+        .unwrap();
+        assert!(scan_repo(&repo, &builtin_packs()).is_empty(), "legit build output must not flag");
+    }
+
+    #[test]
+    fn transitive_pnpm_dep_payload_is_detected() {
+        // A malicious TRANSITIVE dependency lives only in pnpm's virtual store
+        // (node_modules/.pnpm/<pkg>@ver/node_modules/<pkg>), which a top-level walk misses.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("app");
+        let pkg = repo.join("node_modules/.pnpm/evil@1.0.0/node_modules/evil");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(pkg.join("package.json"), r#"{"name":"evil","version":"1.0.0","main":"index.js"}"#)
+            .unwrap();
+        fs::write(
+            pkg.join("index.js"),
+            "export default {};\nglobal.o='5-3-235-du';var _$_1e42=(function(a,b){return a})('x',7);",
+        )
+        .unwrap();
+        let f = scan_repo(&repo, &builtin_packs());
+        assert!(
+            f.iter().any(|x| x.kind == FindingKind::Analyzer && x.campaign == "polinrider"),
+            "transitive pnpm dep payload must be detected: {f:?}"
+        );
+    }
+
+    #[test]
     fn deep_scan_detects_wave3_on_non_default_branch() {
         // The re-infection lived on non-default branches too, so --deep must cover every branch tip.
         use std::path::Path;
