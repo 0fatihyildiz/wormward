@@ -595,39 +595,24 @@ pub fn scan_dependency_typosquats(
             continue;
         };
         let pkg_dir = repo.join("node_modules").join(&name);
-        let malicious = pkg_dir.is_dir() && package_dropper_behavior(&pkg_dir);
-        let (severity, signature_id, evidence) = if malicious {
-            // Corroborated (either name-signal kind) → visible Medium.
-            (
-                Severity::Medium,
-                format!("typosquat:{name}"),
-                format!(
-                    "dependency '{name}' is a likely typosquat of '{}' AND the installed package shows dropper behaviour",
-                    hit.of
-                ),
-            )
-        } else if hit.kind == crate::typosquat::TyposquatKind::Misspelling {
-            // A one-edit misspelling of a popular name is a strong-enough NAME signal to surface as
-            // a suppressed community lead even without behavioural corroboration.
-            (
-                Severity::Low,
-                format!("pkg-community:typosquat:{name}"),
-                format!("dependency '{name}' name-resembles '{}' (community lead — no dropper behaviour observed)", hit.of),
-            )
-        } else {
-            // A DECORATION with no dropper behaviour is too weak to report at all — the legit
-            // ecosystem is full of `<root>-<word>` names, so a name-only decoration lead would be a
-            // false positive. Corroboration (the Medium branch) is the only way it surfaces.
+        // A typosquat NAME is only ever reported WITH dropper-behaviour corroboration. A name-only
+        // lead (either a misspelling like `gaxios`/`preact` or a decoration) is too FP-prone — the
+        // legit ecosystem is full of one-edit neighbours and `<root>-<word>` plugins — so we never
+        // emit it. The pre-install `check-package` command covers the not-installed case explicitly.
+        if !(pkg_dir.is_dir() && package_dropper_behavior(&pkg_dir)) {
             continue;
-        };
+        }
         findings.push(Finding {
             campaign: "polinrider".into(),
-            severity,
+            severity: Severity::Medium,
             repo: repo.to_path_buf(),
             file: Some(PathBuf::from("package.json")),
-            signature_id,
+            signature_id: format!("typosquat:{name}"),
             kind: FindingKind::NpmPackage,
-            evidence,
+            evidence: format!(
+                "dependency '{name}' is a likely typosquat of '{}' AND the installed package shows dropper behaviour",
+                hit.of
+            ),
             remediable: false,
             online: None,
             git_ref: None,
@@ -764,11 +749,17 @@ fn scan_repo_inner(repo: &Path, packs: &[Pack], cancel: &AtomicBool) -> Vec<Find
         findings.extend(scan_dependency_typosquats(repo, &working, packs));
     }
 
-    if !cancel.load(Ordering::Relaxed) && !findings.is_empty() && reflog_has_amend(repo) {
-        // Attribute the reflog corroboration to a campaign (pack) finding when one
-        // exists; fall back to "generic" only if every finding is capability-only.
+    // Reflog-amend is PROPAGATION corroboration — it only makes sense alongside an actual infection
+    // (a Critical payload finding), never on its own and never on a weaker lead. Amended commits are
+    // ubiquitous in normal development, so gating on a Critical finding is what keeps this from
+    // false-positiving as "worm propagation" on a clean repo (e.g. one that merely has a Medium
+    // typosquat/name-resemblance or a Low community lead).
+    let has_critical = findings.iter().any(|f| f.severity == Severity::Critical);
+    if !cancel.load(Ordering::Relaxed) && has_critical && reflog_has_amend(repo) {
+        // Attribute the reflog corroboration to the campaign (pack) finding.
         let campaign = findings
             .iter()
+            .filter(|f| f.severity == Severity::Critical)
             .map(|f| f.campaign.as_str())
             .find(|c| *c != "generic")
             .unwrap_or("generic")
@@ -1424,20 +1415,67 @@ mod tests {
     }
 
     #[test]
-    fn misspelling_without_dropper_is_community_low() {
-        // A one-edit MISSPELLING of a popular name is a strong-enough name signal to surface as a
-        // suppressed community lead even without behaviour — but never a default-visible Medium.
+    fn name_only_typosquat_without_dropper_is_not_flagged() {
+        // FP-safety: a name-only typosquat (misspelling OR decoration), with no dropper behaviour,
+        // must produce NO finding — legit one-edit neighbours (`gaxios`→axios, `preact`→react) and
+        // legit `<root>-<word>` plugins abound. `gaxios` is a real Google package; it must not flag.
         let tmp = TempDir::new().unwrap();
         let repo = make_repo(&tmp);
-        // `tailwindcs` = `tailwindcss` minus one char (edit distance 1) -> Misspelling.
-        fs::write(repo.join("package.json"), r#"{"dependencies":{"tailwindcs":"1.0.0"}}"#).unwrap();
+        fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"tailwindcs":"1.0.0","gaxios":"6.0.0","tailwind-gridhelper":"1.0.0"}}"#,
+        )
+        .unwrap();
         let files = WorkingTree::new(&repo);
         let f = scan_dependency_typosquats(&repo, &files, &[]);
+        assert!(f.is_empty(), "uncorroborated name-only typosquats must not be flagged: {f:?}");
+    }
+
+    #[test]
+    fn reflog_amend_does_not_fire_on_non_critical_findings() {
+        // Regression for the `gaxios` cascade: a repo with only a non-Critical finding (here a
+        // Medium IOC-domain reference) plus amended commits in the reflog must NOT produce a
+        // `worm propagation` reflog finding — amended commits are ubiquitous in normal dev, so the
+        // reflog heuristic only corroborates an actual Critical infection.
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git")
+                .arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status()
+                .unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        // A Medium-only signal: a config referencing a pack IOC domain (IocDomain = Medium). The
+        // file is `postcss.config.mjs` so `literal_pack` (which targets it) runs the IOC check.
+        std::fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default { url: 'https://evil.example' };",
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "c1"]);
+        git(&repo, &["commit", "-q", "--amend", "-m", "c1-amended"]); // normal dev amend
+        let pack = {
+            let mut p = literal_pack();
+            p.manifest.ioc_domains = vec!["evil.example".into()];
+            p.manifest.content_signatures.clear(); // ensure the ONLY finding is the Medium IocDomain
+            p
+        };
+        let f = scan_repo(&repo, &[pack]);
         assert!(
-            f.iter().any(|x| x.signature_id == "pkg-community:typosquat:tailwindcs"),
-            "misspelling must surface as a community lead: {f:?}"
+            f.iter().any(|x| x.kind == FindingKind::IocDomain),
+            "the Medium IOC-domain finding should be present: {f:?}"
         );
-        assert!(!f.iter().any(|x| x.severity == Severity::Medium), "no behaviour -> not Medium");
+        assert!(
+            !f.iter().any(|x| x.kind == FindingKind::GitReflog),
+            "reflog-amend must NOT fire without a Critical finding: {f:?}"
+        );
     }
 
     #[test]
