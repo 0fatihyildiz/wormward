@@ -2,11 +2,11 @@
   import { onMount } from "svelte";
   import { app, fail, clearErrors, go, notify } from "../lib/state.svelte";
   import { device } from "../lib/platform";
-  import { scan, doctor, cancelScan, cleanPreview, cleanApply } from "../lib/api";
+  import { scan, doctor, cancelScan, cleanApply } from "../lib/api";
   import { listen } from "@tauri-apps/api/event";
   import GuidedProgress from "../lib/components/GuidedProgress.svelte";
   import FindingCard from "../lib/components/FindingCard.svelte";
-  import type { ScanProgress, Finding, RepoPlan } from "../lib/types";
+  import type { ScanProgress, Finding } from "../lib/types";
 
   const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
 
@@ -17,7 +17,6 @@
   let logEl = $state<HTMLDivElement | null>(null);
 
   // --- results / clean ---
-  let plans = $state<RepoPlan[]>([]);
   let removedSummary = $state("");
 
   // C5: the guided flow advances by mutating app.flow (not app.view), so App.svelte's
@@ -34,7 +33,8 @@
   // They're only reachable via Advanced → branch cleaning, so they must count toward
   // "manual" (need your review), not "removable" — otherwise the summary promises an
   // automatic removal the UI has no button for.
-  const removable = $derived(findings.filter((f) => f.remediable && !f.git_ref).length);
+  const removableFindings = $derived(findings.filter((f) => f.remediable && !f.git_ref));
+  const removable = $derived(removableFindings.length);
   const manual = $derived(total - removable);
 
   const SEV_RANK: Record<string, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
@@ -50,8 +50,10 @@
       (a, b) => rank(b[1][0].severity) - rank(a[1][0].severity) || b[1].length - a[1].length,
     );
   });
-  const applicable = $derived(plans.filter((p) => p.actions.length));
-  const fixableRepos = $derived(applicable.map((p) => p.repo));
+  // Repos with an auto-removable working-tree finding — exactly what "Remove threats safely"
+  // cleans. Derived from the scan's own findings so results show IMMEDIATELY with no second full
+  // re-scan (the old eager cleanPreview); cleanApply re-scans just these repos on click.
+  const fixableRepos = $derived([...new Set(removableFindings.map((f) => f.repo))]);
 
   async function runScan() {
     clearErrors();
@@ -60,7 +62,6 @@
     stopping = false;
     repoLog = [];
     progress = null;
-    plans = [];
     removedSummary = "";
     const unlisten = await listen<ScanProgress>("local-scan-progress", (e) => {
       const p = e.payload;
@@ -90,10 +91,10 @@
       app.machineReport = machine;
       app.report = repos;
       app.lastScanAt = Date.now();
-      // cleanPreview re-scans every repo (uncancellable). Skip it when code wasn't scanned, or the
-      // run was cancelled/partial — Stop/partial should land on results at once, and a one-click
-      // clean shouldn't be offered on partial or stale data.
-      plans = app.scanRepos && !repos?.cancelled ? await cleanPreview(app.dirs) : [];
+      // No eager cleanPreview here: it re-scanned every repo (uncancellable), so results only
+      // appeared after a full SECOND scan — the "done but still waiting" delay. The remediation
+      // plan is derived from these findings (fixableRepos) and applied lazily by cleanApply on
+      // click, so a completed OR stopped scan lands on results at once.
       app.flow = "results";
     } catch (e) {
       fail(e);
@@ -222,7 +223,7 @@
       {:else}
         <p class="flow-summary"><strong>{total} {plural(total, "threat", "threats")} found.</strong> {removable} can be removed safely and automatically; {manual} need your review.</p>
 
-        {#if applicable.length}
+        {#if fixableRepos.length}
           <div class="flow-actions">
             <button class="btn primary" onclick={removeThreats}>Remove threats safely</button>
           </div>
