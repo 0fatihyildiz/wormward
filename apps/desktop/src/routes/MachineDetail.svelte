@@ -2,6 +2,7 @@
   import { onDestroy } from "svelte";
   import { doctor, doctorClearCache, doctorHardenTriggers } from "../lib/api";
   import { app, fail, go } from "../lib/state.svelte";
+  import { device, machineSupported } from "../lib/platform";
   import { dialog } from "../lib/modal";
 
   const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
@@ -83,28 +84,39 @@
 <div class="page" aria-busy={running}>
   <button class="back" onclick={() => go("home")}>← Home</button>
   <div class="page-head">
-    <h1>This Mac</h1>
+    <h1>This {device}</h1>
     <p class="lede">
       Check this computer for malware that's running right now, infected app caches, and settings
       that let malware come back.
     </p>
   </div>
 
-  <div class="row">
-    <button class="btn primary" onclick={runCheck} disabled={running}>
-      {#if running}<span class="spinner"></span>Checking this Mac…{:else}{report ? "Check again" : "Run a check"}{/if}
-    </button>
-    <label class="switch">
-      <input type="checkbox" checked={watching} onchange={toggleWatch} />
-      <span class="track"></span>
-      <span class="lbl">Live monitoring <span class="muted">— re-checks every few seconds</span></span>
-    </label>
-  </div>
+  {#if machineSupported}
+    <div class="row">
+      <button class="btn primary" onclick={runCheck} disabled={running}>
+        {#if running}<span class="spinner"></span>Checking this {device}…{:else}{report ? "Check again" : "Run a check"}{/if}
+      </button>
+      <label class="switch">
+        <input type="checkbox" checked={watching} onchange={toggleWatch} />
+        <span class="track"></span>
+        <span class="lbl">Live monitoring <span class="muted">— re-checks every few seconds</span></span>
+      </label>
+    </div>
+  {/if}
 
-  {#if !report && !running}
+  {#if !machineSupported}
     <div class="state">
       <span class="glyph">◎</span>
-      <h2>This Mac hasn't been checked yet</h2>
+      <h2>Machine check is macOS-only for now</h2>
+      <p class="muted micro">
+        Wormward's machine check — running threats, infected toolchain caches, and re-infection
+        triggers — is built for macOS. Your code is still scanned normally from Home.
+      </p>
+    </div>
+  {:else if !report && !running}
+    <div class="state">
+      <span class="glyph">◎</span>
+      <h2>This {device} hasn't been checked yet</h2>
       <p class="muted micro">
         Run a check to look for malware running right now, infected app caches, and risky settings.
       </p>
@@ -112,7 +124,7 @@
   {:else if !report && running}
     <div class="state" role="status">
       <span class="spinner"></span>
-      <p>Checking this Mac…</p>
+      <p>Checking this {device}…</p>
     </div>
   {:else if report}
     <!-- Worst-first: an active threat is the most urgent thing to surface. A newly -->

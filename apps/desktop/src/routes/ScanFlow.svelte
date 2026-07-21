@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app, fail, clearErrors, go, notify } from "../lib/state.svelte";
+  import { device } from "../lib/platform";
   import { scan, doctor, cancelScan, cleanPreview, cleanApply } from "../lib/api";
   import { listen } from "@tauri-apps/api/event";
   import GuidedProgress from "../lib/components/GuidedProgress.svelte";
@@ -165,7 +166,11 @@
     <section class="flow-step scanning-step">
       <h1 class="flow-title" tabindex="-1" bind:this={stepHeadingEl}>Scanning…</h1>
       <GuidedProgress
-        label="Checking your Mac and your code…"
+        label={app.scanMac && app.scanRepos
+          ? `Checking your ${device} and your code…`
+          : app.scanMac
+            ? `Checking your ${device}…`
+            : "Checking your code…"}
         done={progress?.done ?? 0}
         total={progress?.total ?? 0}
         indeterminate={!progress}

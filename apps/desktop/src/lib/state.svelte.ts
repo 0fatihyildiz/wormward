@@ -1,6 +1,7 @@
 import type { ScanReport, DoctorReport } from "./types";
 import { humanizeError } from "./errors";
 import { loadLocations } from "./locations";
+import { machineSupported } from "./platform";
 
 // Re-exported so existing importers keep working; impl now lives in ./errors.
 export { humanizeError };
@@ -44,7 +45,8 @@ export const app = $state({
 
 // "dirs" ARE the protected locations (name kept for api.scan compatibility).
 app.dirs = loadLocations();
-app.scanMac = localStorage.getItem("scan_mac") !== "0"; // both surfaces on by default
+// The machine check is macOS-only; off (and unscannable) elsewhere. Repos are the cross-platform surface.
+app.scanMac = machineSupported && localStorage.getItem("scan_mac") !== "0";
 app.scanRepos = localStorage.getItem("scan_repos") !== "0";
 app.online = localStorage.getItem("online_scan") === "1";
 app.history = localStorage.getItem("scan_history") === "1";

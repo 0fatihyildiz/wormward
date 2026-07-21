@@ -1,9 +1,10 @@
 <script lang="ts">
   import { app, go, fail } from "../lib/state.svelte";
-  import { machineStatus, reposStatus, overallLevel } from "../lib/protection";
+  import { machineStatus, reposStatus, overallLevel, type SurfaceStatus } from "../lib/protection";
   import { saveLocations } from "../lib/locations";
   import { pickDirs } from "../lib/api";
   import { homeDir } from "@tauri-apps/api/path";
+  import { device, machineSupported } from "../lib/platform";
   import ShieldStatus from "../lib/components/ShieldStatus.svelte";
   import HealthChip from "../lib/components/HealthChip.svelte";
 
@@ -11,7 +12,12 @@
   // so an empty list is the honest "no locations saved yet" first-run signal (reactively).
   const firstRun = $derived(app.dirs.length === 0);
 
-  const machine = $derived(machineStatus(app.machineReport));
+  // The machine check is macOS-only; elsewhere show an honest "macOS only" instead of a false clean.
+  const machine = $derived(
+    machineSupported
+      ? machineStatus(app.machineReport)
+      : ({ level: "unknown", label: "macOS only" } as SurfaceStatus),
+  );
   const repos = $derived(reposStatus(app.report));
   const overall = $derived(overallLevel(machine, repos));
 
@@ -36,10 +42,11 @@
   // Spec Screen 2: once scanned, the sub line also carries the last-scan time.
   const lastScan = $derived(app.lastScanAt ? new Date(app.lastScanAt).toLocaleString() : null);
   const sub = $derived.by(() => {
-    if (!scanned) return "Run a Full Scan to check this Mac and your code.";
+    if (!scanned)
+      return `Run a Full Scan to check ${machineSupported ? `this ${device} and ` : ""}your code.`;
     switch (overall) {
       case "protected":
-        return `No threats on this Mac or in your code. · Last scan: ${lastScan}`;
+        return `No threats ${machineSupported ? `on this ${device} or ` : ""}in your code. · Last scan: ${lastScan}`;
       case "attention":
         return `Some things need a look. Open the details below to see what. · Last scan: ${lastScan}`;
       case "threat":
@@ -103,8 +110,8 @@
   <section class="hero">
     <h1 class="shield-heading">Protect your code from supply-chain worms</h1>
     <p class="shield-sub">
-      Wormward checks this Mac and the folders where you keep your projects for malware that
-      spreads through package updates. Choose your code folder to get started.
+      Wormward checks {machineSupported ? `this ${device} and ` : ""}the folders where you keep your
+      projects for malware that spreads through package updates. Choose your code folder to get started.
     </p>
     <div class="hero-actions">
       <button class="btn primary cta" onclick={chooseFolder} disabled={picking}>
@@ -120,11 +127,13 @@
     {#if noSurface}<p class="scan-opt-hint">Pick at least one thing to scan below.</p>{/if}
     <div class="scan-opts">
       <span class="scan-opts-title">What to scan</span>
-      <label class="switch">
-        <input type="checkbox" bind:checked={app.scanMac} onchange={() => persist("scan_mac", app.scanMac)} />
-        <span class="track"></span>
-        <span class="lbl">This Mac <span class="muted">— running threats, infected caches, risky settings</span></span>
-      </label>
+      {#if machineSupported}
+        <label class="switch">
+          <input type="checkbox" bind:checked={app.scanMac} onchange={() => persist("scan_mac", app.scanMac)} />
+          <span class="track"></span>
+          <span class="lbl">This {device} <span class="muted">— running threats, infected caches, risky settings</span></span>
+        </label>
+      {/if}
       <label class="switch">
         <input type="checkbox" bind:checked={app.scanRepos} onchange={() => persist("scan_repos", app.scanRepos)} />
         <span class="track"></span>
@@ -162,7 +171,7 @@
       <button class="linklike gh-link" onclick={() => go("advanced")}>Scan my GitHub account →</button>
     </div>
     <div class="chips-row">
-      <HealthChip label="This Mac" status={machine} onclick={() => go("machine")} />
+      <HealthChip label={`This ${device}`} status={machine} onclick={() => go("machine")} />
       <HealthChip label="Repositories" status={repos} onclick={() => go("repos")} />
     </div>
   </section>
