@@ -432,6 +432,62 @@ fn line_has_padding_run(line: &str) -> bool {
     false
 }
 
+/// Evasion-resistant generalization of the injection tells: an APPENDED OBFUSCATED BLOB — a final
+/// physical line that is a dramatic statistical OUTLIER in length versus the rest of the file AND is
+/// executable-obfuscated (an eval/Function/atob/charcode sink or a large inline string-array). This
+/// catches the variant a determined operator would ship to dodge the other tells: NO ≥200-space
+/// padding and a RENAMED (non-`_$_hex`) decoder — the payload is still a giant obfuscated statement
+/// grafted onto the end of an otherwise-normal file, which no renaming removes.
+///
+/// FP-safe by construction: it fires only when the file is otherwise NORMAL source (short median
+/// line length — a uniformly long/minified file has no outlier and is skipped, on top of being
+/// excluded), the last line is both absolutely long (≥400) and ≥4× the median, AND it carries an
+/// execution/obfuscation token. Legitimate code has no such grafted outlier line.
+/// A short, non-comment line that carries a code token — used to tell readable source apart from a
+/// minified bundle's license header (comments / over-long lines).
+fn is_readable_code_line(l: &str) -> bool {
+    let t = l.trim_start();
+    l.len() < 200
+        && !t.starts_with('*')
+        && !t.starts_with("//")
+        && !t.starts_with("/*")
+        && t.bytes().any(|b| matches!(b, b';' | b'{' | b'}' | b'(' | b'='))
+}
+
+fn appended_obfuscated_blob(content: &str) -> bool {
+    let lines: Vec<&str> = content.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+    if lines.len() < 4 {
+        return false;
+    }
+    let last = *lines.last().unwrap();
+    if last.len() < 400 {
+        return false;
+    }
+    // The head (everything before the blob) must look like READABLE SOURCE — several short, non-comment
+    // code lines. This is what separates an injection ("normal code, then a grafted blob") from a
+    // minified/production bundle (a short license header + one giant code line): a bundle has ~no such
+    // lines (comments or over-long), so it never fires. This was a real FP on `three.min.js`/`vue.prod.js`.
+    let head = &lines[..lines.len() - 1];
+    let readable: Vec<usize> =
+        head.iter().filter(|l| is_readable_code_line(l)).map(|l| l.len()).collect();
+    if readable.len() < 3 {
+        return false;
+    }
+    // The blob line must be a dramatic outlier vs the readable code lines.
+    let mut lens = readable.clone();
+    lens.sort_unstable();
+    let median = lens[lens.len() / 2].max(1);
+    if last.len() < median.saturating_mul(4) {
+        return false;
+    }
+    // And executable-obfuscated — name-independent tells only.
+    let exec_sink = ["eval(", "Function(", "atob(", "unescape(", "String.fromCharCode", "charCodeAt"]
+        .iter()
+        .any(|t| last.contains(t));
+    let string_array = last.matches("','").count() >= 6 || last.matches("\",\"").count() >= 6;
+    exec_sink || (string_array && last.contains('('))
+}
+
 /// Version-independent injected-payload structural tells for a REPO-WIDE scan — any text file, not
 /// only a recognized auto-run surface. The PolinRider family appends its payload to the last line of
 /// whatever file it infects: not just recognized configs but arbitrary executable source
@@ -442,7 +498,7 @@ fn line_has_padding_run(line: &str) -> bool {
 /// (it has `$`) and is not a legitimate identifier convention. The caller excludes minified /
 /// build-output / vendored files, so this only adds coverage of the family's non-config hosts.
 pub fn injected_payload(content: &str) -> bool {
-    padding_injection(content) || decoder_re().is_match(content)
+    padding_injection(content) || decoder_re().is_match(content) || appended_obfuscated_blob(content)
 }
 
 /// The double-base64 exfil-staging blob shape: content begins `eyJ` (base64 of
@@ -897,6 +953,59 @@ mod tests {
         let pad = " ".repeat(2000);
         let cfg = format!("export default {{}};{pad}global.o='5-3-168-du';var _$_3317=eval(x);");
         assert!(gate(Surface::ConfigFile, &score(&cfg, Surface::ConfigFile)));
+    }
+
+    // --- Evasion resistance: appended obfuscated blob (no padding, renamed decoder) ---
+    #[test]
+    fn appended_blob_caught_without_padding_or_hex_decoder() {
+        // The evasion variant: NO ≥200-space padding, decoder RENAMED off `_$_hex`. The payload is
+        // still a giant obfuscated statement grafted onto the last line of a normal file.
+        let blob = format!(
+            "var q9zK=(function(a,b){{return eval(atob(a))}})('{}',31337);q9zK();",
+            "A".repeat(500)
+        );
+        let file = format!("import x from 'y';\nconst app = make();\nmodule.exports = app;\n{blob}");
+        assert!(appended_obfuscated_blob(&file), "renamed-decoder, padding-less blob must be caught");
+        assert!(injected_payload(&file), "injected_payload must subsume the appended-blob signal");
+        // same-line append (no newline before the blob) also trips
+        let same = format!("import a from 'a';\nconst cfg = {{}};\nsetup();\nmodule.exports=cfg;{blob}");
+        assert!(appended_obfuscated_blob(&same));
+    }
+
+    #[test]
+    fn appended_blob_string_array_variant() {
+        // A string-array obfuscator tail (no eval literal, no `_$_`) on the last line still trips.
+        let arr = vec!["'zx'"; 120].join(",");
+        let file = format!("import a from 'x';\nexport default {{}};\nfunction real(){{ return 1; }}\nvar _a=[{arr}];_a.forEach(x=>run(x));");
+        assert!(appended_obfuscated_blob(&file), "string-array tail must be caught");
+    }
+
+    #[test]
+    fn appended_blob_fp_safe_on_normal_and_minified() {
+        // Normal multi-line source: no giant outlier last line.
+        let normal = "import express from 'express';\nconst app = express();\napp.get('/', (r,s)=>s.send('ok'));\nmodule.exports = app;\n";
+        assert!(!appended_obfuscated_blob(normal));
+        // Minified/uniform-long file: high median, no outlier -> skipped.
+        let min_line = "var a=1;function f(){return a};".repeat(30); // ~900 chars
+        let minified = format!("{min_line}\n{min_line}\n{min_line}\nmodule.exports={{}};");
+        assert!(!appended_obfuscated_blob(&minified));
+        // A legit long LAST line that is NOT executable-obfuscated (e.g. a long data/URL string).
+        let data_tail = format!("const cfg = {{}};\nexport default cfg;\nconst DOCS = '{}';", "https://example.com/very/long/path/".repeat(20));
+        assert!(!appended_obfuscated_blob(&data_tail), "a long non-executable data line must not fire");
+        // Outlier present but under 4x median -> not fired.
+        let modest = format!("{}\n{}\n{}eval(x)", "x".repeat(150), "y".repeat(150), "z".repeat(300));
+        assert!(!appended_obfuscated_blob(&modest));
+        // Real-world FP that this guard fixed: a minified bundle = a LICENSE header + one giant code
+        // line carrying eval/string-arrays (the `three.min.js`/`vue.prod.js` shape). The head is all
+        // comment lines, so there is no readable-source structure -> must not fire.
+        let arr = vec!["'zx'"; 200].join(",");
+        let minbundle = format!(
+            "/*!\n * @license MIT\n * Copyright (c) 2024\n * https://example.com\n */\nvar t=[{arr}];function f(a){{return eval(a)}}f(t.join(''));"
+        );
+        assert!(
+            !appended_obfuscated_blob(&minbundle),
+            "a minified license-header bundle must not fire (real FP class)"
+        );
     }
 
     // --- gate matrix (Task 6) ---

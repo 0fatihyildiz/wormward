@@ -255,7 +255,23 @@ discriminator.**
 - Names a pack already tracks are skipped (the version-aware lockfile/node_modules checks own them),
   so the pass is purely additive and never overrides a version pin.
 
-The FP-safety was proven by **auditing the matcher against 3,366 real npm package names** pulled from
+### Evasion resistance — appended-obfuscated-blob detector (`capability.rs` `appended_obfuscated_blob`)
+
+The structural tells above (padding run, `_$_hex` decoder) are version-independent but still key on
+*this family's current shape*. A determined operator could drop the ≥200-space padding and rename the
+decoder off `_$_hex`. `appended_obfuscated_blob` closes that path name-independently: it fires on a
+final physical line that is a dramatic length OUTLIER (≥400 chars and ≥4× the median readable-code
+line) carrying an execution/obfuscation token (eval/Function/atob/charcode or a large inline
+string-array) — i.e. a giant obfuscated statement grafted onto an otherwise-normal file. It is folded
+into `injected_payload`, so the repo-wide pass, the package behavioural check, and the analyzer all
+gain it. FP-safety comes from requiring the HEAD to be readable source (≥3 short, non-comment code
+lines) — a minified/production bundle is a license header + one giant line, so it has no such
+structure and never fires. This was validated against real packages: an initial version false-flagged
+`three.min.js`/`vue.prod.js`; the readable-head guard fixed it, and the fix is locked by
+`appended_blob_fp_safe_on_normal_and_minified` (0 FP across 24 real popular packages — minified,
+production, and obfuscated).
+
+The delivery-vector FP-safety was proven by **auditing the matcher against 3,366 real npm package names** pulled from
 the live registry across the exact worst-case ecosystems (`react`, `tailwind`, `chalk`, `eslint`,
 `vue`, …). This caught a real FP class — `react`/`next`/`vite`/`eslint` have huge legit `<root>-<word>`
 plugin ecosystems (`react-icons`, `lucide-react`, …) — which was fixed by removing those roots as
