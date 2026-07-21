@@ -9,9 +9,12 @@ use ignore::{WalkBuilder, WalkState};
 static NEVER: AtomicBool = AtomicBool::new(false);
 
 fn is_pruned_dir(name: &str) -> bool {
-    // `.wormward-backup` holds pristine copies of removed payloads — never rescan it,
-    // or every scan after a `clean` would re-flag the backed-up originals.
-    name == ".git" || name == "node_modules" || name == ".wormward-backup"
+    // `.wormward-backup` (in EXCLUDED_DIRS) holds pristine copies of removed payloads — never
+    // rescan it, or every scan after a `clean` would re-flag the backed-up originals.
+    // EXCLUDED_DIRS as a whole (target/, dist/, .next/, …) is pruned because every scan pass
+    // already skips those paths via is_excluded_path — enumerating a multi-GB build tree only
+    // to discard each path is the walk's dominant wasted I/O.
+    name == ".git" || crate::surface::EXCLUDED_DIRS.contains(&name)
 }
 
 fn base_builder(root: &Path) -> WalkBuilder {
@@ -32,16 +35,51 @@ pub fn discover_repos(root: &Path) -> Vec<PathBuf> {
     discover_repos_cancellable(root, &NEVER)
 }
 
+/// Package-shaped node_modules descent for repo DISCOVERY. Inside a node_modules subtree, only
+/// the places a vendored repo's `.git` can live at a package ROOT are entered: a direct child
+/// (`<pkg>`, `@scope`, `.pnpm`), the second level for scoped / pnpm-virtual-store packages
+/// (`@scope/<pkg>`, `.pnpm/<name>@<ver>`), plus `.git` and nested `node_modules` re-entry points
+/// at any depth. A package's own internal file tree (thousands of entries per package) is never
+/// enumerated — that enumeration was over half of total scan time on real trees. The worm vendors
+/// at `node_modules/<pkg>/.git`, so coverage is unchanged where it matters; a `.git` buried
+/// deeper inside a package's shipped sources is the accepted tradeoff.
+fn node_modules_descent_allowed(path: &Path) -> bool {
+    let comps: Vec<&std::ffi::OsStr> = path.components().map(|c| c.as_os_str()).collect();
+    let last_nm = match comps.iter().rposition(|c| *c == "node_modules") {
+        Some(i) => i,
+        None => return true, // not inside node_modules — normal descent
+    };
+    let tail = &comps[last_nm + 1..];
+    // `.git` (a vendored repo) and `node_modules` (a nested install tree) re-enter at any depth.
+    if let Some(name) = tail.last() {
+        if *name == ".git" || *name == "node_modules" {
+            return true;
+        }
+    }
+    match tail.len() {
+        // node_modules itself, or a direct child: a package root, an @scope, or pnpm's .pnpm.
+        0 | 1 => true,
+        // One level deeper only for the two layouts whose package roots live there.
+        2 => {
+            let head = tail[0].to_string_lossy();
+            head.starts_with('@') || head == ".pnpm"
+        }
+        _ => false,
+    }
+}
+
 /// Cancellable variant of [`discover_repos`]. The parallel walk quits as soon as `cancel` is
 /// set, so a Stop during the discovery phase — which descends into node_modules and can be the
 /// slowest part of scanning a large monorepo — is honored instead of running the whole tree to
 /// completion first.
 pub fn discover_repos_cancellable(root: &Path, cancel: &AtomicBool) -> Vec<PathBuf> {
     let found = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
-    let b = base_builder(root);
-    // Descend everywhere (including node_modules): the worm can vendor an infected
-    // repo at node_modules/<pkg>/.git, so we must still discover it. We only avoid
-    // descending into .git internals, via WalkState::Skip in the callback below.
+    let mut b = base_builder(root);
+    // Descend into node_modules (the worm can vendor an infected repo at
+    // node_modules/<pkg>/.git) but package-shaped: only package roots and re-entry points are
+    // entered, never a package's internal file tree — see node_modules_descent_allowed. .git
+    // internals are skipped via WalkState::Skip in the callback below.
+    b.filter_entry(|e| node_modules_descent_allowed(e.path()));
     b.build_parallel().run(|| {
         let found = Arc::clone(&found);
         Box::new(move |res| {
@@ -173,6 +211,77 @@ mod tests {
         let repos = discover_repos(root);
         assert!(repos.contains(&root.join("app")));
         assert!(repos.contains(&root.join("app/node_modules/evil-pkg")));
+    }
+
+    #[test]
+    fn discovers_vendored_repos_at_every_package_root_shape() {
+        // The node_modules descent is package-shaped (it must not enumerate every package's
+        // internal file tree), so each place a PACKAGE ROOT can live must still be reached:
+        // plain, @scoped, the pnpm virtual store, and a nested node_modules.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let nm = root.join("app/node_modules");
+        fs::create_dir_all(root.join("app/.git")).unwrap();
+        fs::create_dir_all(nm.join("@scope/evil/.git")).unwrap();
+        fs::create_dir_all(nm.join(".pnpm/evil@1.0.0/node_modules/evil/.git")).unwrap();
+        fs::create_dir_all(nm.join("host/node_modules/nested-evil/.git")).unwrap();
+
+        let repos = discover_repos(root);
+        assert!(repos.contains(&nm.join("@scope/evil")), "scoped package root: {repos:?}");
+        assert!(
+            repos.contains(&nm.join(".pnpm/evil@1.0.0/node_modules/evil")),
+            "pnpm virtual-store package root: {repos:?}"
+        );
+        assert!(
+            repos.contains(&nm.join("host/node_modules/nested-evil")),
+            "nested node_modules package root: {repos:?}"
+        );
+    }
+
+    #[test]
+    fn discovery_skips_package_internals_under_node_modules() {
+        // The accepted tradeoff of the package-shaped descent: a .git buried INSIDE a package's
+        // source tree (not at a package root) is no longer discovered — the worm vendors at
+        // node_modules/<pkg>/.git, and enumerating every package's internals cost more than half
+        // of total scan time on real trees.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("app/.git")).unwrap();
+        fs::create_dir_all(root.join("app/node_modules/pkg/src/deep/.git")).unwrap();
+
+        let repos = discover_repos(root);
+        assert!(repos.contains(&root.join("app")));
+        assert!(
+            !repos.contains(&root.join("app/node_modules/pkg/src/deep")),
+            "package internals must not be walked: {repos:?}"
+        );
+    }
+
+    #[test]
+    fn walk_prunes_dirs_every_scan_pass_excludes() {
+        // Build-output dirs (target/, dist/, .next/, …) are skipped by every scan pass via
+        // is_excluded_path — enumerating them in the walk is pure wasted I/O (a Rust repo's
+        // target/ alone can be 99% of its walked paths). They must be pruned at walk time.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        touch(&repo.join("src/index.js"));
+        touch(&repo.join("target/debug/build/foo/out.rs"));
+        touch(&repo.join("dist/index.js"));
+        touch(&repo.join(".next/server/app.js"));
+        touch(&repo.join("coverage/lcov.info"));
+
+        let files = walk_repo_files(repo);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.strip_prefix(repo).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(names.contains(&"src/index.js".to_string()));
+        for pruned in ["target/", "dist/", ".next/", "coverage/"] {
+            assert!(
+                !names.iter().any(|n| n.starts_with(pruned)),
+                "{pruned} must be pruned from the walk, got {names:?}"
+            );
+        }
     }
 
     #[test]
