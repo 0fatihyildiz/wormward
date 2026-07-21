@@ -19,6 +19,8 @@ export interface Finding {
   remediable: boolean;
   online?: OnlineVerdict;
   git_ref?: string;
+  /** Where the match sits in `file`: 1-based line + a short snippet of the matched line. */
+  excerpt?: { line: number; text: string } | null;
 }
 
 export interface ScanReport {

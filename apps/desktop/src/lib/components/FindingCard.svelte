@@ -11,7 +11,10 @@
     info: "Note",
   };
   const title = $derived(SEV_WORD[finding.severity] ?? "Threat");
-  const where = $derived(finding.file ?? finding.repo);
+  // file:line when the finding knows where it matched; repo as the fallback anchor.
+  const where = $derived(
+    finding.file ? (finding.excerpt ? `${finding.file}:${finding.excerpt.line}` : finding.file) : finding.repo,
+  );
   const label = $derived(finding.remediable ? "Removable automatically" : "Needs your attention");
 </script>
 
@@ -26,11 +29,15 @@
     <dl class="fc-dl">
       <dt>What we found</dt>
       <dd class="mono">{finding.evidence}</dd>
+      {#if finding.excerpt}
+        <dt>Matched code</dt>
+        <dd class="mono snippet">line {finding.excerpt.line}: <code>{finding.excerpt.text}</code></dd>
+      {/if}
       <dt>Repository</dt>
       <dd class="mono">{finding.repo}</dd>
       {#if finding.file}
         <dt>File</dt>
-        <dd class="mono">{finding.file}</dd>
+        <dd class="mono">{finding.file}{#if finding.excerpt}:{finding.excerpt.line}{/if}</dd>
       {/if}
       <dt>Campaign</dt>
       <dd>{finding.campaign}</dd>
@@ -64,6 +71,7 @@
   .fc-dl dt { color: var(--faint); font-size: 11px; }
   .fc-dl dd { margin: 0; color: var(--fg); font-size: 12px; overflow-wrap: anywhere; min-width: 0; }
   .fc-dl dd.mono { font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+  .fc-dl dd.snippet code { display: inline-block; max-width: 100%; background: var(--surface-1, rgba(128,128,128,.12)); border-radius: 4px; padding: 2px 6px; color: var(--fg); word-break: break-all; }
   .fc-dl dd.crit { color: var(--danger); }
   .fc-dl dd.muted { color: var(--muted); }
 </style>

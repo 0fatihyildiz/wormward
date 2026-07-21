@@ -34,13 +34,18 @@ pub fn to_sarif(findings: &[Finding]) -> String {
                 Some(file) => f.repo.join(file).to_string_lossy().replace('\\', "/"),
                 None => f.repo.to_string_lossy().replace('\\', "/"),
             };
+            let mut physical = json!({ "artifactLocation": { "uri": uri } });
+            // Anchor the alert to the matched line, with the snippet GitHub renders inline.
+            // Only when an excerpt exists — a fabricated startLine of 0/1 would be wrong.
+            if let Some(e) = &f.excerpt {
+                physical["region"] =
+                    json!({ "startLine": e.line, "snippet": { "text": e.text } });
+            }
             json!({
                 "ruleId": f.signature_id,
                 "level": level(&f.severity),
                 "message": { "text": f.evidence },
-                "locations": [{
-                    "physicalLocation": { "artifactLocation": { "uri": uri } }
-                }],
+                "locations": [{ "physicalLocation": physical }],
                 "properties": { "campaign": f.campaign, "kind": f.kind }
             })
         })
@@ -78,6 +83,7 @@ mod tests {
             remediable: true,
             online: None,
             git_ref: None,
+            excerpt: None,
         }
     }
 
@@ -113,5 +119,21 @@ mod tests {
     fn empty_findings_still_valid() {
         let v: serde_json::Value = serde_json::from_str(&to_sarif(&[])).unwrap();
         assert_eq!(v["runs"][0]["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn excerpt_emits_sarif_region_with_line_and_snippet() {
+        let mut finding = f(Severity::Critical, "primary");
+        finding.excerpt = Some(crate::finding::Excerpt { line: 7, text: "eval(x)".into() });
+        let v: serde_json::Value = serde_json::from_str(&to_sarif(&[finding])).unwrap();
+        let region = &v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+        assert_eq!(region["startLine"], 7);
+        assert_eq!(region["snippet"]["text"], "eval(x)");
+        // No excerpt → no region key (a startLine of 0 would be invalid SARIF).
+        let v: serde_json::Value =
+            serde_json::from_str(&to_sarif(&[f(Severity::Critical, "primary")])).unwrap();
+        assert!(v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+            .get("region")
+            .is_none());
     }
 }

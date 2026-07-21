@@ -345,6 +345,7 @@ mod enrich_tests {
             remediable: false,
             online: None,
             git_ref: None,
+            excerpt: None,
         }
     }
 
@@ -360,6 +361,7 @@ mod enrich_tests {
             remediable: false,
             online: None,
             git_ref: None,
+            excerpt: None,
         }
     }
 

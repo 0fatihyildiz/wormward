@@ -542,6 +542,9 @@ mod tests {
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
+                // A user-level init.templateDir can inject real hooks into the test repo (a
+                // developer's own anti-worm pre-commit hook trips the GitHook capability pass).
+                .env("GIT_TEMPLATE_DIR", "")
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@t")
                 .env("GIT_COMMITTER_NAME", "t")

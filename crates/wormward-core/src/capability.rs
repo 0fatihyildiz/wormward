@@ -480,6 +480,14 @@ fn appended_obfuscated_blob(content: &str) -> bool {
     if readable.len() < 3 {
         return false;
     }
+    // A grafted payload's HOST is readable source, so the payload line is the file's only
+    // blob-scale line. A head that already carries ≥2 blob-scale lines is a multi-line minified
+    // bundle (webpack/Next chunks mix short runtime lines — enough to pass the readable guard
+    // above — with huge minified lines, and end on a huge line full of exec tokens). One long
+    // head line is allowed so a lone legit data/base64 constant can't suppress a real detection.
+    if head.iter().filter(|l| l.len() >= 400).count() >= 2 {
+        return false;
+    }
     // The blob line must be a dramatic outlier vs the readable code lines.
     let mut lens = readable.clone();
     lens.sort_unstable();
@@ -507,6 +515,44 @@ fn appended_obfuscated_blob(content: &str) -> bool {
 /// build-output / vendored files, so this only adds coverage of the family's non-config hosts.
 pub fn injected_payload(content: &str) -> bool {
     padding_injection(content) || decoder_re().is_match(content) || appended_obfuscated_blob(content)
+}
+
+/// Byte offset of the tell [`injected_payload`] fired on, for the finding's excerpt. Mirrors the
+/// tells in the same order: the payload after a padding run, the decoder identifier, or the start
+/// of the appended-blob line. `None` when the content carries no tell (callers only ask after a
+/// positive `injected_payload`, so that is the defensive path, not the normal one).
+pub fn injected_payload_offset(content: &str) -> Option<usize> {
+    let mut line_start = 0usize;
+    for line in content.split_inclusive('\n') {
+        if line_has_padding_run(line) {
+            // Anchor on the payload AFTER the pad: the end of the qualifying whitespace run.
+            let pad_end = line
+                .char_indices()
+                .scan(0usize, |run, (i, c)| {
+                    if c == ' ' || c == '\t' {
+                        *run += 1;
+                    } else if *run >= 200 {
+                        return Some(Some(i));
+                    } else {
+                        *run = 0;
+                    }
+                    Some(None)
+                })
+                .flatten()
+                .next();
+            return Some(line_start + pad_end.unwrap_or(0));
+        }
+        line_start += line.len();
+    }
+    if let Some(m) = decoder_re().find(content) {
+        return Some(m.start());
+    }
+    if appended_obfuscated_blob(content) {
+        // The blob is the last non-empty line; anchor on its start.
+        let trimmed = content.trim_end();
+        return Some(trimmed.rfind('\n').map(|i| i + 1).unwrap_or(0));
+    }
+    None
 }
 
 /// The double-base64 exfil-staging blob shape: content begins `eyJ` (base64 of
@@ -1030,6 +1076,48 @@ mod tests {
         assert!(
             !appended_obfuscated_blob(&minbundle),
             "a minified license-header bundle must not fire (real FP class)"
+        );
+    }
+
+    #[test]
+    fn appended_blob_fp_safe_on_webpack_chunk_shape() {
+        // Real-world FP class (Next.js static-export chunks under _next/static/chunks/): a
+        // MULTI-LINE minified bundle. Unlike the license-header shape above, a webpack chunk has
+        // plenty of SHORT runtime lines (enough "readable source" to pass that guard) interleaved
+        // with blob-scale minified lines, and its last line is huge and full of exec tokens
+        // (charCodeAt/String.fromCharCode) and string arrays. The tell that separates it from an
+        // infected source file: the head ALREADY contains blob-scale lines — a grafted payload's
+        // host is readable source, where the payload line is the file's only blob-scale line.
+        let long_min = "function(e,t,r){var n=r(1),o=r(2);e.exports=n(o);".repeat(15); // ~750 chars
+        let mut chunk = String::new();
+        for i in 0..20 {
+            chunk.push_str("\"use strict\";\n");
+            chunk.push_str(&format!("var n{i}=r({i});\n"));
+            chunk.push_str(&long_min);
+            chunk.push('\n');
+        }
+        let arr = vec!["\"zx\""; 50].join(",");
+        chunk.push_str(&format!(
+            "var t=[{arr}];t.map(function(e){{return String.fromCharCode(e.charCodeAt(0))}});{}",
+            long_min
+        ));
+        assert!(
+            !appended_obfuscated_blob(&chunk),
+            "a multi-line minified chunk (short runtime lines + blob-scale head lines) must not fire"
+        );
+        // The discriminator must NOT cost detection: the same grafted blob on all-readable source
+        // (one straggler long data line allowed) still fires.
+        let blob = format!(
+            "var q9zK=(function(a,b){{return eval(atob(a))}})('{}',31337);q9zK();",
+            "A".repeat(500)
+        );
+        let host = format!(
+            "import x from 'y';\nconst app = make();\nconst DATA = '{}';\nmodule.exports = app;\n{blob}",
+            "d".repeat(450) // one legit blob-scale data line must not suppress detection
+        );
+        assert!(
+            appended_obfuscated_blob(&host),
+            "a single legit long line in the host must not suppress a real grafted blob"
         );
     }
 

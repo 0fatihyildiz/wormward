@@ -12,6 +12,9 @@ pub struct SigHit {
     pub pack_id: String,
     pub signature_id: String,
     pub severity: Severity,
+    /// Byte offset of the match in the scanned content, where the matcher has one (literal /
+    /// regex). Whole-content kinds (sha256, entropy tail) carry `None`.
+    pub offset: Option<usize>,
 }
 
 struct SigMeta {
@@ -25,6 +28,9 @@ pub struct SignatureEngine {
     literal_meta: Vec<SigMeta>,
     regex_set: Option<RegexSet>,
     regex_meta: Vec<SigMeta>,
+    // Individually-compiled copies of the set's patterns, indexed like `regex_meta`: the set
+    // answers WHICH patterns matched, these answer WHERE (for the finding excerpt).
+    regexes: Vec<regex::Regex>,
     // lowercase digest -> every signature carrying that digest. Multiple packs can
     // share a digest, so we keep a Vec instead of collapsing to a single meta.
     sha256: HashMap<String, Vec<SigMeta>>,
@@ -39,6 +45,7 @@ impl SignatureEngine {
         let mut literal_meta: Vec<SigMeta> = Vec::new();
         let mut regex_patterns: Vec<String> = Vec::new();
         let mut regex_meta: Vec<SigMeta> = Vec::new();
+        let mut regexes: Vec<regex::Regex> = Vec::new();
         let mut sha256: HashMap<String, Vec<SigMeta>> = HashMap::new();
         let mut entropy: Vec<(f64, SigMeta)> = Vec::new();
 
@@ -57,9 +64,11 @@ impl SignatureEngine {
                     }
                     SignatureKind::Regex => {
                         // Skip patterns that don't compile rather than failing the whole build.
-                        if regex::Regex::new(&sig.value).is_ok() {
+                        // The compiled single regex is kept for match-position lookup.
+                        if let Ok(re) = regex::Regex::new(&sig.value) {
                             regex_patterns.push(sig.value.clone());
                             regex_meta.push(meta);
+                            regexes.push(re);
                         }
                     }
                     SignatureKind::Sha256 => {
@@ -92,7 +101,7 @@ impl SignatureEngine {
             RegexSetBuilder::new(&regex_patterns).size_limit(1 << 24).build().ok()
         };
 
-        SignatureEngine { literal, literal_meta, regex_set, regex_meta, sha256, entropy }
+        SignatureEngine { literal, literal_meta, regex_set, regex_meta, regexes, sha256, entropy }
     }
 
     pub fn scan_content(&self, content: &str) -> Vec<SigHit> {
@@ -109,6 +118,7 @@ impl SignatureEngine {
                         pack_id: meta.pack_id.clone(),
                         signature_id: meta.signature_id.clone(),
                         severity: meta.severity.clone(),
+                        offset: Some(m.start()),
                     });
                 }
             }
@@ -121,6 +131,7 @@ impl SignatureEngine {
                     pack_id: meta.pack_id.clone(),
                     signature_id: meta.signature_id.clone(),
                     severity: meta.severity.clone(),
+                    offset: self.regexes[idx].find(content).map(|m| m.start()),
                 });
             }
         }
@@ -134,6 +145,7 @@ impl SignatureEngine {
                         pack_id: meta.pack_id.clone(),
                         signature_id: meta.signature_id.clone(),
                         severity: meta.severity.clone(),
+                        offset: None, // whole-content match — no position
                     });
                 }
             }
@@ -150,6 +162,7 @@ impl SignatureEngine {
                         pack_id: meta.pack_id.clone(),
                         signature_id: meta.signature_id.clone(),
                         severity: meta.severity.clone(),
+                        offset: None, // tail-statistic match — no single position
                     });
                 }
             }
@@ -251,6 +264,28 @@ mod tests {
         assert_eq!(engine.scan_content(&blob).len(), 1);
         // Plain config stays below threshold.
         assert!(engine.scan_content("export default { plugins: {} };\n").is_empty());
+    }
+
+    #[test]
+    fn literal_and_regex_hits_carry_match_offset() {
+        // The excerpt shown in results needs WHERE the signature matched, not just that it did.
+        let pack = pack_with(vec![lit("primary", "rmcej%otb%")]);
+        let engine = SignatureEngine::build(&[pack]);
+        let content = "prefix rmcej%otb% suffix";
+        let hits = engine.scan_content(content);
+        assert_eq!(hits[0].offset, Some(content.find("rmcej%otb%").unwrap()));
+
+        let pack = pack_with(vec![sig(SignatureKind::Regex, "g", r"global\['[!_A-Za-z]+'\]=")]);
+        let engine = SignatureEngine::build(&[pack]);
+        let content = "var x; global['!']='8-270-2';";
+        let hits = engine.scan_content(content);
+        assert_eq!(hits[0].offset, Some(content.find("global['!']=").unwrap()));
+
+        // Whole-content kinds have no meaningful position.
+        let digest = crate::matchers::sha256_hex(b"payload");
+        let pack = pack_with(vec![sig(SignatureKind::Sha256, "h", &digest)]);
+        let engine = SignatureEngine::build(&[pack]);
+        assert_eq!(engine.scan_content("payload")[0].offset, None);
     }
 
     #[test]

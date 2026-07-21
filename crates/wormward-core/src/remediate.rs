@@ -111,6 +111,20 @@ pub fn action_for(finding: &Finding, packs: &[Pack]) -> Option<RemediationAction
     }
 }
 
+/// Will `action` actually do something when applied? A `StripPayload` whose markers occur
+/// nowhere in the file can only fail with "no strip marker found" — offering it as an
+/// auto-fix is the "62 removable, removed 0" lie. Delete/gitignore actions target something
+/// the scan just observed, so they are always applicable.
+pub fn action_is_applicable(action: &RemediationAction, files: &dyn crate::repo_files::RepoFiles) -> bool {
+    match action {
+        RemediationAction::StripPayload { file, markers, .. } => files
+            .read(file)
+            .map(|c| strip_marker_matches(&c, markers))
+            .unwrap_or(false),
+        _ => true,
+    }
+}
+
 /// Derive remediation actions from findings. Working-tree findings only; auto-cleanable
 /// kinds become actions (deduped by target), the rest are returned as `manual`.
 pub fn plan_remediation(findings: &[Finding], packs: &[Pack]) -> RemediationPlan {
@@ -120,6 +134,13 @@ pub fn plan_remediation(findings: &[Finding], packs: &[Pack]) -> RemediationPlan
     for f in findings {
         // Deep-scan findings live on other branches — cannot edit safely here.
         if f.git_ref.is_some() {
+            manual.push(f.clone());
+            continue;
+        }
+        // The scanner stamps `remediable` with content in hand (action exists AND is applicable
+        // — see `action_is_applicable`); a finding it marked unfixable must stay manual, or the
+        // plan promises a strip that `apply` will refuse ("no strip marker found").
+        if !f.remediable {
             manual.push(f.clone());
             continue;
         }
@@ -436,6 +457,7 @@ mod tests {
             remediable: true,
             online: None,
             git_ref: None,
+            excerpt: None,
         }
     }
 

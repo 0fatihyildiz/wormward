@@ -24,6 +24,11 @@ pub fn render_text(report: &ScanReport) -> String {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "-".to_string());
+        // file:line when the finding knows where it matched.
+        let file = match &f.excerpt {
+            Some(e) => format!("{file}:{}", e.line),
+            None => file,
+        };
         let branch = f
             .git_ref
             .as_deref()
@@ -38,6 +43,9 @@ pub fn render_text(report: &ScanReport) -> String {
             branch,
             f.evidence,
         ));
+        if let Some(e) = &f.excerpt {
+            out.push_str(&format!("      └ {}\n", e.text));
+        }
         if let Some(v) = &f.online {
             let status = if v.malicious { "OSM: MALICIOUS" } else { "OSM: not flagged" };
             let link = if v.osm_url.is_empty() {
@@ -150,6 +158,7 @@ mod tests {
                 remediable: true,
                 online: None,
                 git_ref: None,
+                excerpt: None,
             }],
         }
     }
@@ -215,6 +224,7 @@ mod tests {
             remediable: false,
             online: None,
             git_ref: None,
+            excerpt: None,
         }];
         let text = render_audit_text(&findings);
         assert!(text.contains("Account audit"));
@@ -239,6 +249,7 @@ mod tests {
             remediable: true,
             online: None,
             git_ref: Some("origin/evil".into()),
+            excerpt: None,
         };
         let outcomes = vec![RepoOutcome {
             repo: RepoRef {

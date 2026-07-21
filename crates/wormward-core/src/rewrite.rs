@@ -371,6 +371,7 @@ mod tests {
             remediable: true,
             online: None,
             git_ref: branch.map(String::from),
+            excerpt: None,
         }
     }
 

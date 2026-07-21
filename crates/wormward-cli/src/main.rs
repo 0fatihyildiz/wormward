@@ -319,6 +319,7 @@ fn main() -> ExitCode {
                                 remediable: false,
                                 online: None,
                                 git_ref: None,
+                                excerpt: None,
                             });
                         }
                     }
@@ -1120,6 +1121,7 @@ mod tests {
             remediable: true,
             online: None,
             git_ref: None,
+            excerpt: None,
         }
     }
 

@@ -50,6 +50,7 @@ fn finding(repo: &str, sev: Severity, sig: &str, evidence: String) -> Finding {
         remediable: false, // advisory only — wormward never touches account settings
         online: None,
         git_ref: None,
+        excerpt: None,
     }
 }
 

@@ -180,6 +180,10 @@ impl CampaignAnalyzer for PolinriderAnalyzer {
                 remediable: true,
                 online: None,
                 git_ref: None,
+                // Anchor on the structural tell (pad/decoder/blob) when present — the analyzer
+                // confirms the same payload family, so the tell is where the injection sits.
+                excerpt: wormward_core::injected_payload_offset(&file.content)
+                    .map(|o| wormward_core::Excerpt::at(&file.content, o)),
             }],
             None => vec![],
         }

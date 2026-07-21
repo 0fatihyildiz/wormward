@@ -21,7 +21,8 @@ pub mod typosquat;
 pub mod walk;
 
 pub use engine::{SigHit, SignatureEngine};
-pub use finding::{Finding, FindingKind, OnlineVerdict, Severity};
+pub use capability::injected_payload_offset;
+pub use finding::{Excerpt, Finding, FindingKind, OnlineVerdict, Severity};
 pub use hunt::{baseline, extract_new_iocs, NewIocs};
 pub use iocs::{collect_iocs, to_ioc_list, to_npm_report, to_stix, Iocs};
 pub use histrewrite::{git_filter_repo_available, replace_text_expressions, rewrite_history};

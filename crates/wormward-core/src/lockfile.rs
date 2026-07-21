@@ -296,6 +296,7 @@ pub fn check_lockfiles(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<F
                         remediable: false,
                         online: None,
                         git_ref: None,
+                        excerpt: None,
                     });
                 }
             }

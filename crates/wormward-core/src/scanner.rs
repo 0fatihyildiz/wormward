@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -67,6 +67,7 @@ fn check_artifacts(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Findi
                 remediable: true,
                 online: None,
                 git_ref: None,
+                excerpt: None,
             });
         }
     }
@@ -91,6 +92,16 @@ fn check_gitignore(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Findi
     let lines: Vec<&str> = content.lines().map(|l| l.trim()).collect();
     for injected in &pack.manifest.gitignore_injections {
         if lines.iter().any(|l| l == injected) {
+            // Byte offset of the injected line, for the excerpt.
+            let mut off = 0usize;
+            let mut pos = None;
+            for l in content.split_inclusive('\n') {
+                if l.trim() == injected {
+                    pos = Some(off);
+                    break;
+                }
+                off += l.len();
+            }
             findings.push(Finding {
                 campaign: pack.manifest.id.clone(),
                 severity: pack.manifest.severity.clone(),
@@ -102,6 +113,7 @@ fn check_gitignore(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Findi
                 remediable: true,
                 online: None,
                 git_ref: None,
+                excerpt: pos.map(|p| crate::finding::Excerpt::at(&content, p)),
             });
         }
     }
@@ -124,7 +136,7 @@ fn check_npm(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Finding> {
     for bad in &pack.manifest.bad_npm_packages {
         // Match the dependency key as it appears in package.json ("name":).
         let needle = format!("\"{bad}\"");
-        if content.contains(&needle) {
+        if let Some(pos) = content.find(&needle) {
             findings.push(Finding {
                 campaign: pack.manifest.id.clone(),
                 severity: pack.manifest.severity.clone(),
@@ -136,6 +148,7 @@ fn check_npm(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Finding> {
                 remediable: false,
                 online: None,
                 git_ref: None,
+                excerpt: Some(crate::finding::Excerpt::at(&content, pos)),
             });
         }
     }
@@ -218,6 +231,7 @@ fn scan_files_inner(
                 remediable: true,
                 online: None,
                 git_ref: None,
+                excerpt: hit.offset.map(|o| crate::finding::Excerpt::at(&content, o)),
             });
         }
 
@@ -225,7 +239,7 @@ fn scan_files_inner(
         for &i in &targeting {
             let pack = &packs[i];
             for domain in &pack.manifest.ioc_domains {
-                if content.contains(domain) {
+                if let Some(pos) = content.find(domain.as_str()) {
                     findings.push(Finding {
                         campaign: pack.manifest.id.clone(),
                         severity: Severity::Medium,
@@ -237,6 +251,7 @@ fn scan_files_inner(
                         remediable: false,
                         online: None,
                         git_ref: None,
+                        excerpt: Some(crate::finding::Excerpt::at(&content, pos)),
                     });
                 }
             }
@@ -259,12 +274,15 @@ fn scan_files_inner(
     }
 
     // `remediable` must track whether an auto-remediation action actually exists
-    // (remediate::action_for is the single source of that mapping). A ContentSignature
-    // or Analyzer hit from a campaign with no strip strategy is NOT auto-remediable;
-    // stamping it true would let exit-code resolution and branch-tip routing treat
-    // unfixable malware as "resolved". Re-stamp uniformly so no path drifts.
+    // (remediate::action_for is the single source of that mapping) AND would do something
+    // (action_is_applicable — a strip whose markers occur nowhere in the file can only fail).
+    // A ContentSignature or Analyzer hit from a campaign with no strip strategy is NOT
+    // auto-remediable; stamping it true would let exit-code resolution and branch-tip routing
+    // treat unfixable malware as "resolved". Re-stamp uniformly so no path drifts.
     for f in &mut findings {
-        f.remediable = crate::remediate::action_for(f, packs).is_some();
+        f.remediable = crate::remediate::action_for(f, packs)
+            .map(|a| crate::remediate::action_is_applicable(&a, files))
+            .unwrap_or(false);
     }
     findings
 }
@@ -282,6 +300,7 @@ fn cap_finding(repo: &Path, file: PathBuf, surface: Surface, s: &CapabilityScore
         remediable: false,
         online: None,
         git_ref: None,
+        excerpt: None,
     }
 }
 
@@ -448,6 +467,7 @@ fn scan_capabilities_inner(repo: &Path, files: &dyn RepoFiles, cancel: &AtomicBo
                 remediable: false,
                 online: None,
                 git_ref: None,
+                excerpt: None,
             });
         }
     }
@@ -616,6 +636,7 @@ pub fn scan_dependency_typosquats(
             remediable: false,
             online: None,
             git_ref: None,
+            excerpt: None,
         });
     }
     findings
@@ -682,6 +703,8 @@ fn scan_injection_structure_inner(
                 remediable: true,
                 online: None,
                 git_ref: None,
+                excerpt: crate::capability::injected_payload_offset(&content)
+                    .map(|o| crate::finding::Excerpt::at(&content, o)),
             });
         }
     }
@@ -721,9 +744,12 @@ fn scan_tree_inner(
     }
     // Capability findings default to non-remediable, but a few (e.g. a malicious .vscode/tasks.json)
     // now map to a delete action. Re-stamp uniformly so the `remediable` flag tracks the single
-    // action_for source of truth for every finding kind, not just the pack-pass ones.
+    // action_for source of truth for every finding kind, not just the pack-pass ones — gated on
+    // the action being applicable (a marker-less strip would only fail at apply time).
     for f in &mut findings {
-        f.remediable = crate::remediate::action_for(f, packs).is_some();
+        f.remediable = crate::remediate::action_for(f, packs)
+            .map(|a| crate::remediate::action_is_applicable(&a, files))
+            .unwrap_or(false);
     }
     findings
 }
@@ -781,6 +807,7 @@ fn scan_repo_inner(repo: &Path, packs: &[Pack], cancel: &AtomicBool) -> Vec<Find
             remediable: false,
             online: None,
             git_ref: None,
+            excerpt: None,
         });
     }
     findings
@@ -854,23 +881,42 @@ fn head_commit(repo: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Paths that differ between two commits (`git diff --name-only <base> <tip>`). NUL-delimited so
-/// special/non-ASCII paths survive. Commit-to-commit (no working-tree stat), so it stays cheap.
-fn diff_paths(repo: &Path, base: &str, tip: &str) -> Vec<PathBuf> {
+/// Changed paths between two commits with each path's TIP-side blob oid
+/// (`git diff --raw -z --no-renames --full-index <base> <tip>`), skipping deletions (no tip-side
+/// blob to scan). `--no-renames` matters twice: rename detection is the single most expensive part
+/// of a large stale-branch diff (~4x wall time on real trees), and disabling it splits a rename
+/// into delete+add so the add side — the only side with content to scan — keeps the one-path
+/// record shape parsed here. `--no-abbrev` keeps raw-record oids unabbreviated so they are stable
+/// cross-tip dedup keys (`--full-index` would not do: it governs only patch-format index lines).
+/// NUL-delimited so special/non-ASCII paths survive. Commit-to-commit (no working-tree stat), so
+/// it stays cheap.
+fn diff_raw(repo: &Path, base: &str, tip: &str) -> Vec<(PathBuf, String)> {
     let out = crate::proc::git()
         .arg("-C")
         .arg(repo)
-        .args(["diff", "--name-only", "-z", base, tip])
+        .args(["diff", "--raw", "-z", "--no-renames", "--no-abbrev", base, tip])
         .output();
     let out = match out {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
-    String::from_utf8_lossy(&out.stdout)
-        .split('\0')
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect()
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut fields = stdout.split('\0');
+    let mut entries = Vec::new();
+    // -z raw record: ":<oldmode> <newmode> <oldoid> <newoid> <status>" NUL "<path>" NUL. With
+    // --no-renames every status is single-path, so records alternate meta/path cleanly.
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        let mut cols = meta.split(' ');
+        let (Some(new_oid), Some(status)) = (cols.nth(3), cols.next()) else {
+            continue;
+        };
+        // 'D' = deleted on the tip: no tip-side blob, nothing to scan.
+        if status.starts_with('D') || path.is_empty() {
+            continue;
+        }
+        entries.push((PathBuf::from(path), new_oid.to_string()));
+    }
+    entries
 }
 
 /// Scan the tip tree of every local/remote branch (deduped by commit, excluding HEAD's
@@ -893,6 +939,14 @@ pub fn deep_scan_repo_cancellable(
     // blob reader instead of one per tip (the tip specs carry their own commit, so one reader
     // serves them all).
     let reader = GitTree::shared_reader();
+    // Cross-tip blob cache: (path, tip-side blob oid) → the findings that blob produced, git_ref
+    // unset. Sibling branches of a busy repo share most of their diff-from-HEAD content — every
+    // stale branch re-lists the same old versions of the same files — so most (path, blob) pairs
+    // repeat across tips. Scan each pair once, then replay its cached findings (stamped with the
+    // later tip's ref) instead of re-reading the blob. Keyed by path AND oid because every scan
+    // pass is path-sensitive (target globs, surface classification). The map only holds unique
+    // pairs, so its size tracks distinct content, not tips × files.
+    let mut blob_cache: HashMap<(PathBuf, String), Vec<Finding>> = HashMap::new();
     for (oid, name) in branch_commits(repo) {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -904,24 +958,56 @@ pub fn deep_scan_repo_cancellable(
             continue;
         }
         // Scan ONLY the files this tip changes vs HEAD. Content shared with HEAD is already covered
-        // by the working-tree pass, so the tip's added/changed files are all that is left to check.
-        // This drops per-tip work from the whole tree to the (usually tiny) diff — the key to a fast
-        // deep scan on a many-branch repo WITHOUT adding parallelism (and thus without more heat).
-        let tree = match head.as_deref() {
+        // by the working-tree pass, so the tip's added/changed files are all that is left to check;
+        // of those, blobs already scanned under an earlier tip replay from the cache. This drops
+        // per-tip work from the whole tree to the diff's UNIQUE content — the key to a fast deep
+        // scan on a many-branch repo WITHOUT adding parallelism (and thus without more heat).
+        let mut tree_findings = match head.as_deref() {
             Some(base) => {
-                let changed = diff_paths(repo, base, &oid);
+                let changed = diff_raw(repo, base, &oid);
                 if changed.is_empty() {
                     continue;
                 }
-                GitTree::new_for_paths_with_reader(repo, &oid, changed, reader.clone())
+                let mut replayed: Vec<Finding> = Vec::new();
+                let mut fresh: Vec<(PathBuf, String)> = Vec::new();
+                for (path, boid) in changed {
+                    match blob_cache.get(&(path.clone(), boid.clone())) {
+                        Some(cached) => replayed.extend(cached.iter().cloned()),
+                        None => fresh.push((path, boid)),
+                    }
+                }
+                if !fresh.is_empty() {
+                    let paths: Vec<PathBuf> = fresh.iter().map(|(p, _)| p.clone()).collect();
+                    let tree = GitTree::new_for_paths_with_reader(repo, &oid, paths, reader.clone());
+                    let scanned = scan_tree_inner(repo, &tree, packs, cancel);
+                    // A cancelled pass is partial — caching it would remember not-yet-scanned
+                    // blobs as clean, so only a completed pass populates the cache.
+                    if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        let mut by_file: HashMap<PathBuf, Vec<Finding>> = HashMap::new();
+                        for f in &scanned {
+                            if let Some(file) = &f.file {
+                                by_file.entry(file.clone()).or_default().push(f.clone());
+                            }
+                        }
+                        // Every fresh pair is cached, findings or not — the empty entries (clean
+                        // blobs, the overwhelming majority) are what save the re-reads. A finding
+                        // on a file OUTSIDE the diff (e.g. a derived-script target read straight
+                        // from the tip) has no known blob oid and stays uncached.
+                        for (path, boid) in fresh {
+                            let cached = by_file.remove(&path).unwrap_or_default();
+                            blob_cache.insert((path, boid), cached);
+                        }
+                    }
+                    replayed.extend(scanned);
+                }
+                replayed
             }
             // No HEAD (unborn/detached edge): fall back to scanning the full tip tree.
             None => match GitTree::new(repo, &oid) {
-                Some(t) => t,
+                Some(t) => scan_tree_inner(repo, &t, packs, cancel),
                 None => continue,
             },
         };
-        let mut tree_findings = scan_tree_inner(repo, &tree, packs, cancel);
         for f in &mut tree_findings {
             f.git_ref = Some(name.clone());
         }
@@ -992,6 +1078,8 @@ fn scan_build_output(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
                             remediable: false,
                             online: None,
                             git_ref: None,
+                            excerpt: crate::capability::injected_payload_offset(&content)
+                                .map(|o| crate::finding::Excerpt::at(&content, o)),
                         });
                     }
                 }
@@ -1112,6 +1200,7 @@ pub fn scan_node_modules(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
                         remediable: false,
                         online: None,
                         git_ref: None,
+                        excerpt: None,
                     });
                 }
             }
@@ -1162,6 +1251,7 @@ pub fn scan_node_modules(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
             remediable: false,
             online: None,
             git_ref: None,
+            excerpt: None,
         });
     }
     findings
@@ -1238,6 +1328,7 @@ pub fn scan_history(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
                 remediable: false,
                 online: None,
                 git_ref: Some(short),
+                excerpt: None,
             });
         }
     }
@@ -1297,6 +1388,7 @@ pub fn scan_date_skew(repo: &Path) -> Vec<Finding> {
                 remediable: false,
                 online: None,
                 git_ref: Some(short),
+                excerpt: None,
             });
         }
     }
@@ -1441,6 +1533,19 @@ mod tests {
             remediation: None,
         };
         Pack { manifest, analyzer: None }
+    }
+
+    /// `literal_pack` plus a strip config, for tests exercising the remediable/strip contract.
+    fn strip_pack() -> Pack {
+        let mut pack = literal_pack();
+        pack.manifest.remediation = Some(crate::pack::Remediation {
+            config_payload: Some(crate::pack::PayloadStrip {
+                strategy: "strip_after_marker".into(),
+                markers: vec!["global['!']=".into()],
+                strip_lines: vec![],
+            }),
+        });
+        pack
     }
 
     fn make_repo(tmp: &TempDir) -> PathBuf {
@@ -2099,6 +2204,7 @@ mod tests {
                         remediable: true,
                         online: None,
                         git_ref: None,
+                        excerpt: None,
                     }]
                 } else {
                     vec![]
@@ -2498,6 +2604,216 @@ mod tests {
         assert_eq!(
             deep.iter().filter(|f| f.kind == FindingKind::ContentSignature).count(),
             1
+        );
+    }
+
+    #[test]
+    fn findings_carry_excerpt_with_line_and_snippet() {
+        // Results must show WHERE a finding matched: file line + a short snippet. Covers the
+        // content-signature, IOC-domain, and gitignore-injection population paths.
+        let tmp = TempDir::new().unwrap();
+        let repo = make_repo(&tmp);
+        fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default {};\nrun('rmcej%otb%');\nfetch('https://evil-c2.example');\n",
+        )
+        .unwrap();
+        fs::write(repo.join(".gitignore"), "node_modules\ntemp_disk_file\n").unwrap();
+
+        let mut pack = literal_pack();
+        pack.manifest.ioc_domains = vec!["evil-c2.example".into()];
+        pack.manifest.gitignore_injections = vec!["temp_disk_file".into()];
+        let findings = scan_repo(&repo, &[pack]);
+
+        let sig = findings.iter().find(|f| f.kind == FindingKind::ContentSignature).unwrap();
+        let e = sig.excerpt.as_ref().expect("content-signature finding must carry an excerpt");
+        assert_eq!(e.line, 2);
+        assert!(e.text.contains("rmcej%otb%"), "snippet must show the match: {}", e.text);
+
+        let ioc = findings.iter().find(|f| f.kind == FindingKind::IocDomain).unwrap();
+        let e = ioc.excerpt.as_ref().expect("ioc finding must carry an excerpt");
+        assert_eq!(e.line, 3);
+        assert!(e.text.contains("evil-c2.example"));
+
+        let gi = findings.iter().find(|f| f.kind == FindingKind::GitignoreInjection).unwrap();
+        let e = gi.excerpt.as_ref().expect("gitignore finding must carry an excerpt");
+        assert_eq!(e.line, 2);
+        assert_eq!(e.text, "temp_disk_file");
+    }
+
+    #[test]
+    fn structural_injection_finding_carries_excerpt() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let blob = format!("eval(atob('{}'));run();", "A".repeat(500));
+        fs::write(repo.join("server.js"), format!("const a=1;\nconst b=2;\nconst c=3;\n{blob}"))
+            .unwrap();
+        let findings = scan_repo(repo, &[literal_pack()]);
+        let f = findings.iter().find(|f| f.signature_id == "injection:structural").unwrap();
+        let e = f.excerpt.as_ref().expect("structural finding must carry an excerpt");
+        assert_eq!(e.line, 4, "must anchor on the grafted blob line");
+        assert!(e.text.contains("eval(atob("), "snippet must show the blob head: {}", e.text);
+    }
+
+    #[test]
+    fn structural_finding_without_matching_strip_marker_is_not_remediable() {
+        // The "Removed 0 threats" bug: a structural-injection (Analyzer) finding was stamped
+        // remediable merely because its campaign HAS a strip config — but if none of the strip
+        // markers occur in the file, apply() can only fail with "no strip marker found". Such a
+        // finding must surface as needs-your-attention (remediable=false), and plan_remediation
+        // must not fabricate a doomed action for it.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        // Trips appended_obfuscated_blob (readable head + grafted eval blob) but contains NO
+        // strip marker (no bracket-global, no padding run, no version tag, no decoder IIFE).
+        let blob = format!("eval(atob('{}'));run();", "A".repeat(500));
+        fs::write(repo.join("server.js"), format!("const a=1;\nconst b=2;\nconst c=3;\n{blob}"))
+            .unwrap();
+
+        // polinrider pack WITH a strip config (whose markers can't match this file)
+        let findings = scan_repo(repo, &[strip_pack()]);
+        let f = findings
+            .iter()
+            .find(|f| f.signature_id == "injection:structural")
+            .expect("structural finding must still be detected");
+        assert!(!f.remediable, "no strip marker in file → must not promise auto-removal: {f:?}");
+        let plan = crate::remediate::plan_remediation(&findings, &[strip_pack()]);
+        assert!(
+            plan.actions.is_empty(),
+            "no action may be planned for an unstrippable finding: {:?}",
+            plan.actions
+        );
+    }
+
+    #[test]
+    fn structural_finding_with_matching_strip_marker_stays_remediable() {
+        // Counterpart guard: when a strip marker IS present, the finding must remain
+        // auto-removable — the honesty fix must not cost real remediations.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        let blob = format!("global['!']='8-270-2';eval(atob('{}'));", "A".repeat(500));
+        fs::write(repo.join("server.js"), format!("const a=1;\nconst b=2;\nconst c=3;\n{blob}"))
+            .unwrap();
+
+        let findings = scan_repo(repo, &[strip_pack()]);
+        let f = findings
+            .iter()
+            .find(|f| f.signature_id == "injection:structural")
+            .expect("structural finding must be detected");
+        assert!(f.remediable, "marker present → auto-removable must be preserved: {f:?}");
+        let plan = crate::remediate::plan_remediation(&findings, &[strip_pack()]);
+        assert!(!plan.actions.is_empty(), "a strippable finding must plan an action");
+    }
+
+    #[test]
+    fn diff_raw_lists_added_and_modified_tip_blobs_but_not_deletions() {
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status().unwrap();
+        }
+        fn git_out(repo: &Path, args: &[&str]) -> String {
+            let out = Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one").unwrap();
+        std::fs::write(repo.join("c.txt"), "gone").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        git(&repo, &["checkout", "-q", "-b", "tip"]);
+        std::fs::write(repo.join("a.txt"), "two").unwrap();
+        std::fs::write(repo.join("b.txt"), "new").unwrap();
+        std::fs::remove_file(repo.join("c.txt")).unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "tip"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let map: std::collections::HashMap<PathBuf, String> =
+            diff_raw(&repo, "main", "tip").into_iter().collect();
+        // Modified and added paths carry the tip-side FULL blob oid (the cross-tip dedup key).
+        assert_eq!(map.get(Path::new("a.txt")), Some(&git_out(&repo, &["rev-parse", "tip:a.txt"])));
+        assert_eq!(map.get(Path::new("b.txt")), Some(&git_out(&repo, &["rev-parse", "tip:b.txt"])));
+        // A path deleted on the tip has no tip-side blob — nothing to scan, so no entry.
+        assert!(!map.contains_key(Path::new("c.txt")), "deleted path must be skipped: {map:?}");
+    }
+
+    #[test]
+    fn deep_scan_reports_shared_payload_on_every_branch() {
+        // Two branches carry the SAME infected blob at the same path (the dominant shape on a
+        // fork with many stale sibling branches). Branch cleaning routes by git_ref, so the deep
+        // scan must report BOTH branches — the cross-tip blob dedup may scan the blob once but
+        // must replicate the finding per tip, never swallow the second branch's report.
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status().unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "export default {};").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "clean"]);
+        git(&repo, &["checkout", "-q", "-b", "evil1"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        git(&repo, &["commit", "-q", "-am", "p1"]);
+        git(&repo, &["checkout", "-q", "main"]);
+        git(&repo, &["checkout", "-q", "-b", "evil2"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        git(&repo, &["commit", "-q", "-am", "p2"]); // distinct commit, identical blob
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let deep = deep_scan_repo(&repo, &[literal_pack()]);
+        for branch in ["evil1", "evil2"] {
+            assert!(
+                deep.iter().any(|f| f.kind == FindingKind::ContentSignature
+                    && f.git_ref.as_deref() == Some(branch)),
+                "branch '{branch}' must keep its own finding: {deep:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_scan_finds_payload_at_renamed_path() {
+        // The diff runs with --no-renames, so a rename surfaces as delete+add; the add side
+        // carries the payload blob and must be scanned at its NEW path.
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status().unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "infected"]);
+        git(&repo, &["checkout", "-q", "-b", "moved"]);
+        std::fs::create_dir_all(repo.join("web")).unwrap();
+        git(&repo, &["mv", "postcss.config.mjs", "web/postcss.config.mjs"]);
+        git(&repo, &["commit", "-q", "-m", "rename"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let deep = deep_scan_repo(&repo, &[literal_pack()]);
+        assert!(
+            deep.iter().any(|f| f.git_ref.as_deref() == Some("moved")
+                && f.file.as_deref() == Some(Path::new("web/postcss.config.mjs"))),
+            "renamed payload must be found at its new path on the branch tip: {deep:?}"
         );
     }
 }

@@ -40,6 +40,9 @@ const ASSET_EXTS: &[&str] = &["woff", "woff2", "ttf", "otf", "eot", "png", "jpg"
 pub(crate) const EXCLUDED_DIRS: &[&str] = &[
     "dist", "build", ".next", "out", "coverage", "vendor", "node_modules", ".wormward-backup",
     "target", ".output", ".nuxt",
+    // Next.js STATIC EXPORT output (`.next` is only the dev/build cache). Committed exports put
+    // minified chunks under `<site>/_next/static/chunks/` — a real structural-injection FP class.
+    "_next",
 ];
 
 const LIFECYCLE_KEYS: &[&str] = &[
@@ -256,6 +259,19 @@ mod tests {
         // Real source is NOT excluded.
         assert!(!is_excluded_path(Path::new("postcss.config.mjs")));
         assert!(!is_excluded_path(Path::new("src/index.js")));
+    }
+
+    #[test]
+    fn next_static_export_output_excluded() {
+        // A Next.js STATIC EXPORT emits its build output under `_next/` (`.next/` is only the
+        // dev/build cache). Committed exports (`assets/_next/static/chunks/*.js`) are minified
+        // bundles — the FP class that tripped the structural-injection pass on real repos.
+        assert!(is_excluded_path(Path::new("_next/static/chunks/1098c2541054fc77.js")));
+        assert!(is_excluded_path(Path::new(
+            "plugins/examples/homepage/assets/_next/static/chunks/app/page.js"
+        )));
+        // A file merely NAMED _next.js (not inside a `_next` dir) is still scanned.
+        assert!(!is_excluded_path(Path::new("src/_next.js")));
     }
     #[test]
     fn config_nested() {
