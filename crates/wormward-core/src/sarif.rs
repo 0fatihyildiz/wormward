@@ -27,9 +27,12 @@ pub fn to_sarif(findings: &[Finding]) -> String {
     let results: Vec<_> = findings
         .iter()
         .map(|f| {
+            // SARIF `artifactLocation.uri` is a URI reference, which uses forward slashes. On
+            // Windows `PathBuf::join` yields backslashes, so normalize — otherwise the paths in an
+            // upload to GitHub code scanning are malformed and don't map to files in the repo.
             let uri = match &f.file {
-                Some(file) => f.repo.join(file).to_string_lossy().into_owned(),
-                None => f.repo.to_string_lossy().into_owned(),
+                Some(file) => f.repo.join(file).to_string_lossy().replace('\\', "/"),
+                None => f.repo.to_string_lossy().replace('\\', "/"),
             };
             json!({
                 "ruleId": f.signature_id,
@@ -89,6 +92,20 @@ mod tests {
         assert_eq!(
             v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
             "/r/postcss.config.mjs"
+        );
+    }
+
+    #[test]
+    fn uri_uses_forward_slashes_for_nested_paths() {
+        // A nested repo-relative path must serialize with forward slashes on every OS (SARIF URIs
+        // are not OS-native paths); on Windows PathBuf::join would otherwise emit backslashes.
+        let mut finding = f(Severity::Critical, "primary");
+        finding.repo = PathBuf::from("/r");
+        finding.file = Some(PathBuf::from("apps").join("web").join("postcss.config.mjs"));
+        let v: serde_json::Value = serde_json::from_str(&to_sarif(&[finding])).unwrap();
+        assert_eq!(
+            v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "/r/apps/web/postcss.config.mjs"
         );
     }
 
