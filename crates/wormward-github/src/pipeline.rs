@@ -473,23 +473,35 @@ pub fn scan_pass_with_progress_cancellable(
     let total = repos.len();
     let cache = BlobCache::new();
     let done_counter = AtomicUsize::new(0);
+    // Once the host reports throttling, the rest of the run goes one-repo-at-a-time:
+    // eight workers independently backing off into a tripped secondary limit is exactly
+    // the pattern that escalates to an account-level abuse flag.
+    let serial = std::sync::Mutex::new(());
+    let scan_one = |repo: &RepoRef| {
+        // Cancelled: skip the network-heavy scan and report the repo clean.
+        if cancel.load(Ordering::Relaxed) {
+            Ok(ScannedRepo {
+                repo: repo.clone(),
+                findings: Vec::new(),
+                error: None,
+                auto_fixable: false,
+                branch_fixable: false,
+            })
+        } else {
+            api_scan_repo(repo, host, packs, &cache, token)
+        }
+    };
     // `collect::<Result<Vec<_>, _>>()` lets rayon short-circuit cooperatively on the
     // first Err (a rate limit) instead of scanning every repo before propagating it.
     let scan_all = || {
         repos
             .par_iter()
             .map(|repo| {
-                // Cancelled: skip the network-heavy scan and report the repo clean.
-                let result = if cancel.load(Ordering::Relaxed) {
-                    Ok(ScannedRepo {
-                        repo: repo.clone(),
-                        findings: Vec::new(),
-                        error: None,
-                        auto_fixable: false,
-                        branch_fixable: false,
-                    })
+                let result = if host.throttle_hint() {
+                    let _one_at_a_time = serial.lock().unwrap();
+                    scan_one(repo)
                 } else {
-                    api_scan_repo(repo, host, packs, &cache, token)
+                    scan_one(repo)
                 };
                 let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 on_progress(ScanProgress { done, total, repo: repo.full_name.clone() });
@@ -2257,5 +2269,67 @@ mod tests {
         let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
         assert_eq!(scan.infected_full_names(), vec!["me/small".to_string()]);
         assert!(host.branches.load(Ordering::Relaxed) > 0, "REST path must be used");
+    }
+
+    /// GitFakeHost with the throttle hint permanently on — drives the serialized-scan path.
+    struct ThrottledHost(GitFakeHost);
+    impl RepoHost for ThrottledHost {
+        fn list_repos(&self, f: bool, o: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            self.0.list_repos(f, o)
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+            self.0.list_orgs()
+        }
+        fn list_branches(&self, n: &str) -> Result<Vec<Branch>, GithubError> {
+            self.0.list_branches(n)
+        }
+        fn get_tree(&self, n: &str, s: &str) -> Result<Tree, GithubError> {
+            self.0.get_tree(n, s)
+        }
+        fn get_blob(&self, n: &str, s: &str) -> Result<Option<String>, GithubError> {
+            self.0.get_blob(n, s)
+        }
+        fn throttle_hint(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn throttled_scan_serializes_but_completes_with_full_results() {
+        let tmp = TempDir::new().unwrap();
+        let a = make_infected_origin_named(&tmp, "ta");
+        let b = make_infected_origin_named(&tmp, "tb");
+        let host = ThrottledHost(GitFakeHost {
+            repos: vec![
+                RepoRef {
+                    full_name: "me/ta".into(),
+                    clone_url: a.to_string_lossy().to_string(),
+                    default_branch: "main".into(),
+                    fork: false,
+                    size: 0,
+                    pushed_at: None,
+                },
+                RepoRef {
+                    full_name: "me/tb".into(),
+                    clone_url: b.to_string_lossy().to_string(),
+                    default_branch: "main".into(),
+                    fork: false,
+                    size: 0,
+                    pushed_at: None,
+                },
+            ],
+        });
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        let mut infected = scan.infected_full_names();
+        infected.sort();
+        assert_eq!(infected, vec!["me/ta".to_string(), "me/tb".to_string()]);
     }
 }

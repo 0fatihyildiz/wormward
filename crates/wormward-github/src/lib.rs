@@ -98,6 +98,11 @@ pub trait RepoHost: Sync {
     fn get_tree(&self, full_name: &str, commit_sha: &str) -> Result<Tree, GithubError>;
     /// `Ok(None)` for binary / non-UTF-8 blobs (mirrors `GitTree::read`).
     fn get_blob(&self, full_name: &str, blob_sha: &str) -> Result<Option<String>, GithubError>;
+    /// True when the host has observed throttling (e.g. a secondary rate limit) and the
+    /// caller should reduce concurrency. Default false: mocks and fakes are never throttled.
+    fn throttle_hint(&self) -> bool {
+        false
+    }
 }
 
 // ---- Account-audit host abstraction (read-only) ----------------------------------------
@@ -155,6 +160,13 @@ pub trait AccountHost: Sync {
 pub struct GitHubHost {
     pub token: String,
     pub base_url: String,
+    /// Global pacer: the earliest Instant the NEXT request may start. Shared across every
+    /// scan thread so the account's request rate is smooth (~6/s) instead of 8 workers
+    /// bursting — burstiness, not volume, is what trips GitHub's secondary limit.
+    next_request: std::sync::Mutex<std::time::Instant>,
+    /// Sticky: set once any request observes a secondary rate limit (Retry-After present).
+    /// `scan_pass` consults it via `throttle_hint` and serializes the rest of the run.
+    secondary_hit: std::sync::atomic::AtomicBool,
 }
 
 #[derive(serde::Deserialize)]
@@ -190,7 +202,12 @@ struct ApiOrg {
 
 impl GitHubHost {
     pub fn new(token: String) -> Self {
-        GitHubHost { token, base_url: "https://api.github.com".into() }
+        GitHubHost {
+            token,
+            base_url: "https://api.github.com".into(),
+            next_request: std::sync::Mutex::new(std::time::Instant::now()),
+            secondary_hit: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// GET `url` with auth headers. Only ever sends the bearer token to the configured
@@ -220,6 +237,18 @@ impl GitHubHost {
         let mut last_rl_msg: Option<String> = None;
         let mut last_suffix: Option<String> = None;
         for _ in 0..=MAX_RATE_RETRIES {
+            {
+                let (wait, next) = {
+                    let mut slot = self.next_request.lock().unwrap();
+                    let (wait, next) = pace_slot(*slot, std::time::Instant::now(), MIN_REQUEST_SPACING);
+                    *slot = next;
+                    (wait, next)
+                };
+                let _ = next;
+                if !wait.is_zero() {
+                    std::thread::sleep(wait);
+                }
+            }
             match ureq::get(url)
                 .set("Authorization", &format!("Bearer {}", self.token))
                 .set("User-Agent", "wormward")
@@ -243,6 +272,11 @@ impl GitHubHost {
                     // consumed, so an actionable message survives whether we give up now or after
                     // exhausting retries.
                     let retry_after = resp.header("retry-after").map(str::to_owned);
+                    if retry_after.is_some() {
+                        // Secondary limit (Retry-After while quota remains): remember it so
+                        // the scan drops to serial instead of 8 workers re-tripping it.
+                        self.secondary_hit.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let reset = resp.header("x-ratelimit-reset").map(str::to_owned);
                     let wait = retry_wait(
                         retry_after.as_deref(),
@@ -348,6 +382,26 @@ const MAX_RATE_RETRIES: usize = 3;
 /// primary-quota exhaustion (reset up to an hour out) — not worth blocking the run for, so we
 /// surface RateLimited instead of sleeping.
 const MAX_RATE_WAIT_SECS: u64 = 60;
+
+/// Minimum spacing between request starts (global, all threads). ~6.6 req/s: fast enough
+/// that pacing never dominates a scan, smooth enough to stop the burst signature.
+const MIN_REQUEST_SPACING: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Compute a request's start slot under global pacing: returns (wait, new_next_allowed).
+/// `next_allowed` is the earliest permitted start; a request arriving early waits out the
+/// difference, a late one starts immediately and re-anchors the schedule at `now` (no
+/// banking of unused slots — bursts stay capped at one request per spacing).
+fn pace_slot(
+    next_allowed: std::time::Instant,
+    now: std::time::Instant,
+    spacing: std::time::Duration,
+) -> (std::time::Duration, std::time::Instant) {
+    if next_allowed <= now {
+        (std::time::Duration::ZERO, now + spacing)
+    } else {
+        (next_allowed - now, next_allowed + spacing)
+    }
+}
 
 /// Pull the human `message` out of a GitHub error JSON body (e.g. "You have exceeded a secondary
 /// rate limit…" or "Resource not accessible by personal access token"), for surfacing the real
@@ -486,6 +540,10 @@ impl RepoHost for GitHubHost {
             .decode(compact)
             .map_err(|e| GithubError::Parse(format!("blob base64: {e}")))?;
         Ok(String::from_utf8(bytes).ok()) // None for binary blobs, like GitTree::read
+    }
+
+    fn throttle_hint(&self) -> bool {
+        self.secondary_hit.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -649,6 +707,13 @@ mod tests {
     use super::*;
     use httpmock::prelude::*;
 
+    /// Build a `GitHubHost` pointed at a mock server, with pacing/breaker state fresh.
+    fn test_host(token: &str, base_url: String) -> GitHubHost {
+        let mut host = GitHubHost::new(token.to_string());
+        host.base_url = base_url;
+        host
+    }
+
     #[test]
     fn explicit_token_wins() {
         let t = resolve_token(Some("tok_explicit")).unwrap();
@@ -689,11 +754,12 @@ mod tests {
             ]));
         });
 
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         let repos = host.list_repos(false, &[]).unwrap();
         let names: Vec<&str> = repos.iter().map(|r| r.full_name.as_str()).collect();
         // owned + org-member repos across both pages; the fork is filtered out.
         assert_eq!(names, vec!["me/a", "org/repo", "me/b"]);
+        assert!(!host.throttle_hint(), "a clean run never trips the breaker");
     }
 
     #[test]
@@ -706,7 +772,7 @@ mod tests {
                 {"login":"foo"}
             ]));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         assert_eq!(host.list_orgs().unwrap(), vec!["acme".to_string(), "foo".to_string()]);
     }
 
@@ -730,7 +796,7 @@ mod tests {
                 {"full_name":"acme/x","clone_url":"https://x/x.git","default_branch":"main","fork":false}
             ]));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         let repos = host.list_repos(false, &["acme".into()]).unwrap();
         let names: Vec<&str> = repos.iter().map(|r| r.full_name.as_str()).collect();
         // personal (owner) + the org's repos; the personal fork is filtered out.
@@ -752,7 +818,7 @@ mod tests {
             when.method(GET).path("/orgs/bad/repos");
             then.status(404).body("{}");
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         let result = host.list_repos(false, &["bad".into()]);
         match result {
             Err(e) => assert!(e.to_string().contains("bad"), "error should name the org: {e}"),
@@ -779,7 +845,7 @@ mod tests {
             then.status(200).json_body(serde_json::json!([]));
         });
 
-        let host = GitHubHost { token: "secret".into(), base_url: api.base_url() };
+        let host = test_host("secret", api.base_url());
         let result = host.list_repos(false, &[]);
         assert!(result.is_err(), "expected an error, got {result:?}");
         attacker_mock.assert_hits(0); // token never sent to the foreign host
@@ -802,7 +868,7 @@ mod tests {
                 {"full_name":"me/a","clone_url":"https://x/a.git","default_branch":"main","fork":false}
             ]));
         });
-        let host = GitHubHost { token: "secret".into(), base_url: api.base_url() };
+        let host = test_host("secret", api.base_url());
         let result = host.list_repos(false, &[]);
         assert!(result.is_err(), "expected an error, got {result:?}");
     }
@@ -837,7 +903,7 @@ mod tests {
                 {"name":"evil","commit":{"sha":"bbb"}}
             ]));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         let branches = host.list_branches("me/a").unwrap();
         assert_eq!(
             branches,
@@ -862,7 +928,7 @@ mod tests {
                 "truncated": true
             }));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         let tree = host.get_tree("me/a", "aaa").unwrap();
         assert!(tree.truncated);
         // Non-blob entries (type == "tree") are filtered out.
@@ -891,7 +957,7 @@ mod tests {
             when.method(GET).path("/repos/me/a/git/blobs/b2");
             then.status(200).json_body(serde_json::json!({"content": bin, "encoding": "base64"}));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         assert_eq!(host.get_blob("me/a", "b1").unwrap(), Some("hello world".to_string()));
         assert_eq!(host.get_blob("me/a", "b2").unwrap(), None); // non-UTF-8 → Ok(None)
     }
@@ -910,7 +976,7 @@ mod tests {
             when.method(GET).path("/repos/me/a/branches");
             then.status(200).json_body(serde_json::json!([]));
         });
-        let host = GitHubHost { token: "secret".into(), base_url: api.base_url() };
+        let host = test_host("secret", api.base_url());
         assert!(host.list_branches("me/a").is_err());
         attacker_mock.assert_hits(0);
     }
@@ -928,7 +994,7 @@ mod tests {
                 .header("x-ratelimit-reset", far.to_string())
                 .body("{}");
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         match host.list_branches("me/a") {
             Err(GithubError::RateLimited(m)) => {
                 assert!(m.contains("limited for ~"), "wait duration surfaced: {m}");
@@ -946,7 +1012,7 @@ mod tests {
             when.method(GET).path("/repos/me/a/branches");
             then.status(403).header("x-ratelimit-remaining", "0").body("{}");
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         match host.list_branches("me/a") {
             Err(GithubError::RateLimited(m)) => {
                 assert!(!m.contains("limited for ~"), "no wait hint, message: {m}");
@@ -999,11 +1065,31 @@ mod tests {
                 .header("x-ratelimit-remaining", "42")
                 .json_body(serde_json::json!({"message": "Resource not accessible by personal access token"}));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         match host.list_branches("me/a") {
             Err(GithubError::Http(m)) => assert!(m.contains("not accessible"), "message surfaced: {m}"),
             other => panic!("expected Http scope error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pace_slot_spaces_request_starts() {
+        use std::time::{Duration, Instant};
+        let spacing = Duration::from_millis(150);
+        let t0 = Instant::now();
+        // First request: next-allowed is in the past → start now, no wait.
+        let (wait, next) = pace_slot(t0, t0, spacing);
+        assert_eq!(wait, Duration::ZERO);
+        assert_eq!(next, t0 + spacing);
+        // Second request arrives immediately → waits the remaining slot.
+        let (wait2, next2) = pace_slot(next, t0, spacing);
+        assert_eq!(wait2, spacing);
+        assert_eq!(next2, t0 + spacing * 2);
+        // A late arrival (past the slot) starts immediately and resets from now.
+        let late = t0 + Duration::from_secs(5);
+        let (wait3, next3) = pace_slot(next2, late, spacing);
+        assert_eq!(wait3, Duration::ZERO);
+        assert_eq!(next3, late + spacing);
     }
 
     #[test]
@@ -1020,7 +1106,7 @@ mod tests {
                 .header("retry-after", "0")
                 .json_body(serde_json::json!({"message": "You have exceeded a secondary rate limit"}));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         match host.list_branches("me/a") {
             Err(GithubError::RateLimited(m)) => {
                 assert!(m.contains("secondary rate limit"), "GitHub message surfaced: {m}");
@@ -1029,6 +1115,7 @@ mod tests {
         }
         // Initial attempt + MAX_RATE_RETRIES retries all hit the server (backoff engaged).
         assert_eq!(mock.hits(), super::MAX_RATE_RETRIES + 1);
+        assert!(host.throttle_hint());
     }
 
     // ---- account audit host ----
@@ -1041,7 +1128,7 @@ mod tests {
                 .header("X-OAuth-Scopes", "repo, admin:public_key, workflow")
                 .json_body(serde_json::json!({"login": "me"}));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         assert_eq!(
             host.token_scopes().unwrap(),
             vec!["repo".to_string(), "admin:public_key".into(), "workflow".into()]
@@ -1055,7 +1142,7 @@ mod tests {
             when.method(GET).path("/user");
             then.status(200).json_body(serde_json::json!({"login": "me"}));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         assert!(host.token_scopes().unwrap().is_empty());
     }
 
@@ -1069,7 +1156,7 @@ mod tests {
                 {"id": 2, "title": "backdoor", "key": "ssh-rsa BBBB"}
             ]));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         let keys = host.list_ssh_keys().unwrap();
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].id, "1");
@@ -1088,7 +1175,7 @@ mod tests {
                 "runners": [{"id": 7, "name": "SHA1HULUD", "os": "Linux"}]
             }));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         assert_eq!(
             host.list_repo_runners("me/a").unwrap(),
             vec![Runner { id: "7".into(), name: "SHA1HULUD".into(), os: "Linux".into() }]
@@ -1104,7 +1191,7 @@ mod tests {
                 {"id": 5, "active": true, "events": ["push"], "config": {"url": "https://evil.host/collect"}}
             ]));
         });
-        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        let host = test_host("t", server.base_url());
         assert_eq!(
             host.list_repo_webhooks("me/a").unwrap(),
             vec![Webhook {
