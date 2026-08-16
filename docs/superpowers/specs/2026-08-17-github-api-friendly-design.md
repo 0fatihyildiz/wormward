@@ -99,8 +99,8 @@ scanned by the same detectors.
 1. Counting mock host: a repo with `size` above the threshold produces zero
    `list_branches`/`get_tree`/`get_blob` calls and is scanned via clone (findings present).
 2. A repo at/below the threshold keeps the REST path (calls observed).
-3. Message suffix: mock-server rate-limit test asserts `limited until` appears when a reset
-   hint exists, and is absent otherwise. `errors.test.ts` covers plain-limited,
+3. Message suffix: mock-server rate-limit test asserts `; limited for ~N min` appears when a
+   reset hint exists, and is absent otherwise. `errors.test.ts` covers plain-limited,
    limited-with-time, and scraping-flagged shapes.
 4. Pacer: pure spacing computation unit-tested; no timing-flaky assertions.
 5. Breaker: mock host with `throttle_hint() == true` → scan completes serially (behavioral:
