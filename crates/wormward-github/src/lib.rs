@@ -218,6 +218,7 @@ impl GitHubHost {
         // A far-off reset (true PRIMARY-quota exhaustion) has no cheap recovery, so give up fast.
         // The most recent rate-limit body message, surfaced if every retry is exhausted.
         let mut last_rl_msg: Option<String> = None;
+        let mut last_suffix: Option<String> = None;
         for _ in 0..=MAX_RATE_RETRIES {
             match ureq::get(url)
                 .set("Authorization", &format!("Bearer {}", self.token))
@@ -249,6 +250,10 @@ impl GitHubHost {
                         now_epoch_secs(),
                         MAX_RATE_WAIT_SECS,
                     );
+                    if let Some(s) = limited_suffix(retry_after.as_deref(), reset.as_deref(), now_epoch_secs() as u64)
+                    {
+                        last_suffix = Some(s);
+                    }
                     if let Some(msg) = resp.into_string().ok().as_deref().and_then(rate_limit_message) {
                         last_rl_msg = Some(msg);
                     }
@@ -256,7 +261,8 @@ impl GitHubHost {
                         Some(w) => std::thread::sleep(w),
                         None => {
                             let detail = last_rl_msg.unwrap_or_else(|| format!("HTTP {code}"));
-                            return Err(GithubError::RateLimited(format!("{detail} ({url})")));
+                            let suffix = last_suffix.unwrap_or_default();
+                            return Err(GithubError::RateLimited(format!("{detail}{suffix} ({url})")));
                         }
                     }
                 }
@@ -275,7 +281,8 @@ impl GitHubHost {
             }
         }
         let detail = last_rl_msg.unwrap_or_else(|| format!("rate limited after {MAX_RATE_RETRIES} retries"));
-        Err(GithubError::RateLimited(format!("{detail} ({url})")))
+        let suffix = last_suffix.unwrap_or_default();
+        Err(GithubError::RateLimited(format!("{detail}{suffix} ({url})")))
     }
 
     fn get(&self, url: &str) -> Result<(Option<String>, String), GithubError> {
@@ -378,6 +385,24 @@ fn retry_wait(
     };
     let secs = secs.max(0) as u64;
     (secs <= cap_secs).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Human wait-duration suffix for a RateLimited detail: `"; limited for ~N min"`, N =
+/// minutes until the hint rounds up (minimum 1 — a sub-minute or just-elapsed hint still
+/// means "about a minute", never silence). `Retry-After` (delta seconds) wins over
+/// `x-ratelimit-reset` (epoch seconds). None when no hint exists — the caller appends
+/// nothing rather than inventing a wait. A duration needs no timezone handling, which is
+/// why this is not a wall-clock time.
+fn limited_suffix(retry_after: Option<&str>, reset: Option<&str>, now_epoch: u64) -> Option<String> {
+    let secs: u64 = if let Some(ra) = retry_after.and_then(|s| s.trim().parse::<u64>().ok()) {
+        ra
+    } else if let Some(rs) = reset.and_then(|s| s.trim().parse::<u64>().ok()) {
+        rs.saturating_sub(now_epoch)
+    } else {
+        return None;
+    };
+    let mins = secs.div_ceil(60).max(1);
+    Some(format!("; limited for ~{mins} min"))
 }
 
 impl RepoHost for GitHubHost {
@@ -904,7 +929,30 @@ mod tests {
                 .body("{}");
         });
         let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
-        assert!(matches!(host.list_branches("me/a"), Err(GithubError::RateLimited(_))));
+        match host.list_branches("me/a") {
+            Err(GithubError::RateLimited(m)) => {
+                assert!(m.contains("limited for ~"), "wait duration surfaced: {m}");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_without_wait_hint_omits_duration_suffix() {
+        // 403 + exhausted quota but NEITHER Retry-After NOR x-ratelimit-reset: no wait hint exists,
+        // so the surfaced message must not claim one.
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/me/a/branches");
+            then.status(403).header("x-ratelimit-remaining", "0").body("{}");
+        });
+        let host = GitHubHost { token: "t".into(), base_url: server.base_url() };
+        match host.list_branches("me/a") {
+            Err(GithubError::RateLimited(m)) => {
+                assert!(!m.contains("limited for ~"), "no wait hint, message: {m}");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     #[test]
@@ -924,6 +972,20 @@ mod tests {
         assert_eq!(retry_wait(None, None, 1000, cap), None);
         // Retry-After takes precedence over reset.
         assert_eq!(retry_wait(Some("3"), Some("9999"), 1000, cap), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn limited_suffix_reports_minutes_rounded_up() {
+        // Retry-After (delta seconds) wins; 90s → 2 min.
+        assert_eq!(limited_suffix(Some("90"), None, 1000).as_deref(), Some("; limited for ~2 min"));
+        // Reset epoch: 1000 + 1859s → 31 min.
+        assert_eq!(limited_suffix(None, Some("2859"), 1000).as_deref(), Some("; limited for ~31 min"));
+        // Sub-minute waits floor at 1 min; a past reset also reports the 1-min minimum
+        // (the limit was JUST lifting — "~1 min" beats claiming nothing).
+        assert_eq!(limited_suffix(Some("5"), None, 1000).as_deref(), Some("; limited for ~1 min"));
+        assert_eq!(limited_suffix(None, Some("900"), 1000).as_deref(), Some("; limited for ~1 min"));
+        // No hint at all → no suffix.
+        assert_eq!(limited_suffix(None, None, 1000), None);
     }
 
     #[test]
