@@ -42,15 +42,17 @@ scanned by the same detectors.
 ### B. Honest rate-limit messages
 
 - In `call`'s two give-up paths (immediate far-off reset, and retries exhausted), append
-  `"; limited until HH:MM"` to the `RateLimited` detail when a `Retry-After` or
-  `x-ratelimit-reset` hint is available (local time, derived from the last captured hint).
-  No hint → detail unchanged.
-- Desktop `errors.ts`: extract `limited until HH:MM` from the raw error and surface it —
-  "GitHub rate limit reached — wormward paused and retried, but it's still limited until
-  HH:MM. Wait until then and try again." When the raw error contains GitHub's anti-scraping
-  wording (`scraping`), say instead: "GitHub has temporarily flagged this account's API
-  traffic. Wait until HH:MM, then scan fewer repos or orgs at once." Both fall back to the
-  current copy when no time is present. `errors.test.ts` updated for all three shapes.
+  `"; limited for ~N min"` to the `RateLimited` detail when a `Retry-After` or
+  `x-ratelimit-reset` hint is available (N = minutes until the hint, rounded up, minimum 1
+  — a duration needs no timezone handling, unlike a wall-clock time). No hint → detail
+  unchanged.
+- Desktop `errors.ts`: extract `limited for ~N min` from the raw error and surface it —
+  "GitHub rate limit reached — wormward paused and retried, but it's still limited for
+  about N more minutes. Wait and try again." When the raw error contains GitHub's
+  anti-scraping wording (`scraping`), say instead: "GitHub has temporarily flagged this
+  account's API traffic. Wait about N minutes, then scan fewer repos or orgs at once."
+  Both fall back to the current copy when no duration is present. `errors.test.ts` updated
+  for all three shapes.
 
 ### C. Pacing + circuit breaker
 
