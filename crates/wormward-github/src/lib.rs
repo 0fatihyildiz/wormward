@@ -451,10 +451,9 @@ fn retry_wait(
 fn limited_suffix(retry_after: Option<&str>, reset: Option<&str>, now_epoch: u64) -> Option<String> {
     let secs: u64 = if let Some(ra) = retry_after.and_then(|s| s.trim().parse::<u64>().ok()) {
         ra
-    } else if let Some(rs) = reset.and_then(|s| s.trim().parse::<u64>().ok()) {
-        rs.saturating_sub(now_epoch)
     } else {
-        return None;
+        let rs = reset.and_then(|s| s.trim().parse::<u64>().ok())?;
+        rs.saturating_sub(now_epoch)
     };
     let mins = secs.div_ceil(60).max(1);
     Some(format!("; limited for ~{mins} min"))

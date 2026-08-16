@@ -54,6 +54,16 @@ describe("humanizeError", () => {
     );
   });
 
+  it("does not flag a repo name containing 'scraping' in the request URL as the anti-scraping abuse case", () => {
+    expect(
+      humanizeError(
+        "API rate limit exceeded; limited for ~31 min (https://api.github.com/repos/me/web-scraping-kit)",
+      ),
+    ).toBe(
+      "GitHub rate limit reached — wormward paused and retried, but it's still limited for about 31 more minutes. Wait and try again.",
+    );
+  });
+
   it("maps network failures", () => {
     expect(humanizeError("failed to connect: connection timed out")).toBe(
       "Network error — couldn't reach the server. Check your connection and retry.",

@@ -9,8 +9,11 @@ export function humanizeError(e: unknown): string {
   const limited = s.match(/limited for ~(\d+) min/);
   // The anti-scraping flag is a different situation than quota: GitHub has judged the
   // traffic pattern abusive, so "try again" alone is bad advice — say what happened and
-  // how to avoid re-tripping it. Checked before the generic rate-limit mapping.
-  if (/scraping/i.test(s)) {
+  // how to avoid re-tripping it. Checked before the generic rate-limit mapping. Anchored
+  // on GitHub's actual phrase ("scraping GitHub"), not bare "scraping" — a RateLimited
+  // message embeds the request URL, which can contain a repo full name like
+  // "me/web-scraping-kit" and would otherwise misclassify a plain rate limit.
+  if (/scraping github/i.test(s)) {
     const wait = limited ? `Wait about ${limited[1]} minutes, then` : "Wait a while, then";
     return `GitHub has temporarily flagged this account's API traffic. ${wait} scan fewer repos or orgs at once.`;
   }

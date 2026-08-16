@@ -510,9 +510,16 @@ pub fn scan_pass_with_progress_cancellable(
     // eight workers independently backing off into a tripped secondary limit is exactly
     // the pattern that escalates to an account-level abuse flag.
     let serial = std::sync::Mutex::new(());
+    // Run-local record of "this run actually cancel-skipped a repo", independent of the
+    // shared `cancel` flag's state at the end of the run. The desktop clears that same
+    // flag at the START of every new scan, so a slow run's save gate could otherwise
+    // observe `cancel == false` even though THIS run produced cancel-skip placeholders
+    // earlier — poisoning the cache with never-scanned repos recorded as clean.
+    let saw_cancel = AtomicBool::new(false);
     let scan_one = |repo: &RepoRef| {
         // Cancelled: skip the network-heavy scan and report the repo clean.
         if cancel.load(Ordering::Relaxed) {
+            saw_cancel.store(true, Ordering::Relaxed);
             Ok(ScannedRepo {
                 repo: repo.clone(),
                 findings: Vec::new(),
@@ -559,10 +566,16 @@ pub fn scan_pass_with_progress_cancellable(
     // Only a successful, non-cancelled run's verdicts are trustworthy enough to cache: a
     // cancelled run reports skipped-as-clean placeholders for repos it never actually
     // looked at, and an Err (rate limit) already short-circuited before reaching here.
+    // Gated on the RUN-LOCAL `saw_cancel`, not the shared `cancel` flag: the desktop
+    // clears `cancel` at the start of the NEXT scan, so re-reading the shared flag here
+    // could see `false` even though this run produced cancel-skip placeholders earlier.
+    // A run that saw no cancellation is safe to save even if the shared flag was set
+    // (by a newer scan) and cleared again after this run finished — every repo in THIS
+    // run's results was genuinely scanned.
     // `save()` only runs when something was actually recorded: fixtures/hosts that never
     // supply `pushed_at` (e.g. tests without WORMWARD_CACHE_DIR set) record nothing, so
     // this never touches the real `~/.wormward` on a machine that hasn't opted in.
-    if !cancel.load(Ordering::Relaxed) {
+    if !saw_cancel.load(Ordering::Relaxed) {
         let mut new_cache = scan_cache;
         let mut recorded_any = false;
         for sr in scanned.iter().chain(skipped.iter()) {
@@ -2527,6 +2540,62 @@ mod tests {
         assert!(
             !cache_dir.join("github-scan-cache.json").exists(),
             "a cancelled run must not record 'clean' verdicts"
+        );
+        std::env::remove_var("WORMWARD_CACHE_DIR");
+    }
+
+    /// Reproduces the shared-flag race: the caller (desktop) clears the same `cancel`
+    /// flag it passed in as soon as a NEWER scan starts. If the save gate re-reads that
+    /// shared flag at the very end of a run, a repo that was genuinely cancel-skipped
+    /// earlier in THIS run gets recorded clean once the flag flips back to false before
+    /// the gate runs. `on_progress` fires right after each repo's placeholder/result is
+    /// produced (and before the save gate), so flipping `cancel` from inside it
+    /// deterministically reproduces "cleared after this run's cancel-skips, before this
+    /// run's save gate" without any real threads or timing. The fix must track that THIS
+    /// run saw a cancellation independently of the shared flag's later state.
+    #[test]
+    fn cleared_cancel_flag_after_skip_does_not_poison_cache() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        std::env::set_var("WORMWARD_CACHE_DIR", &cache_dir);
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/x".into(),
+                clone_url: "unused".into(),
+                default_branch: "main".into(),
+                fork: false,
+                size: 0,
+                pushed_at: Some("2026-08-17T00:00:00Z".into()),
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        // Cancelled before the first repo, like `cancelled_scan_writes_no_cache` — but this
+        // time a "newer scan started" clears the SAME flag from inside `on_progress`, which
+        // fires after the repo's cancel-skip placeholder is produced and before the save gate.
+        let cancel = AtomicBool::new(true);
+        let on_progress = |_p: ScanProgress| {
+            cancel.store(false, Ordering::Relaxed);
+        };
+        let _ = scan_pass_with_progress_cancellable(
+            &opts,
+            &host,
+            &builtin_packs(),
+            "",
+            &cancel,
+            &on_progress,
+        );
+        assert!(
+            !cache_dir.join("github-scan-cache.json").exists(),
+            "a run that cancel-skipped repos must not record 'clean' verdicts, even if the \
+             shared cancel flag is cleared (by a newer scan) before this run's save gate runs"
         );
         std::env::remove_var("WORMWARD_CACHE_DIR");
     }
