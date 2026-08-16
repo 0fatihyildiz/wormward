@@ -242,9 +242,10 @@ fn describe_action(a: &wormward_core::RemediationAction) -> String {
 ///       could not persist (temp clone / no push), or manual/branch-only findings.
 ///   2 — a repo errored and no unresolved findings remain to take precedence over it.
 /// A repo's findings only count as "resolved" when the cleaned default branch was actually
-/// force-pushed back to origin with no error; a local-only clone or a dry-run leaves origin
-/// infected, so it stays unresolved. (Auth/enumeration failures before the run are handled
-/// separately and also exit 2.)
+/// force-pushed back to origin with no error AND the repo needs no manual review; a
+/// local-only clone, a dry-run, or a repo that still needs manual review (even after a
+/// branch-tip push) leaves origin infected, so it stays unresolved. (Auth/enumeration
+/// failures before the run are handled separately and also exit 2.)
 fn github_exit_code(outcomes: &[wormward_github::pipeline::RepoOutcome]) -> u8 {
     let mut any_unresolved = false;
     let mut any_error = false;
@@ -253,11 +254,15 @@ fn github_exit_code(outcomes: &[wormward_github::pipeline::RepoOutcome]) -> u8 {
             any_error = true;
         }
         if !o.findings.is_empty() {
-            // Resolved only if a fix was pushed AND no non-remediable finding survives.
-            // Capability (campaign="generic"), npm, ioc and branch-only findings are never
-            // auto-fixed, so a push alone must not mark the repo clean.
-            let resolved =
-                o.error.is_none() && !o.pushed.is_empty() && o.findings.iter().all(|f| f.remediable);
+            // Resolved only if a fix was pushed, no non-remediable finding survives, AND
+            // no manual review is outstanding. `pushed` non-empty no longer implies the
+            // default branch was fixed: fix_branch_tips appends branch leaves to `pushed`
+            // and runs even when the default-branch fix bailed to manual review, so a
+            // branch-only push must not mark the repo clean while manual_review is set.
+            let resolved = o.error.is_none()
+                && !o.pushed.is_empty()
+                && o.findings.iter().all(|f| f.remediable)
+                && !o.manual_review;
             if !resolved {
                 any_unresolved = true;
             }
@@ -1200,5 +1205,17 @@ mod tests {
         // A repo failed to process (e.g. clone/auth) and left no unresolved findings.
         let outcomes = vec![outcome(vec![], Some("clone failed".into()))];
         assert_eq!(github_exit_code(&outcomes), 2);
+    }
+
+    #[test]
+    fn push_with_manual_review_exits_1() {
+        // Branch tips were force-pushed (`pushed` non-empty) and every finding is
+        // remediable, but the default branch bailed to manual review (soft-fail paths in
+        // fix_default_branch set manual_review=true with error=None). The default branch on
+        // origin is still infected — this must NOT be a false all-clear (regression guard).
+        let mut o = outcome(vec![finding()], None);
+        o.pushed = vec!["evil".into()];
+        o.manual_review = true;
+        assert_eq!(github_exit_code(&[o]), 1);
     }
 }

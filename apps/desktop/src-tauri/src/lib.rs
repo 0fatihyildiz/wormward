@@ -586,8 +586,10 @@ pub struct GithubRepoView {
     full_name: String,
     findings: usize,
     campaigns: Vec<String>,
-    /// True when the default working tree has an applicable remediation action — the only
-    /// repos `github_fix` can actually fix (branch-only infections are reported, not fixable).
+    /// True when the default working tree has an applicable remediation action, OR at least
+    /// one branch tip does — branch-only infected repos are fixable too (cleaned via the
+    /// branch path when pushing). Repos with nothing plannable at all (no working-tree
+    /// action and no cleanable branch tip) remain manual and are not fixable.
     fixable: bool,
 }
 
@@ -722,12 +724,15 @@ async fn github_fix(
             .filter(|o| sel.contains(&o.repo.full_name))
             .map(|o| GithubFixView {
                 // Mirror the CLI's per-repo resolution (github_exit_code): resolved only when a
-                // fix was actually pushed AND no non-remediable finding survives on origin —
-                // not merely "some actions ran". Otherwise the GUI reports `fixed` while a
-                // non-remediable infection is still live.
+                // fix was actually pushed, no non-remediable finding survives on origin, AND no
+                // manual review is outstanding — not merely "some actions ran". `pushed`
+                // non-empty no longer implies the default branch was fixed: a branch-tip clean
+                // can push while the default branch itself bailed to manual review, so that
+                // must not read as `fixed` either.
                 fixed: o.error.is_none()
                     && !o.pushed.is_empty()
-                    && o.findings.iter().all(|f| f.remediable),
+                    && o.findings.iter().all(|f| f.remediable)
+                    && !o.manual_review,
                 full_name: o.repo.full_name,
                 pushed: o.pushed,
                 actions: o.actions,

@@ -529,7 +529,14 @@ fn fix_scanned(
     // only when pushing — a rewritten tip in a throwaway clone that is never pushed
     // accomplishes nothing. Without --push, branch findings keep routing to manual review.
     let preview = plan_remediation(&sr.findings, packs);
-    let branch_preview = if opts.push {
+    // Gate on `sr.branch_fixable`, not merely `opts.push`: when the default branch is unknown
+    // (stale metadata, a rename race, or a serde-defaulted empty `default_branch`), EVERY
+    // finding is git_ref-stamped — including the branch that is actually checked out on clone
+    // — so `plan_branch_cleans` alone would be non-empty even though we cannot reliably tell
+    // default from non-default branches. Without this gate the fix path would force-push-
+    // rewrite branches (including the real default) without the default path's residual-
+    // verify safety, contradicting the scan-side rationale for `branch_fixable`.
+    let branch_preview = if opts.push && sr.branch_fixable {
         plan_branch_cleans(&sr.findings, packs, 0)
     } else {
         Vec::new()
@@ -2005,8 +2012,10 @@ mod tests {
     #[test]
     fn unknown_default_branch_with_remediable_branch_is_not_fixable() {
         // Regression: ensure that repos with unknown default branches are never marked as fixable,
-        // even if branch tips carry remediable findings. This safety guard prevents offering to
-        // "fix" repos where we cannot reliably distinguish default from non-default branches.
+        // even if branch tips carry remediable findings. This safety guard prevents both offering
+        // to "fix" repos where we cannot reliably distinguish default from non-default branches,
+        // AND the fix path itself from acting on them (see
+        // `unknown_default_branch_fix_does_not_rewrite_branches` below).
         let tmp = TempDir::new().unwrap();
         let bare = make_branch_only_infected_origin(&tmp, "unknown");
         let host = GitFakeHost {
@@ -2038,5 +2047,53 @@ mod tests {
             !scan.fixable_full_names(&builtin_packs()).contains(&"me/unknown".to_string()),
             "unknown default branch repos must not be fixable candidates"
         );
+    }
+
+    #[test]
+    fn unknown_default_branch_fix_does_not_rewrite_branches() {
+        // Regression: `fix_scanned` must gate branch cleaning on `sr.branch_fixable`, not
+        // merely on `opts.push`. A repo whose `default_branch` matches no listed branch stamps
+        // EVERY finding with a git_ref (including the branch that IS actually checked out on
+        // clone), so `plan_branch_cleans` alone is non-empty even though `branch_fixable` is
+        // false. With `selected: None` (the CLI's behavior for <2 candidates), the old gate
+        // force-push-rewrote every branch — including the real default — without the
+        // default-branch path's residual-verify safety. It must instead route to manual review
+        // and touch nothing.
+        let tmp = TempDir::new().unwrap();
+        let bare = make_branch_only_infected_origin(&tmp, "unknown-fix");
+        let before_main = bare_file(&bare, "main", "postcss.config.mjs");
+        let before_evil = bare_file(&bare, "evil", "postcss.config.mjs");
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/unknown-fix".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "trunk".into(), // does not exist; real branches are main + evil
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: true,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        assert!(!scan.repos()[0].branch_fixable, "precondition: not branch_fixable");
+
+        let outcomes = fix_pass(&scan, &opts, &builtin_packs(), "", None);
+        let o = &outcomes[0];
+
+        // Nothing on the bare origin was rewritten.
+        assert_eq!(bare_file(&bare, "main", "postcss.config.mjs"), before_main);
+        assert_eq!(bare_file(&bare, "evil", "postcss.config.mjs"), before_evil);
+        assert!(
+            bare_branches(&bare).iter().all(|b| !b.starts_with("wormward-backup/")),
+            "no backup branches should have been pushed: {:?}",
+            bare_branches(&bare)
+        );
+        assert!(o.pushed.is_empty(), "nothing should have been pushed: {:?}", o.pushed);
+        assert!(o.manual_review, "must route to manual review");
     }
 }
