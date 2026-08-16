@@ -1115,6 +1115,8 @@ mod tests {
             clone_url: "https://x/r.git".into(),
             default_branch: "main".into(),
             fork: false,
+            size: 0,
+            pushed_at: None,
         }
     }
 

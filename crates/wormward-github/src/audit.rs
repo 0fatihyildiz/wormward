@@ -287,6 +287,8 @@ mod tests {
             clone_url: String::new(),
             default_branch: "main".into(),
             fork: false,
+            size: 0,
+            pushed_at: None,
         }
     }
 

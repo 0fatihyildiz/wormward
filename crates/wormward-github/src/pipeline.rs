@@ -304,6 +304,15 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
 /// bursting hundreds of blob reads; a small repo under this stays on the cheaper API path.
 const BIG_TREE_BLOBS: usize = 300;
 
+/// Listing-reported repo size (KB) above which a repo is scanned via a shallow clone
+/// WITHOUT any per-repo REST calls. The clone rides git smart-HTTP, which does not draw
+/// on the REST core quota — so routing on the listing's free `size` field turns the
+/// scan's dominant cost (per-blob REST reads, the burst pattern that trips GitHub's
+/// anti-abuse heuristics) into ordinary CI-shaped git traffic. Only tiny repos, where a
+/// couple of REST calls are cheaper than a clone, stay on the API path; `tree_needs_clone`
+/// remains the second net for repos that are small on disk but dense in files.
+const CLONE_SIZE_KB: u64 = 64;
+
 /// How many repos to scan concurrently over the API. The scan is network-bound so some parallelism
 /// helps, but GitHub's secondary rate limit keys off concurrency + burstiness — so keep this modest
 /// (paired with `call`'s per-request backoff) rather than maximizing it. Lowered from an earlier,
@@ -339,6 +348,11 @@ fn api_scan_repo(
         auto_fixable: false,
         branch_fixable: false,
     };
+
+    // Clone-first: decided from the listing alone, before a single per-repo REST call.
+    if repo.size > CLONE_SIZE_KB {
+        return Ok(fallback_clone_scan(repo, packs, token));
+    }
 
     let branches = match host.list_branches(&repo.full_name) {
         Ok(b) => b,
@@ -901,6 +915,47 @@ mod tests {
         }
     }
 
+    /// Delegates to an inner GitFakeHost while counting per-repo API calls, so tests can
+    /// assert a scan path made ZERO per-repo REST calls (the whole point of clone-first).
+    struct CountingHost {
+        inner: GitFakeHost,
+        branches: std::sync::atomic::AtomicUsize,
+        trees: std::sync::atomic::AtomicUsize,
+        blobs: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingHost {
+        fn new(inner: GitFakeHost) -> Self {
+            Self {
+                inner,
+                branches: Default::default(),
+                trees: Default::default(),
+                blobs: Default::default(),
+            }
+        }
+    }
+
+    impl RepoHost for CountingHost {
+        fn list_repos(&self, f: bool, o: &[String]) -> Result<Vec<RepoRef>, GithubError> {
+            self.inner.list_repos(f, o)
+        }
+        fn list_orgs(&self) -> Result<Vec<String>, GithubError> {
+            self.inner.list_orgs()
+        }
+        fn list_branches(&self, n: &str) -> Result<Vec<Branch>, GithubError> {
+            self.branches.fetch_add(1, Ordering::Relaxed);
+            self.inner.list_branches(n)
+        }
+        fn get_tree(&self, n: &str, s: &str) -> Result<Tree, GithubError> {
+            self.trees.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_tree(n, s)
+        }
+        fn get_blob(&self, n: &str, s: &str) -> Result<Option<String>, GithubError> {
+            self.blobs.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_blob(n, s)
+        }
+    }
+
     /// Build an infected bare origin under `tmp` in a uniquely-named subdir so several
     /// can coexist in one test.
     fn make_infected_origin_named(tmp: &TempDir, name: &str) -> PathBuf {
@@ -1097,6 +1152,8 @@ mod tests {
             clone_url: bare.to_string_lossy().to_string(),
             default_branch: "main".into(),
             fork: false,
+            size: 0,
+            pushed_at: None,
         };
         let sr = fallback_clone_scan(&repo, &builtin_packs(), "");
         assert!(sr.error.is_none(), "unexpected error: {:?}", sr.error);
@@ -1120,6 +1177,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -1156,6 +1215,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -1192,6 +1253,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -1243,12 +1306,16 @@ mod tests {
                     clone_url: bare_branch_only.to_string_lossy().to_string(),
                     default_branch: "main".into(),
                     fork: false,
+                    size: 0,
+                    pushed_at: None,
                 },
                 RepoRef {
                     full_name: "me/wt".into(),
                     clone_url: bare_working_tree.to_string_lossy().to_string(),
                     default_branch: "main".into(),
                     fork: false,
+                    size: 0,
+                    pushed_at: None,
                 },
             ],
         };
@@ -1293,6 +1360,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -1337,6 +1406,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -1367,6 +1438,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -1430,6 +1503,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let scan = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "").unwrap();
@@ -1451,6 +1526,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let scan = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "").unwrap();
@@ -1498,6 +1575,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -1570,6 +1649,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -1642,6 +1723,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -1691,6 +1774,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "trunk".into(), // does not exist; real branches are main + evil
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
 
@@ -1726,12 +1811,16 @@ mod tests {
                     clone_url: bare_a.to_string_lossy().to_string(),
                     default_branch: "main".into(),
                     fork: false,
+                    size: 0,
+                    pushed_at: None,
                 },
                 RepoRef {
                     full_name: "me/b".into(),
                     clone_url: bare_b.to_string_lossy().to_string(),
                     default_branch: "main".into(),
                     fork: false,
+                    size: 0,
+                    pushed_at: None,
                 },
             ],
         };
@@ -1801,6 +1890,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -1889,6 +1980,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         }
     }
@@ -1947,6 +2040,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             });
         }
         let host = GitFakeHost { repos };
@@ -1985,6 +2080,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "main".into(),
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         // fix+push requested but NOT confirmed (`yes: false`) → dry run.
@@ -2024,6 +2121,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "trunk".into(), // does not exist; real branches are main + evil
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
 
@@ -2069,6 +2168,8 @@ mod tests {
                 clone_url: bare.to_string_lossy().to_string(),
                 default_branch: "trunk".into(), // does not exist; real branches are main + evil
                 fork: false,
+                size: 0,
+                pushed_at: None,
             }],
         };
         let opts = GithubRunOpts {
@@ -2095,5 +2196,66 @@ mod tests {
         );
         assert!(o.pushed.is_empty(), "nothing should have been pushed: {:?}", o.pushed);
         assert!(o.manual_review, "must route to manual review");
+    }
+
+    #[test]
+    fn big_repo_scans_via_clone_with_zero_per_repo_rest_calls() {
+        // A repo whose listing `size` exceeds CLONE_SIZE_KB must be scanned via one
+        // shallow clone (git transport — no REST quota) WITHOUT even a list_branches
+        // call. Detection coverage is unchanged: the clone scan still finds the payload.
+        let tmp = TempDir::new().unwrap();
+        let bare = make_infected_origin(&tmp);
+        let host = CountingHost::new(GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/big".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+                size: CLONE_SIZE_KB + 1,
+                pushed_at: None,
+            }],
+        });
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        assert_eq!(scan.infected_full_names(), vec!["me/big".to_string()]);
+        assert_eq!(host.branches.load(Ordering::Relaxed), 0, "list_branches must not be called");
+        assert_eq!(host.trees.load(Ordering::Relaxed), 0, "get_tree must not be called");
+        assert_eq!(host.blobs.load(Ordering::Relaxed), 0, "get_blob must not be called");
+    }
+
+    #[test]
+    fn small_repo_stays_on_the_rest_path() {
+        // At or below the threshold the cheap REST path is kept (no clone overhead for
+        // tiny repos): per-repo calls ARE made and the payload is still found.
+        let tmp = TempDir::new().unwrap();
+        let bare = make_infected_origin(&tmp);
+        let host = CountingHost::new(GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/small".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+                size: CLONE_SIZE_KB,
+                pushed_at: None,
+            }],
+        });
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        assert_eq!(scan.infected_full_names(), vec!["me/small".to_string()]);
+        assert!(host.branches.load(Ordering::Relaxed) > 0, "REST path must be used");
     }
 }

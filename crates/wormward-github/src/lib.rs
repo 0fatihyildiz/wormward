@@ -15,6 +15,15 @@ pub struct RepoRef {
     pub default_branch: String,
     #[serde(default)]
     pub fork: bool,
+    /// Bare-repo disk size in KB, from the repo listing. Drives clone-vs-REST scan
+    /// routing (a big repo scans via one shallow clone on git smart-HTTP instead of
+    /// hundreds of REST blob reads). Serde-defaulted: fixtures and old payloads read 0.
+    #[serde(default)]
+    pub size: u64,
+    /// Last-push timestamp from the repo listing (ISO 8601). Powers the clean-repo
+    /// rescan cache; never fetched separately.
+    #[serde(default)]
+    pub pushed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
