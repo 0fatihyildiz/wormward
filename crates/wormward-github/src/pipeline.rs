@@ -524,6 +524,13 @@ fn fix_scanned(
     // Dry run: report the actions that WOULD be applied. No clone, no writes.
     if !opts.yes {
         outcome.actions = preview.actions.iter().map(describe_action).collect();
+        // Branch cleans that WOULD run. Names come from the API findings' refs (`evil`);
+        // the applied path names come from the clone's remote-tracking refs (`origin/evil`).
+        for bp in &branch_preview {
+            for a in &bp.actions {
+                outcome.actions.push(format!("branch {}: {}", bp.branch, describe_action(a)));
+            }
+        }
         return outcome;
     }
 
@@ -1942,5 +1949,40 @@ mod tests {
         let mut names: Vec<&str> = ev.iter().map(|p| p.repo.as_str()).collect();
         names.sort();
         assert_eq!(names, vec!["me/a", "me/b", "me/c"]);
+    }
+
+    #[test]
+    fn dry_run_lists_branch_cleans_and_touches_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let bare = make_branch_only_infected_origin(&tmp, "dryrun");
+        let before = bare_file(&bare, "evil", "postcss.config.mjs");
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/dryrun".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        // fix+push requested but NOT confirmed (`yes: false`) → dry run.
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: false,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        let outcomes = fix_pass(&scan, &opts, &builtin_packs(), "", None);
+        let o = &outcomes[0];
+        assert!(
+            o.actions.iter().any(|a| a.starts_with("branch evil: ")),
+            "dry run must list the branch cleans: {:?}",
+            o.actions
+        );
+        assert!(o.pushed.is_empty());
+        assert_eq!(bare_file(&bare, "evil", "postcss.config.mjs"), before);
+        assert!(bare_branches(&bare).iter().all(|b| !b.starts_with("wormward-backup/")));
     }
 }
