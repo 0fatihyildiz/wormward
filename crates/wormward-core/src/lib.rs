@@ -32,8 +32,9 @@ pub use rules::{to_sigma, to_suricata, to_yara};
 pub use sarif::to_sarif;
 pub use git::{
     amend_head, branch_remote, commit_paths, create_ref, current_branch, delete_branch,
-    force_push_with_lease, force_push_with_lease_to, push, reflog_has_amend, rev_parse, update_ref,
-    verify_ref, worktree_add, worktree_add_new_branch, worktree_prune, worktree_remove,
+    fetch_all_remotes, force_push_with_lease, force_push_with_lease_to, push, reflog_has_amend,
+    rev_parse, update_ref, verify_ref, worktree_add, worktree_add_new_branch, worktree_prune,
+    worktree_remove,
 };
 pub use matchers::{shannon_entropy, sha256_hex, ContentSignature, SignatureKind};
 pub use pack::{CampaignAnalyzer, Pack, PackError, PackManifest, ScannedFile};

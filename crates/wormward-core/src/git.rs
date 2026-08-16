@@ -87,6 +87,16 @@ pub fn force_push_with_lease_to(repo: &Path, remote: &str, branch: &str) -> Resu
     run_git(repo, &["push", "--force-with-lease", "--no-verify", remote, "--", branch])
 }
 
+/// `git fetch --all` — bring every remote-tracking ref up to date so a branch scan sees the
+/// branches that exist on the remotes, not just the ones fetched whenever the user last synced
+/// (a worm's freshly-pushed branch is exactly the ref a stale clone is missing). Runs with the
+/// same hardening as every other git call: no hooks, no system config, and GIT_TERMINAL_PROMPT=0
+/// so a credential prompt fails fast instead of hanging a scan worker. Callers treat failure
+/// (offline, no auth) as non-fatal and scan the local refs they have.
+pub fn fetch_all_remotes(repo: &Path) -> Result<(), String> {
+    run_git(repo, &["fetch", "--all", "--quiet"])
+}
+
 /// Run git and capture trimmed stdout on success.
 fn run_git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
     let out = crate::proc::git()
@@ -205,6 +215,41 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn fetch_all_remotes_learns_new_remote_branch() {
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        // Seed clone publishes main…
+        let seed = tmp.path().join("seed");
+        git(tmp.path(), &["clone", "-q", origin.to_str().unwrap(), "seed"]);
+        std::fs::write(seed.join("f.txt"), "a").unwrap();
+        git(&seed, &["checkout", "-q", "-b", "main"]);
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-q", "-m", "c"]);
+        git(&seed, &["push", "-q", "-u", "origin", "main"]);
+        // …the local clone is taken NOW, before 'evil' exists…
+        git(tmp.path(), &["clone", "-q", origin.to_str().unwrap(), "local"]);
+        let local = tmp.path().join("local");
+        // …and 'evil' is pushed afterwards, so the local clone has never seen it.
+        git(&seed, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(seed.join("g.txt"), "b").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-q", "-m", "evil"]);
+        git(&seed, &["push", "-q", "origin", "evil"]);
+
+        assert!(
+            rev_parse(&local, "origin/evil").is_none(),
+            "fixture: the local clone must not know origin/evil yet"
+        );
+        fetch_all_remotes(&local).unwrap();
+        assert!(
+            rev_parse(&local, "origin/evil").is_some(),
+            "fetch must learn the remote's new branch"
+        );
     }
 
     #[test]

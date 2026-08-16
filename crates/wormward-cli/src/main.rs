@@ -563,8 +563,12 @@ fn main() -> ExitCode {
                 .filter_map(|repo| {
                     let findings = scan_repo(&repo, &packs);
                     let plan = plan_remediation(&findings, &packs);
-                    // Cross-branch: plan cleans for infected tips of other branches.
+                    // Cross-branch: plan cleans for infected tips of other branches. Fetch first
+                    // (best-effort; offline/no-auth degrades to the refs already present) so the
+                    // scan sees branches pushed since the user's last sync — a worm's freshly
+                    // pushed branch is exactly the ref a stale clone is missing.
                     let deep = if all_branches {
+                        let _ = wormward_core::fetch_all_remotes(&repo);
                         deep_scan_repo(&repo, &packs)
                     } else {
                         Vec::new()

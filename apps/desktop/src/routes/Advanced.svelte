@@ -588,8 +588,9 @@ args = ["mcp"]`;
       rewritten tips, overwriting remote history.
     </p>
     <p class="muted micro">
-      Scans the branches already in your local clones — it never contacts the remote. If a remote
-      scan flagged a branch you don't see here, run <code>git fetch</code> in that repo first.
+      Fetches each repo's remotes first, so branches pushed since your last sync are scanned too.
+      If a remote is unreachable (offline, no credentials), that repo's already-fetched branches
+      are still scanned.
     </p>
     {#if !app.dirs.length}
       <p class="muted small">Add a protected location in Settings to scan branches.</p>

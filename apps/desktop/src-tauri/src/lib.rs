@@ -462,6 +462,10 @@ async fn clean_branches_preview(dirs: Vec<String>) -> Result<BranchScanResult, S
         let per_repo: Vec<(Vec<BranchCleanPreview>, Vec<BranchManualFinding>)> = repos
             .par_iter()
             .map(|repo| {
+                // Best-effort: bring remote-tracking refs up to date so the scan sees branches
+                // pushed since the user's last fetch (a worm's fresh branch, exactly). Offline
+                // or auth failure degrades to scanning the refs already present.
+                let _ = wormward_core::fetch_all_remotes(repo);
                 let findings = deep_scan_repo(repo, &packs);
                 let plans = plan_branch_cleans(&findings, &packs, ts)
                     .into_iter()
@@ -525,6 +529,9 @@ async fn clean_branches_apply(
             .into_par_iter()
             .flat_map(|(repo_str, branches)| {
                 let repo = PathBuf::from(&repo_str);
+                // Same best-effort fetch as the preview: the re-derived plans must see the same
+                // refs the user just selected from (and any tip moved since).
+                let _ = wormward_core::fetch_all_remotes(&repo);
                 let findings = deep_scan_repo(&repo, &packs);
                 plan_branch_cleans(&findings, &packs, ts)
                     .into_iter()
@@ -912,6 +919,48 @@ mod tests {
             .expect("expected a plan for the infected 'evil' branch");
         assert!(evil.action_count >= 1);
         assert!(evil.backup_ref.starts_with("refs/wormward-backup/evil-"));
+    }
+
+    #[test]
+    fn clean_branches_preview_fetches_new_remote_branches() {
+        // The scenario the GitHub scan hands off: the worm pushed an infected branch to the
+        // remote AFTER the user's last fetch, so the local clone has no ref for it. The branch
+        // scan must fetch first — telling the user to `git fetch` every repo by hand defeats
+        // the point of the scanner.
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin.git");
+        fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        // Seed clone publishes a clean main…
+        let seed = tmp.path().join("seed");
+        git(tmp.path(), &["clone", "-q", origin.to_str().unwrap(), "seed"]);
+        git(&seed, &["checkout", "-q", "-b", "main"]);
+        fs::write(seed.join("postcss.config.mjs"), "export default {};\n").unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-q", "--no-verify", "-m", "clean"]);
+        git(&seed, &["push", "-q", "-u", "origin", "main"]);
+        // …the user's clone is taken NOW…
+        git(tmp.path(), &["clone", "-q", origin.to_str().unwrap(), "local"]);
+        let local = tmp.path().join("local");
+        // …and the worm pushes its infected branch afterwards.
+        git(&seed, &["checkout", "-q", "-b", "evil"]);
+        fs::write(
+            seed.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='8-270-2';\n(\"rmcej%otb%\",2857687)\n",
+        )
+        .unwrap();
+        git(&seed, &["commit", "-q", "--no-verify", "-am", "payload"]);
+        git(&seed, &["push", "-q", "origin", "evil"]);
+
+        let scan = tauri::async_runtime::block_on(clean_branches_preview(vec![local
+            .display()
+            .to_string()]))
+        .unwrap();
+        assert!(
+            scan.plans.iter().any(|p| p.branch == "origin/evil"),
+            "the scan must fetch and flag the remote's new infected branch: plans={:?}",
+            scan.plans.iter().map(|p| p.branch.clone()).collect::<Vec<_>>(),
+        );
     }
 
     #[test]

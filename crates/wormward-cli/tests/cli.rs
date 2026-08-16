@@ -181,6 +181,53 @@ fn scan_deep_flags_payload_on_other_branch() {
 }
 
 #[test]
+fn clean_all_branches_fetches_new_remote_branch() {
+    // A worm pushes an infected branch to the remote AFTER the user's last fetch: the local
+    // clone has no ref for it, so `clean --all-branches` must fetch before scanning — the
+    // GitHub scan told the user this branch is infected, and requiring a manual `git fetch`
+    // per repo would leave the cleaner blind.
+    use std::process::Command as Cmd;
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let st = Cmd::new("git").arg("-C").arg(repo).args(args)
+            .env("GIT_TEMPLATE_DIR", "")
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+            .status().unwrap();
+        assert!(st.success());
+    }
+    let tmp = TempDir::new().unwrap();
+    let origin = tmp.path().join("origin.git");
+    fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    // Seed clone publishes a clean main…
+    let seed = tmp.path().join("seed");
+    git(tmp.path(), &["clone", "-q", origin.to_str().unwrap(), "seed"]);
+    git(&seed, &["checkout", "-q", "-b", "main"]);
+    fs::write(seed.join("readme.md"), "clean").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "--no-verify", "-m", "clean"]);
+    git(&seed, &["push", "-q", "-u", "origin", "main"]);
+    // …the user's clone is taken NOW (in its own dir so only IT gets scanned)…
+    let scan_dir = tmp.path().join("scan");
+    fs::create_dir_all(&scan_dir).unwrap();
+    git(&scan_dir, &["clone", "-q", origin.to_str().unwrap(), "local"]);
+    // …and the worm pushes its infected branch afterwards.
+    git(&seed, &["checkout", "-q", "-b", "evil"]);
+    fs::write(seed.join("temp_auto_push.bat"), "@echo off").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "--no-verify", "-m", "payload"]);
+    git(&seed, &["push", "-q", "origin", "evil"]);
+
+    let out = bin().arg("clean").arg("--all-branches").arg(&scan_dir).output().unwrap();
+    assert_eq!(out.status.code(), Some(1)); // dry run with plans
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("branch origin/evil:"),
+        "must fetch and plan the remote's new infected branch:\n{stdout}"
+    );
+}
+
+#[test]
 fn clean_dry_run_reports_without_changing() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().join("v");
