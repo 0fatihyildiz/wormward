@@ -935,11 +935,11 @@ fn main() -> ExitCode {
             }
 
             // Selection only matters when we will actually write (fix/push + yes). A
-            // dry-run never prompts. Only offer repos that `fix_pass` can actually
-            // remediate (a working-tree action on the default branch); repos infected
-            // only on other branches are still reported but not selectable. With >1 such
-            // repo, let the user deselect any to leave alone; JSON output or no TTY keeps
-            // all.
+            // dry-run never prompts. Offer every repo `fix_pass` can remediate: a
+            // working-tree action on the default branch or a cleanable branch tip. Repos
+            // with nothing plannable are still reported but not selectable. With >1
+            // candidate, let the user deselect any to leave alone; JSON output or no TTY
+            // keeps all.
             // Reflect the post-downgrade reality: `opts.yes` is cleared above when a fix
             // cannot persist, so a non-persistent `--fix --yes` is treated as a dry-run here.
             let writes = opts.yes && opts.fix;

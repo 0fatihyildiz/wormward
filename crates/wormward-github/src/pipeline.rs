@@ -131,6 +131,14 @@ pub struct ScannedRepo {
     /// alone (`is_infected`) does NOT imply this: a repo flagged by a non-marker signature
     /// (a bare C2 address, a dot-notation variant) is infected but not auto-strippable.
     pub auto_fixable: bool,
+    /// True when at least one branch-tip finding (`git_ref` set) is remediable — the scan
+    /// stamped `remediable` against that tip's actual content, so a plannable strip exists.
+    /// Such repos are fixable via the branch cleaner when pushing.
+    pub branch_fixable: bool,
+    /// True when the declared default branch was successfully found and scanned. Distinguishes
+    /// "branch-only infection with known default" from "unknown default branch". A repo with
+    /// an unknown default branch is not branch-fixable even if branch tips are remediable.
+    pub found_default_branch: bool,
 }
 
 impl ScannedRepo {
@@ -180,17 +188,14 @@ impl ScanPass {
             .collect()
     }
 
-    /// `full_name`s of infected repos whose *default working tree* has at least one
-    /// applicable remediation action — the only repos `fix_scanned` can actually fix, and
-    /// therefore the only sensible candidates for interactive selection.
-    ///
-    /// A repo infected solely on a non-default branch has findings but no working-tree
-    /// action (`plan_remediation` routes branch-tip findings, which carry a `git_ref`, to
-    /// `manual`), so it is excluded here even though it remains in the scan results/output.
+    /// `full_name`s of infected repos the fix pass can actually remediate: a working-tree
+    /// action on the default branch (`auto_fixable`) OR a cleanable branch tip
+    /// (`branch_fixable`, applied when pushing). Repos with neither (nothing plannable at
+    /// all) stay in the scan results but are not selection candidates.
     pub fn fixable_full_names(&self, _packs: &[Pack]) -> Vec<String> {
         self.repos
             .iter()
-            .filter(|r| r.is_infected() && r.auto_fixable)
+            .filter(|r| r.is_infected() && (r.auto_fixable || r.branch_fixable))
             .map(|r| r.repo.full_name.clone())
             .collect()
     }
@@ -258,7 +263,7 @@ fn clone_repo(
 /// clone is deleted on return; a later fix re-clones like any other repo.
 fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRepo {
     let mut out =
-        ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None, auto_fixable: false };
+        ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None, auto_fixable: false, branch_fixable: false, found_default_branch: true };
     let tmp = match tempfile::TempDir::new() {
         Ok(t) => t,
         Err(e) => {
@@ -285,6 +290,7 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
     for f in &mut findings {
         f.repo = label.clone();
     }
+    out.branch_fixable = findings.iter().any(|f| f.git_ref.is_some() && f.remediable);
     out.findings = findings;
     out
 }
@@ -326,7 +332,7 @@ fn api_scan_repo(
     token: &str,
 ) -> Result<ScannedRepo, GithubError> {
     let mut out =
-        ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None, auto_fixable: false };
+        ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None, auto_fixable: false, branch_fixable: false, found_default_branch: false };
 
     let branches = match host.list_branches(&repo.full_name) {
         Ok(b) => b,
@@ -350,6 +356,7 @@ fn api_scan_repo(
     let mut tips: Vec<(String, Option<String>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     if let Some(default) = branches.iter().find(|b| b.name == repo.default_branch) {
+        out.found_default_branch = true;
         seen.insert(default.commit_sha.clone());
         tips.push((default.commit_sha.clone(), None));
     }
@@ -398,6 +405,9 @@ fn api_scan_repo(
             return Ok(out);
         }
         out.findings.extend(findings);
+    }
+    if out.found_default_branch {
+        out.branch_fixable = out.findings.iter().any(|f| f.git_ref.is_some() && f.remediable);
     }
     Ok(out)
 }
@@ -455,6 +465,8 @@ pub fn scan_pass_with_progress_cancellable(
                         findings: Vec::new(),
                         error: None,
                         auto_fixable: false,
+                        branch_fixable: false,
+                        found_default_branch: false,
                     })
                 } else {
                     api_scan_repo(repo, host, packs, &cache, token)
@@ -1202,11 +1214,11 @@ mod tests {
     }
 
     #[test]
-    fn branch_only_infection_is_reported_but_not_a_fix_candidate() {
+    fn branch_only_infection_is_a_fix_candidate() {
         // Two infected repos: one infected only on a non-default branch, one infected in
         // its default working tree. Both must appear in the scan results (infected list),
-        // but only the working-tree one is a fixable-selection candidate — offering the
-        // branch-only repo would be a no-op since fix_scanned only touches the default tree.
+        // and both are fixable-selection candidates: the branch-only repo can be fixed when
+        // pushing (the fix pass cleans branch tips when pushing).
         let tmp = TempDir::new().unwrap();
         let bare_branch_only = make_branch_only_infected_origin(&tmp, "branchonly");
         let bare_working_tree = make_infected_origin_named(&tmp, "wt");
@@ -1243,13 +1255,11 @@ mod tests {
         infected.sort();
         assert_eq!(infected, vec!["me/branchonly".to_string(), "me/wt".to_string()]);
 
-        // ...but only the working-tree-infected repo is a fixable-selection candidate.
-        let fixable = scan.fixable_full_names(&builtin_packs());
-        assert_eq!(
-            fixable,
-            vec!["me/wt".to_string()],
-            "branch-only infection must not be offered as a fixable candidate"
-        );
+        // Branch-only repos are now fixable too: the fix pass cleans branch tips when
+        // pushing, so they are legitimate selection candidates alongside working-tree repos.
+        let mut fixable = scan.fixable_full_names(&builtin_packs());
+        fixable.sort();
+        assert_eq!(fixable, vec!["me/branchonly".to_string(), "me/wt".to_string()]);
     }
 
     #[test]
