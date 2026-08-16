@@ -540,7 +540,7 @@ async fn clean_branches_apply(
             })
             .collect();
 
-        apply_branch_cleans(&plans, false, push)
+        apply_branch_cleans(&plans, false, push, &packs)
     })
     .await
     .map_err(|e| e.to_string())?;

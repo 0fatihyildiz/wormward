@@ -166,12 +166,14 @@ fn create_unique_backup_ref(repo: &std::path::Path, base: &str, old_oid: &str) -
 
 /// Apply branch-clean plans. When `dry_run`, every plan reports `Planned` and nothing is
 /// touched. Otherwise, for each plan: back up the tip ref, add a temp worktree on the
-/// branch, run the working-tree remediation there, commit, optionally force-push (scoped to
-/// that branch), and ALWAYS tear the worktree down.
+/// branch, run the working-tree remediation there, re-scan for residual payload (the same
+/// safety property the default-branch path enforces), commit, optionally force-push (scoped
+/// to that branch), and ALWAYS tear the worktree down. `packs` drives the residual re-scan.
 pub fn apply_branch_cleans(
     plans: &[BranchCleanPlan],
     dry_run: bool,
     push: bool,
+    packs: &[Pack],
 ) -> Vec<BranchCleanOutcome> {
     plans
         .iter()
@@ -179,14 +181,14 @@ pub fn apply_branch_cleans(
             let status = if dry_run {
                 BranchCleanStatus::Planned
             } else {
-                clean_branch(plan, push)
+                clean_branch(plan, push, packs)
             };
             BranchCleanOutcome { plan: plan.clone(), status }
         })
         .collect()
 }
 
-fn clean_branch(plan: &BranchCleanPlan, push: bool) -> BranchCleanStatus {
+fn clean_branch(plan: &BranchCleanPlan, push: bool, packs: &[Pack]) -> BranchCleanStatus {
     let repo = &plan.repo;
     let branch = &plan.branch;
 
@@ -259,7 +261,7 @@ fn clean_branch(plan: &BranchCleanPlan, push: bool) -> BranchCleanStatus {
     // Run the clean only if the worktree was added, but ALWAYS tear down — including on add
     // failure, which can still leave a dir and/or a `.git/worktrees/<name>` admin entry.
     let status = match add {
-        Ok(()) => clean_in_worktree(&wt, plan, &backup_ref, push, &mode),
+        Ok(()) => clean_in_worktree(&wt, plan, &backup_ref, push, &mode, packs),
         Err(e) => BranchCleanStatus::Failed(format!("worktree add failed: {e}")),
     };
     teardown(repo, &wt, &mode);
@@ -287,12 +289,27 @@ fn clean_in_worktree(
     backup_ref: &str,
     push: bool,
     mode: &CleanMode,
+    packs: &[Pack],
 ) -> BranchCleanStatus {
     // The backup ref already covers rollback, so skip the on-disk backup dir.
     let res = remediate::apply(wt, &plan.actions, false);
     if res.applied.is_empty() {
         return BranchCleanStatus::Skipped("no actions applied to branch tip".into());
     }
+
+    // SECURITY: verify the strip actually removed the payload before committing (let alone
+    // pushing) anything — mirrors the default-branch path's residual-verify, "the critical
+    // safety property of the whole pipeline". `strip_after_marker` cuts from the marker
+    // onward, but a signature (e.g. a C2 address) sitting BEFORE the marker survives; without
+    // this check that file would be committed and force-pushed as "cleaned" while still
+    // infected. The backup ref (already created) is left in place — it is create-only and
+    // harmless, and is the recovery path if the branch was already worse off.
+    if crate::scanner::scan_repo(wt, packs).iter().any(|f| f.git_ref.is_none()) {
+        return BranchCleanStatus::Failed(
+            "residual detection after strip — manual review".into(),
+        );
+    }
+
     let paths: Vec<PathBuf> = res.applied.iter().map(|a| a.target().to_path_buf()).collect();
     let msg = format!("wormward: clean {}", plan.branch);
     if let Err(e) = crate::git::commit_paths(wt, &msg, &paths) {
@@ -497,7 +514,7 @@ mod tests {
         let plans = plan_branch_cleans(&deep, &packs, 12345);
         assert_eq!(plans.len(), 1);
 
-        let outcomes = apply_branch_cleans(&plans, false, false);
+        let outcomes = apply_branch_cleans(&plans, false, false, &packs);
         assert_eq!(outcomes.len(), 1);
         assert!(
             matches!(outcomes[0].status, BranchCleanStatus::Cleaned { .. }),
@@ -618,13 +635,13 @@ mod tests {
         assert_eq!(plans.len(), 1);
 
         // Dry run: report Planned, mutate NOTHING (no commit, no backup ref).
-        let outcomes = apply_branch_cleans(&plans, true, false);
+        let outcomes = apply_branch_cleans(&plans, true, false, &packs);
         assert!(matches!(outcomes[0].status, BranchCleanStatus::Planned));
         assert_eq!(git_stdout(&repo, &["rev-parse", "evil"]), infected_oid);
         assert!(!crate::git::verify_ref(&repo, "refs/wormward-backup/evil-777"));
 
         // For real: it commits and creates the backup ref.
-        let outcomes = apply_branch_cleans(&plans, false, false);
+        let outcomes = apply_branch_cleans(&plans, false, false, &packs);
         assert!(matches!(
             outcomes[0].status,
             BranchCleanStatus::Cleaned { pushed: false, .. }
@@ -696,7 +713,7 @@ mod tests {
                 markers: vec!["global['!']=".into()],
                 strip_lines: vec![],            }],
         }];
-        let outcomes = apply_branch_cleans(&plans, false, true);
+        let outcomes = apply_branch_cleans(&plans, false, true, &[strip_pack()]);
         assert!(
             matches!(outcomes[0].status, BranchCleanStatus::Cleaned { pushed: true, .. }),
             "expected Cleaned+pushed, got {:?}",
@@ -753,7 +770,7 @@ mod tests {
                 markers: vec!["global['!']=".into()],
                 strip_lines: vec![],            }],
         }];
-        let outcomes = apply_branch_cleans(&plans, false, false);
+        let outcomes = apply_branch_cleans(&plans, false, false, &[strip_pack()]);
         assert!(
             matches!(outcomes[0].status, BranchCleanStatus::Skipped(_)),
             "expected Skipped, got {:?}",
@@ -766,5 +783,62 @@ mod tests {
         // No throwaway branch left behind.
         let branches = git_stdout(&work, &["branch", "--list", "wormward-clean-*"]);
         assert!(branches.is_empty(), "throwaway branch lingered: {branches}");
+    }
+
+    #[test]
+    fn residual_signature_before_marker_blocks_commit_and_push() {
+        // A signature sitting BEFORE the strip marker survives `strip_after_marker` (which cuts
+        // from the marker onward, not before it). Committing/pushing that would flag a
+        // still-infected file as "cleaned" — the default-branch path enforces exactly this via
+        // a post-strip residual re-scan (its "critical safety property of the whole pipeline");
+        // branch cleans must have the same guard (regression guard for its absence).
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("origin.git");
+        let work = tmp.path().join("work");
+        Command::new("git").args(["init", "--bare", "-q"]).arg(&remote).status().unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("postcss.config.mjs"), "export default {};\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "clean"]);
+        git(&work, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&work, &["push", "-q", "-u", "origin", "main"]);
+        git(&work, &["checkout", "-q", "-b", "evil"]);
+        // Signature ('rmcej%otb%') BEFORE the marker ('global[\'!\']=') — strip_after_marker
+        // cuts from the marker onward, so the signature survives the strip.
+        std::fs::write(
+            work.join("postcss.config.mjs"),
+            "var x='rmcej%otb%';\nexport default {};\nglobal['!']='8';",
+        )
+        .unwrap();
+        git(&work, &["commit", "-q", "-am", "payload"]);
+        git(&work, &["push", "-q", "-u", "origin", "evil"]);
+        let infected_oid = git_stdout(&work, &["rev-parse", "origin/evil"]);
+        git(&work, &["checkout", "-q", "main"]);
+        git(&work, &["branch", "-D", "evil"]);
+
+        let plans = vec![BranchCleanPlan {
+            repo: work.clone(),
+            branch: "origin/evil".into(),
+            backup_ref: "refs/wormward-backup/origin/evil-1".into(),
+            actions: vec![RemediationAction::StripPayload {
+                file: PathBuf::from("postcss.config.mjs"),
+                markers: vec!["global['!']=".into()],
+                strip_lines: vec![],            }],
+        }];
+        let outcomes = apply_branch_cleans(&plans, false, true, &[strip_pack()]);
+        assert!(
+            !matches!(outcomes[0].status, BranchCleanStatus::Cleaned { .. }),
+            "must not report Cleaned when a residual signature survives the strip: {:?}",
+            outcomes[0].status
+        );
+
+        // Nothing was pushed: the remote's 'evil' tip is byte-identical to before.
+        assert_eq!(git_stdout(&work, &["rev-parse", "origin/evil"]), infected_oid);
+        let remote_content = git_stdout(&remote, &["show", "evil:postcss.config.mjs"]);
+        assert!(
+            remote_content.contains("rmcej%otb%"),
+            "remote must still carry the signature (nothing pushed): {remote_content}"
+        );
     }
 }

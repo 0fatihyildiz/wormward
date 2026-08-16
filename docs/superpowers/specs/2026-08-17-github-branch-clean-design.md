@@ -48,10 +48,16 @@ force-pushed history rewrites; copy is updated to name branch tips explicitly.
      `refs/heads/wormward-backup/<leaf>-<ts>` (leaf = branch name without the `origin/`
      prefix). The clone is deleted after the run, so a local backup ref would be a lie.
      A failed backup push skips that branch (mirrors the default-branch behavior).
-   - Apply via `apply_branch_cleans(plans, dry_run=false, push=true)` — isolated worktrees,
-     strip-and-verify, per-branch `--force-with-lease`, all reused as-is. In a fresh clone
-     every planned branch is a remote-tracking ref, which `apply_branch_cleans` pushes to the
-     remote's real branch.
+   - Apply via `apply_branch_cleans(plans, dry_run=false, push=true, packs)` — isolated
+     worktrees, per-branch `--force-with-lease`, all reused as-is. In a fresh clone every
+     planned branch is a remote-tracking ref, which `apply_branch_cleans` pushes to the
+     remote's real branch. `apply_branch_cleans` now also strip-and-VERIFIES: after applying
+     the actions in the worktree and before committing, it re-scans the worktree
+     (`scan_repo(wt, packs)`) — the same residual-verify safety property the default-branch
+     path has always had. A signature sitting before the strip marker (surviving
+     `strip_after_marker`, which cuts from the marker onward) makes the worktree scan
+     non-empty; the clean then reports `BranchCleanStatus::Failed(...)` and neither commits
+     nor pushes. The already-created backup ref is left in place (create-only, harmless).
 4. **Reporting** reuses `RepoOutcome`'s existing fields: cleaned branches append to `actions`
    (human-readable "cleaned branch origin/evil: …" lines) and their leaf names to `pushed`;
    the first branch failure goes to `error`. Unplannable branch findings

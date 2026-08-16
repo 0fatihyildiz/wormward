@@ -706,7 +706,7 @@ fn fix_branch_tips(
             }
             continue;
         }
-        for bo in apply_branch_cleans(&[plan], false, true) {
+        for bo in apply_branch_cleans(&[plan], false, true, packs) {
             match bo.status {
                 BranchCleanStatus::Cleaned { pushed: true, .. } => {
                     outcome.actions.push(format!("cleaned branch {}", bo.plan.branch));

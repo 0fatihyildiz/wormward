@@ -766,7 +766,7 @@ fn main() -> ExitCode {
                     // destructive and gated behind --yes exactly like the working-tree
                     // commit/push path. Without --yes it runs as a dry-run (plan only,
                     // no commits/refs). Force-push only with BOTH --push and --yes.
-                    let outcomes = apply_branch_cleans(&w.branch_plans, !yes, do_push && yes);
+                    let outcomes = apply_branch_cleans(&w.branch_plans, !yes, do_push && yes, &packs);
                     for o in &outcomes {
                         match &o.status {
                             BranchCleanStatus::Cleaned { backup_ref, pushed } => println!(
