@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub mod audit;
 pub mod pipeline;
 pub mod api_tree;
+pub mod scan_cache;
 
 // Serialize is required because RepoOutcome (pipeline) serializes an embedded RepoRef.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

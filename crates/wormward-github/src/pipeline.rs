@@ -15,6 +15,7 @@ use wormward_core::{
 };
 
 use crate::api_tree::{ApiTree, BlobCache};
+use crate::scan_cache;
 use crate::{GithubError, RepoHost, RepoRef, Tree};
 
 #[derive(Debug, Clone)]
@@ -166,6 +167,9 @@ fn is_auto_fixable(findings: &[Finding], packs: &[Pack], read: impl Fn(&Path) ->
 #[derive(Debug)]
 pub struct ScanPass {
     repos: Vec<ScannedRepo>,
+    /// Repos skipped this run because the clean-repo rescan cache found them clean and
+    /// unchanged (`pushed_at` matched the last completed scan's verdict).
+    skipped_unchanged: usize,
 }
 
 impl ScanPass {
@@ -173,6 +177,12 @@ impl ScanPass {
     /// their own per-repo view from the raw scan results.
     pub fn repos(&self) -> &[ScannedRepo] {
         &self.repos
+    }
+
+    /// How many repos this run skipped because the rescan cache found them clean and
+    /// unchanged since the last completed scan.
+    pub fn skipped_unchanged(&self) -> usize {
+        self.skipped_unchanged
     }
 
     /// `full_name`s of every infected repo (working-tree OR branch-only), for reporting.
@@ -473,6 +483,29 @@ pub fn scan_pass_with_progress_cancellable(
     let total = repos.len();
     let cache = BlobCache::new();
     let done_counter = AtomicUsize::new(0);
+
+    // Clean-repo rescan cache: a repo recorded clean by a prior COMPLETED scan, whose
+    // listing `pushed_at` is unchanged, needs no API calls at all this run.
+    let fingerprint = scan_cache::packs_fingerprint(packs);
+    let scan_cache = scan_cache::ScanCache::load(&fingerprint);
+    let (skip_repos, to_scan): (Vec<RepoRef>, Vec<RepoRef>) = repos
+        .into_iter()
+        .partition(|r| scan_cache.is_clean_unchanged(&r.full_name, r.pushed_at.as_deref()));
+    let skipped: Vec<ScannedRepo> = skip_repos
+        .into_iter()
+        .map(|repo| {
+            let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            on_progress(ScanProgress { done, total, repo: repo.full_name.clone() });
+            ScannedRepo {
+                repo,
+                findings: Vec::new(),
+                error: None,
+                auto_fixable: false,
+                branch_fixable: false,
+            }
+        })
+        .collect();
+
     // Once the host reports throttling, the rest of the run goes one-repo-at-a-time:
     // eight workers independently backing off into a tripped secondary limit is exactly
     // the pattern that escalates to an account-level abuse flag.
@@ -494,7 +527,7 @@ pub fn scan_pass_with_progress_cancellable(
     // `collect::<Result<Vec<_>, _>>()` lets rayon short-circuit cooperatively on the
     // first Err (a rate limit) instead of scanning every repo before propagating it.
     let scan_all = || {
-        repos
+        to_scan
             .par_iter()
             .map(|repo| {
                 let result = if host.throttle_hint() {
@@ -516,13 +549,39 @@ pub fn scan_pass_with_progress_cancellable(
     // GitHub's ~100-concurrent ceiling and paired with per-request backoff in `call`) so the sweep
     // stays fast without provoking the limit. A pool-build failure falls back to the global pool.
     let scanned = match rayon::ThreadPoolBuilder::new()
-        .num_threads(total.clamp(1, GITHUB_SCAN_CONCURRENCY))
+        .num_threads(to_scan.len().clamp(1, GITHUB_SCAN_CONCURRENCY))
         .build()
     {
         Ok(pool) => pool.install(scan_all),
         Err(_) => scan_all(),
     }?;
-    Ok(ScanPass { repos: scanned })
+
+    // Only a successful, non-cancelled run's verdicts are trustworthy enough to cache: a
+    // cancelled run reports skipped-as-clean placeholders for repos it never actually
+    // looked at, and an Err (rate limit) already short-circuited before reaching here.
+    // `save()` only runs when something was actually recorded: fixtures/hosts that never
+    // supply `pushed_at` (e.g. tests without WORMWARD_CACHE_DIR set) record nothing, so
+    // this never touches the real `~/.wormward` on a machine that hasn't opted in.
+    if !cancel.load(Ordering::Relaxed) {
+        let mut new_cache = scan_cache;
+        let mut recorded_any = false;
+        for sr in scanned.iter().chain(skipped.iter()) {
+            if sr.findings.is_empty() && sr.error.is_none() {
+                if let Some(pushed_at) = sr.repo.pushed_at.as_deref() {
+                    new_cache.record_clean(&sr.repo.full_name, pushed_at);
+                    recorded_any = true;
+                }
+            }
+        }
+        if recorded_any {
+            new_cache.save();
+        }
+    }
+
+    let skipped_unchanged = skipped.len();
+    let mut all_repos = skipped;
+    all_repos.extend(scanned);
+    Ok(ScanPass { repos: all_repos, skipped_unchanged })
 }
 
 /// Remediate one scanned repo. Dry runs (`!opts.yes`) plan from the API-scan
@@ -2331,5 +2390,144 @@ mod tests {
         let mut infected = scan.infected_full_names();
         infected.sort();
         assert_eq!(infected, vec!["me/ta".to_string(), "me/tb".to_string()]);
+    }
+
+    // ---- clean-repo rescan cache -------------------------------------------------------
+
+    /// Guards the process-global `WORMWARD_CACHE_DIR` env var: cargo tests run threaded, so
+    /// without this an env-mutating test could interleave with another test reading the
+    /// same var. Only the cache tests below touch the env, so a single lock here suffices.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn second_scan_skips_unchanged_clean_repo_with_zero_calls() {
+        // First completed scan records the clean repo; the second scan must skip it
+        // without a single per-repo API call. WORMWARD_CACHE_DIR isolates the cache.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        std::env::set_var("WORMWARD_CACHE_DIR", &cache_dir);
+        // Clean bare origin (no payload).
+        let src = tmp.path().join("clean-src");
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("readme.md"), "clean").unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "clean"]);
+        let bare = tmp.path().join("clean.git");
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+
+        let make_host = || {
+            CountingHost::new(GitFakeHost {
+                repos: vec![RepoRef {
+                    full_name: "me/cached".into(),
+                    clone_url: bare.to_string_lossy().to_string(),
+                    default_branch: "main".into(),
+                    fork: false,
+                    size: 0,
+                    pushed_at: Some("2026-08-17T00:00:00Z".into()),
+                }],
+            })
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        let packs = builtin_packs();
+        let first = make_host();
+        let scan1 = scan_pass(&opts, &first, &packs, "").unwrap();
+        assert!(scan1.infected_full_names().is_empty());
+        assert!(first.branches.load(Ordering::Relaxed) > 0, "first scan really scanned");
+        assert_eq!(scan1.skipped_unchanged(), 0);
+
+        let second = make_host();
+        let scan2 = scan_pass(&opts, &second, &packs, "").unwrap();
+        assert!(scan2.infected_full_names().is_empty());
+        assert_eq!(second.branches.load(Ordering::Relaxed), 0, "unchanged clean repo must be skipped");
+        assert_eq!(second.trees.load(Ordering::Relaxed), 0);
+        assert_eq!(scan2.skipped_unchanged(), 1);
+        std::env::remove_var("WORMWARD_CACHE_DIR");
+    }
+
+    #[test]
+    fn infected_repo_is_never_cached() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        std::env::set_var("WORMWARD_CACHE_DIR", &cache_dir);
+        let bare = make_infected_origin(&tmp);
+        let make_host = || {
+            CountingHost::new(GitFakeHost {
+                repos: vec![RepoRef {
+                    full_name: "me/dirty".into(),
+                    clone_url: bare.to_string_lossy().to_string(),
+                    default_branch: "main".into(),
+                    fork: false,
+                    size: 0,
+                    pushed_at: Some("2026-08-17T00:00:00Z".into()),
+                }],
+            })
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        let packs = builtin_packs();
+        scan_pass(&opts, &make_host(), &packs, "").unwrap();
+        let second = make_host();
+        let scan2 = scan_pass(&opts, &second, &packs, "").unwrap();
+        assert_eq!(scan2.infected_full_names(), vec!["me/dirty".to_string()]);
+        assert!(second.branches.load(Ordering::Relaxed) > 0, "infected repo must always rescan");
+        assert_eq!(scan2.skipped_unchanged(), 0);
+        std::env::remove_var("WORMWARD_CACHE_DIR");
+    }
+
+    #[test]
+    fn cancelled_scan_writes_no_cache() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        std::env::set_var("WORMWARD_CACHE_DIR", &cache_dir);
+        let bare = make_infected_origin(&tmp);
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/x".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+                size: 0,
+                pushed_at: Some("2026-08-17T00:00:00Z".into()),
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        let cancel = AtomicBool::new(true); // cancelled before the first repo
+        let _ = scan_pass_with_progress_cancellable(&opts, &host, &builtin_packs(), "", &cancel, &|_| {});
+        assert!(
+            !cache_dir.join("github-scan-cache.json").exists(),
+            "a cancelled run must not record 'clean' verdicts"
+        );
+        std::env::remove_var("WORMWARD_CACHE_DIR");
     }
 }

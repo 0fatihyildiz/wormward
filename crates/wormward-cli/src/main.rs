@@ -909,6 +909,12 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            if scan.skipped_unchanged() > 0 {
+                eprintln!(
+                    "{} unchanged repo(s) skipped (clean last scan; cache: ~/.wormward)",
+                    scan.skipped_unchanged()
+                );
+            }
 
             // Account-persistence audit + rotate-first gate. Run when --audit, or automatically
             // before any real push — a stolen credential plus account persistence (over-privileged
