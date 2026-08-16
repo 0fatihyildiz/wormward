@@ -570,10 +570,10 @@ fn main() -> ExitCode {
                         Vec::new()
                     };
                     let branch_plans = plan_branch_cleans(&deep, &packs, now_secs());
-                    let branch_manual: Vec<wormward_core::Finding> = deep
-                        .into_iter()
-                        .filter(|f| f.git_ref.is_some() && !f.remediable)
-                        .collect();
+                    // Complement of the plans by construction (action_for is the shared gate):
+                    // every git_ref finding is either in a plan or listed as manual, so a
+                    // remediable-marked finding whose campaign lacks a strip config can't vanish.
+                    let branch_manual = wormward_core::branch_manual_findings(&deep, &packs);
                     if plan.actions.is_empty()
                         && plan.manual.is_empty()
                         && branch_plans.is_empty()

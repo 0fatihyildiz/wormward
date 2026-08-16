@@ -43,8 +43,8 @@ pub use remediate::{
 };
 pub use repo_files::{GitTree, RepoFiles, WorkingTree};
 pub use rewrite::{
-    apply_branch_cleans, now_secs, plan_branch_cleans, BranchCleanOutcome, BranchCleanPlan,
-    BranchCleanStatus,
+    apply_branch_cleans, branch_manual_findings, now_secs, plan_branch_cleans, BranchCleanOutcome,
+    BranchCleanPlan, BranchCleanStatus,
 };
 pub use scanner::{
     deep_scan_repo, scan, scan_capabilities, scan_date_skew, scan_deep, scan_dependency_typosquats,

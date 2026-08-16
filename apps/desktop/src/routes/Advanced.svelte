@@ -18,6 +18,7 @@
     GithubFixView,
     ScanProgress,
     BranchCleanPreview,
+    BranchManualFinding,
     BranchSelection,
     BranchCleanResult,
     PackageCheck,
@@ -212,6 +213,7 @@ args = ["mcp"]`;
   let busy = $state(false);
   let busyKind = $state<"branches" | "restore" | "">("");
   let branchPlans = $state<BranchCleanPreview[]>([]);
+  let branchManual = $state<BranchManualFinding[]>([]);
   let branchSel = $state<Record<string, boolean>>({});
   let pushBranches = $state(false);
   let branchLoading = $state(false);
@@ -228,7 +230,9 @@ args = ["mcp"]`;
     branchLoading = true;
     clearErrors();
     try {
-      branchPlans = await cleanBranchesPreview(app.dirs);
+      const scan = await cleanBranchesPreview(app.dirs);
+      branchPlans = scan.plans;
+      branchManual = scan.manual;
       const s: Record<string, boolean> = {};
       for (const b of branchPlans) s[branchKey(b)] = true;
       branchSel = s;
@@ -583,6 +587,10 @@ args = ["mcp"]`;
       a <code>refs/wormward-backup/…</code> ref). Turning on <strong>Push</strong> force-pushes the
       rewritten tips, overwriting remote history.
     </p>
+    <p class="muted micro">
+      Scans the branches already in your local clones — it never contacts the remote. If a remote
+      scan flagged a branch you don't see here, run <code>git fetch</code> in that repo first.
+    </p>
     {#if !app.dirs.length}
       <p class="muted small">Add a protected location in Settings to scan branches.</p>
     {/if}
@@ -601,7 +609,7 @@ args = ["mcp"]`;
     </div>
     {#if branchSummary}<p class="ok-text small" role="status">{branchSummary}</p>{/if}
     {#if branchPlans.length === 0}
-      {#if branchesScanned}<p class="muted micro">No infected branch tips found.</p>{/if}
+      {#if branchesScanned && branchManual.length === 0}<p class="muted micro">No infected branch tips found.</p>{/if}
     {:else}
       <ul class="branch-list">
         {#each branchPlans as b (branchKey(b))}
@@ -614,6 +622,22 @@ args = ["mcp"]`;
           </li>
         {/each}
       </ul>
+    {/if}
+    {#if branchManual.length}
+      <div class="stack" style="margin-top: 4px">
+        <p class="muted small">
+          {branchManual.length} branch {plural(branchManual.length, "finding", "findings")} can't be
+          cleaned automatically — review {plural(branchManual.length, "it", "them")} manually:
+        </p>
+        {#each branchManual as m, i (i)}
+          <div class="branch-res failed">
+            <span class="dot"></span><span class="mono">{m.repo}</span>
+            <span class="chip">branch: {m.branch}</span>
+            {#if m.file}<span class="mono">{m.file}</span>{/if}
+            <span class="muted">— {m.evidence}</span>
+          </div>
+        {/each}
+      </div>
     {/if}
     {#if branchResults.length}
       <div class="stack" style="margin-top: 4px" role="status">

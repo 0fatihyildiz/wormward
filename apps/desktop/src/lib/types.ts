@@ -69,6 +69,20 @@ export interface BranchCleanPreview {
   action_count: number;
 }
 
+/** A branch-tip finding no clean action covers — needs the user's attention, never hidden. */
+export interface BranchManualFinding {
+  repo: string;
+  branch: string;
+  campaign: string;
+  file?: string | null;
+  evidence: string;
+}
+
+export interface BranchScanResult {
+  plans: BranchCleanPreview[];
+  manual: BranchManualFinding[];
+}
+
 export interface BranchSelection {
   repo: string;
   branch: string;

@@ -424,10 +424,29 @@ pub struct BranchCleanApplySummary {
     failed: usize,
 }
 
-/// Deep-scan the given dirs and return a dry-run branch-clean plan per infected branch tip.
-/// Never mutates anything.
+/// A branch-tip finding no clean action covers (IOC domain, capability finding, signature
+/// without a strip strategy, …) — shown as manual work, never silently dropped.
+#[derive(Serialize)]
+pub struct BranchManualFinding {
+    repo: String,
+    branch: String,
+    campaign: String,
+    file: Option<String>,
+    evidence: String,
+}
+
+/// Everything the "Scan other branches" pass found: cleanable plans plus the branch findings
+/// that need manual attention.
+#[derive(Serialize)]
+pub struct BranchScanResult {
+    plans: Vec<BranchCleanPreview>,
+    manual: Vec<BranchManualFinding>,
+}
+
+/// Deep-scan the given dirs and return a dry-run branch-clean plan per infected branch tip,
+/// plus the branch findings no plan can cover. Never mutates anything.
 #[tauri::command]
-async fn clean_branches_preview(dirs: Vec<String>) -> Result<Vec<BranchCleanPreview>, String> {
+async fn clean_branches_preview(dirs: Vec<String>) -> Result<BranchScanResult, String> {
     // spawn_blocking + rayon: a deep scan per repo is the heaviest scan there is; run repos in
     // parallel and keep the async executor free (this used to be a sequential loop on it).
     tauri::async_runtime::spawn_blocking(move || {
@@ -440,11 +459,11 @@ async fn clean_branches_preview(dirs: Vec<String>) -> Result<Vec<BranchCleanPrev
         }
         repos.sort();
         repos.dedup();
-        let mut out: Vec<BranchCleanPreview> = repos
+        let per_repo: Vec<(Vec<BranchCleanPreview>, Vec<BranchManualFinding>)> = repos
             .par_iter()
-            .flat_map(|repo| {
+            .map(|repo| {
                 let findings = deep_scan_repo(repo, &packs);
-                plan_branch_cleans(&findings, &packs, ts)
+                let plans = plan_branch_cleans(&findings, &packs, ts)
                     .into_iter()
                     .map(|plan| BranchCleanPreview {
                         repo: plan.repo.display().to_string(),
@@ -452,10 +471,29 @@ async fn clean_branches_preview(dirs: Vec<String>) -> Result<Vec<BranchCleanPrev
                         backup_ref: plan.backup_ref,
                         action_count: plan.actions.len(),
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                // Complement of the plans (action_for is the shared gate): every git_ref
+                // finding is either plannable or listed here as manual work.
+                let manual = wormward_core::branch_manual_findings(&findings, &packs)
+                    .into_iter()
+                    .map(|f| BranchManualFinding {
+                        repo: f.repo.display().to_string(),
+                        branch: f.git_ref.unwrap_or_default(),
+                        campaign: f.campaign,
+                        file: f.file.map(|p| p.display().to_string()),
+                        evidence: f.evidence,
+                    })
+                    .collect();
+                (plans, manual)
             })
             .collect();
-        out.sort_by(|a, b| (&a.repo, &a.branch).cmp(&(&b.repo, &b.branch)));
+        let mut out = BranchScanResult { plans: Vec::new(), manual: Vec::new() };
+        for (mut plans, mut manual) in per_repo {
+            out.plans.append(&mut plans);
+            out.manual.append(&mut manual);
+        }
+        out.plans.sort_by(|a, b| (&a.repo, &a.branch).cmp(&(&b.repo, &b.branch)));
+        out.manual.sort_by(|a, b| (&a.repo, &a.branch).cmp(&(&b.repo, &b.branch)));
         out
     })
     .await
@@ -863,16 +901,54 @@ mod tests {
     fn clean_branches_preview_finds_infected_non_default_branch() {
         let tmp = TempDir::new().unwrap();
         let repo = repo_with_infected_branch(&tmp);
-        let previews = tauri::async_runtime::block_on(clean_branches_preview(vec![repo
+        let scan = tauri::async_runtime::block_on(clean_branches_preview(vec![repo
             .display()
             .to_string()]))
         .unwrap();
-        let evil = previews
+        let evil = scan
+            .plans
             .iter()
             .find(|p| p.branch == "evil")
             .expect("expected a plan for the infected 'evil' branch");
         assert!(evil.action_count >= 1);
         assert!(evil.backup_ref.starts_with("refs/wormward-backup/evil-"));
+    }
+
+    #[test]
+    fn clean_branches_preview_surfaces_manual_branch_findings() {
+        // A branch-tip finding no clean action covers (here an IOC domain) must be listed as
+        // manual work in the preview. Deriving the preview from plans alone silently hides it —
+        // the user was told the branch is infected (e.g. by the GitHub scan) and would see an
+        // empty branch cleaner.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("readme.md"), "clean").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "--no-verify", "-m", "clean"]);
+        git(&repo, &["checkout", "-q", "-b", "evil"]);
+        fs::write(
+            repo.join("astro.config.mjs"),
+            "fetch('https://260120.vercel.app/settings/mac')",
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "--no-verify", "-m", "ioc"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let scan = tauri::async_runtime::block_on(clean_branches_preview(vec![repo
+            .display()
+            .to_string()]))
+        .unwrap();
+        assert!(
+            scan.manual
+                .iter()
+                .any(|m| m.branch == "evil" && m.file.as_deref() == Some("astro.config.mjs")),
+            "expected the IOC-domain finding on 'evil' to surface as manual work: plans={}, manual={}",
+            scan.plans.len(),
+            scan.manual.len(),
+        );
     }
 
     #[test]

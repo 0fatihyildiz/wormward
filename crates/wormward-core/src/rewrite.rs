@@ -96,6 +96,18 @@ pub fn plan_branch_cleans(findings: &[Finding], packs: &[Pack], timestamp: u64) 
         .collect()
 }
 
+/// The branch-tip findings `plan_branch_cleans` can NOT act on: they carry a `git_ref` but map
+/// to no clean action (IOC domains, npm packages, capability findings, signatures whose campaign
+/// has no strip strategy, …). Every "clean other branches" surface must show these as manual
+/// work — deriving its list from plans alone silently hides real infections.
+pub fn branch_manual_findings(findings: &[Finding], packs: &[Pack]) -> Vec<Finding> {
+    findings
+        .iter()
+        .filter(|f| f.git_ref.is_some() && action_for(f, packs).is_none())
+        .cloned()
+        .collect()
+}
+
 static WT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Nanoseconds since the epoch, best-effort (0 on clock error). Combined with a monotonic
@@ -511,6 +523,70 @@ mod tests {
         assert!(!main_content.contains("rmcej%otb%"));
         let statusz = git_stdout(&repo, &["status", "--porcelain"]);
         assert!(statusz.is_empty(), "working tree should be clean: {statusz}");
+    }
+
+    #[test]
+    fn plans_clean_for_branch_sharing_heads_payload() {
+        // The worm scenario: the SAME payload sits on the default branch (HEAD, checked out)
+        // and on other branch tips. The branch cleaner must still offer to clean those tips —
+        // a working-tree finding cannot produce a branch plan, and the GitHub scan reports the
+        // tips as infected, so missing them here leaves the remote branches infected.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repo.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='8';var x='rmcej%otb%';",
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "payload on main"]);
+        git(&repo, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(repo.join("unrelated.txt"), "clean").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "unrelated change"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let packs = [strip_pack()];
+        let deep = crate::scanner::deep_scan_repo(&repo, &packs);
+        let plans = plan_branch_cleans(&deep, &packs, 777);
+        assert_eq!(plans.len(), 1, "expected a plan for 'evil': {plans:?}");
+        assert_eq!(plans[0].branch, "evil");
+        assert_eq!(plans[0].actions.len(), 1);
+    }
+
+    #[test]
+    fn branch_manual_findings_returns_git_ref_findings_without_action() {
+        // Branch findings that map to no clean action must be surfaced as manual work, not
+        // silently dropped. That includes remediable-marked findings whose pack has no strip
+        // config (`action_for` = None). Working-tree findings and plannable findings stay out.
+        let ioc = finding("/r", Some("evil"), FindingKind::IocDomain, Some("postcss.config.mjs"), "ioc-domain:x");
+        // A ContentSignature whose campaign has no strip strategy maps to no action; it must
+        // surface as manual rather than vanish.
+        let mut no_strategy = finding("/r", Some("evil"), FindingKind::ContentSignature, Some("f.js"), "x");
+        no_strategy.campaign = "shai-hulud".into();
+        let plannable = finding("/r", Some("evil"), FindingKind::ContentSignature, Some("postcss.config.mjs"), "primary");
+        let working_tree = finding("/r", None, FindingKind::IocDomain, Some("postcss.config.mjs"), "ioc-domain:x");
+
+        // literal_pack-shaped pack: no remediation at all → everything with a git_ref is manual.
+        let bare = {
+            let mut p = strip_pack();
+            p.manifest.remediation = None;
+            p
+        };
+        let manual = branch_manual_findings(&[no_strategy.clone()], &[bare]);
+        assert_eq!(manual.len(), 1);
+
+        let manual = branch_manual_findings(
+            &[ioc, no_strategy, plannable, working_tree],
+            &[strip_pack()],
+        );
+        // With strip_pack, the "primary" signature on a target file is plannable; the IOC and
+        // the unconfigured signature are manual; the working-tree finding is out of scope.
+        assert_eq!(manual.len(), 2, "{manual:?}");
+        assert!(manual.iter().all(|f| f.git_ref.as_deref() == Some("evil")));
+        assert!(manual.iter().all(|f| f.signature_id != "primary"));
     }
 
     /// Build a repo with an infected 'evil' branch; return (tmp, repo, infected_oid).

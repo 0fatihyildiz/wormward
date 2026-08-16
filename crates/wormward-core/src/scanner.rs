@@ -890,7 +890,17 @@ fn head_commit(repo: &Path) -> Option<String> {
 /// cross-tip dedup keys (`--full-index` would not do: it governs only patch-format index lines).
 /// NUL-delimited so special/non-ASCII paths survive. Commit-to-commit (no working-tree stat), so
 /// it stays cheap.
-fn diff_raw(repo: &Path, base: &str, tip: &str) -> Vec<(PathBuf, String)> {
+/// Returns the tip-side blobs to scan (path, oid — deletions excluded) plus the set of EVERY
+/// path the diff touches, deletions included. The second set is what the caller uses to decide
+/// which of HEAD's findings still hold on the tip: a path absent from it is byte-identical to
+/// HEAD's blob, while a deleted path must not count as "unchanged". `None` when the diff itself
+/// fails (unreadable commit …) — the tip must then be skipped, not treated as identical to HEAD.
+#[allow(clippy::type_complexity)]
+fn diff_raw(
+    repo: &Path,
+    base: &str,
+    tip: &str,
+) -> Option<(Vec<(PathBuf, String)>, HashSet<PathBuf>)> {
     let out = crate::proc::git()
         .arg("-C")
         .arg(repo)
@@ -898,11 +908,12 @@ fn diff_raw(repo: &Path, base: &str, tip: &str) -> Vec<(PathBuf, String)> {
         .output();
     let out = match out {
         Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+        _ => return None,
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut fields = stdout.split('\0');
     let mut entries = Vec::new();
+    let mut touched = HashSet::new();
     // -z raw record: ":<oldmode> <newmode> <oldoid> <newoid> <status>" NUL "<path>" NUL. With
     // --no-renames every status is single-path, so records alternate meta/path cleanly.
     while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
@@ -910,13 +921,17 @@ fn diff_raw(repo: &Path, base: &str, tip: &str) -> Vec<(PathBuf, String)> {
         let (Some(new_oid), Some(status)) = (cols.nth(3), cols.next()) else {
             continue;
         };
+        if path.is_empty() {
+            continue;
+        }
+        touched.insert(PathBuf::from(path));
         // 'D' = deleted on the tip: no tip-side blob, nothing to scan.
-        if status.starts_with('D') || path.is_empty() {
+        if status.starts_with('D') {
             continue;
         }
         entries.push((PathBuf::from(path), new_oid.to_string()));
     }
-    entries
+    Some((entries, touched))
 }
 
 /// Scan the tip tree of every local/remote branch (deduped by commit, excluding HEAD's
@@ -934,11 +949,38 @@ pub fn deep_scan_repo_cancellable(
 ) -> Vec<Finding> {
     let head = head_commit(repo);
     let mut seen = std::collections::HashSet::new();
+    // Dedup tips by commit up front (excluding HEAD's commit, whose tree the working-tree pass
+    // covers), so the HEAD-tree scan below runs only when some other tip actually exists.
+    let tips: Vec<(String, String)> = branch_commits(repo)
+        .into_iter()
+        .filter(|(oid, _)| head.as_deref() != Some(oid.as_str()) && seen.insert(oid.clone()))
+        .collect();
+    if tips.is_empty() {
+        return Vec::new();
+    }
     let mut findings = Vec::new();
     // One `git cat-file --batch` reader shared by every tip, so a many-branch repo spawns a single
     // blob reader instead of one per tip (the tip specs carry their own commit, so one reader
     // serves them all).
     let reader = GitTree::shared_reader();
+    // Findings on HEAD's COMMITTED tree, scanned once per repo. The per-tip pass below reads only
+    // each tip's diff from HEAD, so an infected file a tip SHARES with HEAD never gets scanned
+    // there — yet the branch cleaner acts solely on git_ref-stamped findings, and the GitHub API
+    // scan (which reads every tip's full tree) reports such tips as infected. These findings are
+    // REPLAYED onto every tip whose diff leaves the file untouched (same blob as HEAD by
+    // definition), keeping local branch results in parity with the remote scan. File-less findings
+    // can't be tied to a shared blob and are not replayable.
+    let head_shared: Vec<Finding> = match head.as_deref() {
+        Some(h) if !cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+            GitTree::new_with_reader(repo, h, reader.clone())
+                .map(|t| scan_tree_inner(repo, &t, packs, cancel))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|f| f.file.is_some())
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     // Cross-tip blob cache: (path, tip-side blob oid) → the findings that blob produced, git_ref
     // unset. Sibling branches of a busy repo share most of their diff-from-HEAD content — every
     // stale branch re-lists the same old versions of the same files — so most (path, blob) pairs
@@ -947,28 +989,33 @@ pub fn deep_scan_repo_cancellable(
     // pass is path-sensitive (target globs, surface classification). The map only holds unique
     // pairs, so its size tracks distinct content, not tips × files.
     let mut blob_cache: HashMap<(PathBuf, String), Vec<Finding>> = HashMap::new();
-    for (oid, name) in branch_commits(repo) {
+    for (oid, name) in tips {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        if head.as_deref() == Some(oid.as_str()) {
-            continue;
-        }
-        if !seen.insert(oid.clone()) {
-            continue;
-        }
-        // Scan ONLY the files this tip changes vs HEAD. Content shared with HEAD is already covered
-        // by the working-tree pass, so the tip's added/changed files are all that is left to check;
-        // of those, blobs already scanned under an earlier tip replay from the cache. This drops
-        // per-tip work from the whole tree to the diff's UNIQUE content — the key to a fast deep
-        // scan on a many-branch repo WITHOUT adding parallelism (and thus without more heat).
+        // Scan ONLY the files this tip changes vs HEAD, then replay HEAD's own findings for files
+        // the tip leaves untouched. Of the changed files, blobs already scanned under an earlier
+        // tip replay from the cache. This keeps per-tip work at the diff's UNIQUE content plus one
+        // HEAD pass per repo — a fast deep scan on a many-branch repo WITHOUT adding parallelism
+        // (and thus without more heat).
         let mut tree_findings = match head.as_deref() {
             Some(base) => {
-                let changed = diff_raw(repo, base, &oid);
-                if changed.is_empty() {
+                // A failed diff means the tip is unreadable — skip it rather than treat it as
+                // identical to HEAD (which would replay HEAD's findings onto it).
+                let Some((changed, touched)) = diff_raw(repo, base, &oid) else {
+                    continue;
+                };
+                // HEAD-shared findings hold on this tip unless the tip touched the file
+                // (modified versions are scanned fresh below; deleted files are in `touched`
+                // and thus never replayed).
+                let mut replayed: Vec<Finding> = head_shared
+                    .iter()
+                    .filter(|f| f.file.as_ref().is_some_and(|p| !touched.contains(p)))
+                    .cloned()
+                    .collect();
+                if changed.is_empty() && replayed.is_empty() {
                     continue;
                 }
-                let mut replayed: Vec<Finding> = Vec::new();
                 let mut fresh: Vec<(PathBuf, String)> = Vec::new();
                 for (path, boid) in changed {
                     match blob_cache.get(&(path.clone(), boid.clone())) {
@@ -2461,11 +2508,13 @@ mod tests {
     }
 
     #[test]
-    fn deep_scan_skips_files_unchanged_from_head() {
-        // Optimization contract: a branch tip is scanned by its DIFF from HEAD. A payload in a file
-        // that is IDENTICAL on HEAD is the working-tree pass's responsibility and must NOT be
-        // re-reported per-branch. Here `main` (HEAD) carries the payload; `evil` only adds an
-        // unrelated clean file, leaving the infected config unchanged — so `evil` yields no finding.
+    fn deep_scan_reports_payload_shared_with_head_per_branch() {
+        // A branch tip is scanned by its DIFF from HEAD, but a payload IDENTICAL to HEAD's must
+        // still be reported per-branch: the branch cleaner derives its plans exclusively from
+        // git_ref-stamped deep findings, so an infected tip sharing HEAD's payload would otherwise
+        // be invisible to it (while the GitHub API scan, which reads every tip's full tree, flags
+        // it). Here `main` (HEAD) carries the payload; `evil` leaves it unchanged and only adds an
+        // unrelated clean file — `evil` must still be flagged.
         use std::process::Command;
         fn git(repo: &Path, args: &[&str]) {
             Command::new("git").arg("-C").arg(repo).args(args)
@@ -2487,11 +2536,43 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "unrelated"]);
         git(&repo, &["checkout", "-q", "main"]);
 
-        // The infected config is unchanged between HEAD and `evil`; deep scan must not re-report it.
         let deep = deep_scan_repo(&repo, &[literal_pack()]);
         assert!(
-            deep.iter().all(|f| f.git_ref.as_deref() != Some("evil")),
-            "a payload identical to HEAD must not be re-reported per-branch: {deep:?}"
+            deep.iter().any(|f| f.kind == FindingKind::ContentSignature
+                && f.git_ref.as_deref() == Some("evil")
+                && f.file.as_deref() == Some(Path::new("postcss.config.mjs"))),
+            "a payload shared with HEAD must still be reported on the branch tip: {deep:?}"
+        );
+    }
+
+    #[test]
+    fn deep_scan_does_not_replay_head_payload_onto_branch_that_deleted_it() {
+        // Counterpart of the shared-payload replay: a tip that DELETED HEAD's infected file no
+        // longer carries the payload and must NOT inherit a finding for it.
+        use std::process::Command;
+        fn git(repo: &Path, args: &[&str]) {
+            Command::new("git").arg("-C").arg(repo).args(args)
+                .env("GIT_TEMPLATE_DIR", "")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e.x")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e.x")
+                .status().unwrap();
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("postcss.config.mjs"), "rmcej%otb%").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "payload"]);
+        git(&repo, &["checkout", "-q", "-b", "cleaned"]);
+        git(&repo, &["rm", "-q", "postcss.config.mjs"]);
+        git(&repo, &["commit", "-q", "-m", "remove payload"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let deep = deep_scan_repo(&repo, &[literal_pack()]);
+        assert!(
+            deep.iter().all(|f| f.git_ref.as_deref() != Some("cleaned")),
+            "a tip that deleted the payload must not be flagged: {deep:?}"
         );
     }
 
@@ -2735,13 +2816,18 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "tip"]);
         git(&repo, &["checkout", "-q", "main"]);
 
-        let map: std::collections::HashMap<PathBuf, String> =
-            diff_raw(&repo, "main", "tip").into_iter().collect();
+        let (entries, touched) = diff_raw(&repo, "main", "tip").unwrap();
+        let map: std::collections::HashMap<PathBuf, String> = entries.into_iter().collect();
         // Modified and added paths carry the tip-side FULL blob oid (the cross-tip dedup key).
         assert_eq!(map.get(Path::new("a.txt")), Some(&git_out(&repo, &["rev-parse", "tip:a.txt"])));
         assert_eq!(map.get(Path::new("b.txt")), Some(&git_out(&repo, &["rev-parse", "tip:b.txt"])));
         // A path deleted on the tip has no tip-side blob — nothing to scan, so no entry.
         assert!(!map.contains_key(Path::new("c.txt")), "deleted path must be skipped: {map:?}");
+        // But the touched set DOES include the deletion — it is what stops HEAD-finding replay
+        // onto a tip that removed the file — alongside every modified/added path.
+        for p in ["a.txt", "b.txt", "c.txt"] {
+            assert!(touched.contains(Path::new(p)), "touched must include {p}: {touched:?}");
+        }
     }
 
     #[test]

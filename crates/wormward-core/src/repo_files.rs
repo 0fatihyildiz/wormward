@@ -117,6 +117,15 @@ impl GitTree {
         Rc::new(RefCell::new(None))
     }
 
+    /// Like [`GitTree::new`] (full `ls-tree` of the commit) but reusing a caller-provided
+    /// [`SharedReader`] — for the deep scan's one full pass over HEAD's tree, which must not
+    /// spawn a second cat-file process next to the per-tip readers.
+    pub(crate) fn new_with_reader(repo: &Path, commit: &str, reader: SharedReader) -> Option<Self> {
+        let mut tree = GitTree::new(repo, commit)?;
+        tree.reader = reader;
+        Some(tree)
+    }
+
     /// Like [`GitTree::new_for_paths`] but reuses a caller-provided [`SharedReader`] instead of
     /// spawning its own — the deep-scan optimization that collapses N per-tip cat-file processes
     /// into one per repo.

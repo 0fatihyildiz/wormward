@@ -6,7 +6,7 @@ import type {
   RepoPlan,
   CleanSummary,
   RestoreSummary,
-  BranchCleanPreview,
+  BranchScanResult,
   BranchSelection,
   BranchCleanApplySummary,
   GithubRepoView,
@@ -48,7 +48,7 @@ export const restore = (dirs: string[]) =>
   invoke<RestoreSummary>("restore", { dirs });
 
 export const cleanBranchesPreview = (dirs: string[]) =>
-  invoke<BranchCleanPreview[]>("clean_branches_preview", { dirs });
+  invoke<BranchScanResult>("clean_branches_preview", { dirs });
 
 export const cleanBranchesApply = (selected: BranchSelection[], push: boolean) =>
   invoke<BranchCleanApplySummary>("clean_branches_apply", { selected, push });
