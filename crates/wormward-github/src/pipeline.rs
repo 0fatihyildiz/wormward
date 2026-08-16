@@ -135,10 +135,6 @@ pub struct ScannedRepo {
     /// stamped `remediable` against that tip's actual content, so a plannable strip exists.
     /// Such repos are fixable via the branch cleaner when pushing.
     pub branch_fixable: bool,
-    /// True when the declared default branch was successfully found and scanned. Distinguishes
-    /// "branch-only infection with known default" from "unknown default branch". A repo with
-    /// an unknown default branch is not branch-fixable even if branch tips are remediable.
-    pub found_default_branch: bool,
 }
 
 impl ScannedRepo {
@@ -262,8 +258,13 @@ fn clone_repo(
 /// (`truncated`, ~100k+ entries) — coverage must never silently degrade. The temp
 /// clone is deleted on return; a later fix re-clones like any other repo.
 fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRepo {
-    let mut out =
-        ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None, auto_fixable: false, branch_fixable: false, found_default_branch: true };
+    let mut out = ScannedRepo {
+        repo: repo.clone(),
+        findings: Vec::new(),
+        error: None,
+        auto_fixable: false,
+        branch_fixable: false,
+    };
     let tmp = match tempfile::TempDir::new() {
         Ok(t) => t,
         Err(e) => {
@@ -331,8 +332,13 @@ fn api_scan_repo(
     cache: &BlobCache,
     token: &str,
 ) -> Result<ScannedRepo, GithubError> {
-    let mut out =
-        ScannedRepo { repo: repo.clone(), findings: Vec::new(), error: None, auto_fixable: false, branch_fixable: false, found_default_branch: false };
+    let mut out = ScannedRepo {
+        repo: repo.clone(),
+        findings: Vec::new(),
+        error: None,
+        auto_fixable: false,
+        branch_fixable: false,
+    };
 
     let branches = match host.list_branches(&repo.full_name) {
         Ok(b) => b,
@@ -355,8 +361,9 @@ fn api_scan_repo(
     // not know the default branch to remediate/force-push, so all findings route to manual.
     let mut tips: Vec<(String, Option<String>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    let mut found_default_branch = false;
     if let Some(default) = branches.iter().find(|b| b.name == repo.default_branch) {
-        out.found_default_branch = true;
+        found_default_branch = true;
         seen.insert(default.commit_sha.clone());
         tips.push((default.commit_sha.clone(), None));
     }
@@ -406,7 +413,7 @@ fn api_scan_repo(
         }
         out.findings.extend(findings);
     }
-    if out.found_default_branch {
+    if found_default_branch {
         out.branch_fixable = out.findings.iter().any(|f| f.git_ref.is_some() && f.remediable);
     }
     Ok(out)
@@ -466,7 +473,6 @@ pub fn scan_pass_with_progress_cancellable(
                         error: None,
                         auto_fixable: false,
                         branch_fixable: false,
-                        found_default_branch: false,
                     })
                 } else {
                     api_scan_repo(repo, host, packs, &cache, token)
@@ -1994,5 +2000,43 @@ mod tests {
         assert!(o.pushed.is_empty());
         assert_eq!(bare_file(&bare, "evil", "postcss.config.mjs"), before);
         assert!(bare_branches(&bare).iter().all(|b| !b.starts_with("wormward-backup/")));
+    }
+
+    #[test]
+    fn unknown_default_branch_with_remediable_branch_is_not_fixable() {
+        // Regression: ensure that repos with unknown default branches are never marked as fixable,
+        // even if branch tips carry remediable findings. This safety guard prevents offering to
+        // "fix" repos where we cannot reliably distinguish default from non-default branches.
+        let tmp = TempDir::new().unwrap();
+        let bare = make_branch_only_infected_origin(&tmp, "unknown");
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/unknown".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "trunk".into(), // does not exist; real branches are main + evil
+                fork: false,
+            }],
+        };
+
+        let scan = scan_pass(&scan_only_opts(), &host, &builtin_packs(), "").unwrap();
+        let sr = &scan.repos()[0];
+
+        // The repo is infected (evil branch is detected).
+        assert!(sr.is_infected(), "evil branch must be detected");
+        // Findings should have git_ref set (all tips scanned as non-default).
+        assert!(
+            sr.findings.iter().all(|f| f.git_ref.is_some()),
+            "all findings must be git_ref-stamped when default branch is unknown"
+        );
+        // BUT: branch_fixable must be false, so it's not offered as a candidate.
+        assert!(
+            !sr.branch_fixable,
+            "repos with unknown default branch must not be branch_fixable"
+        );
+        // Confirm it doesn't appear in fixable list.
+        assert!(
+            !scan.fixable_full_names(&builtin_packs()).contains(&"me/unknown".to_string()),
+            "unknown default branch repos must not be fixable candidates"
+        );
     }
 }
