@@ -547,7 +547,7 @@ args = ["mcp"]`;
       </ul>
       {#if repos.some((r) => !r.fixable)}
         <p class="muted micro">
-          Repos marked "manual review" have no automatic clean action — open them on GitHub and
+          Repos marked “manual review” have no automatic clean action — open them on GitHub and
           review the flagged files by hand.
         </p>
       {/if}
