@@ -539,7 +539,7 @@ args = ["mcp"]`;
                 <span class="count" aria-label="{r.findings} {plural(r.findings, 'finding', 'findings')}">{r.findings}</span>
                 {#if r.campaigns.length}<span class="muted">{r.campaigns.join(", ")}</span>{/if}
                 {#if done}<span class="chip ok-chip">Cleaned ✓</span>
-                {:else if !r.fixable}<span class="chip">branch-only</span>{/if}
+                {:else if !r.fixable}<span class="chip">manual review</span>{/if}
               </span>
             </label>
           </li>
@@ -547,8 +547,8 @@ args = ["mcp"]`;
       </ul>
       {#if repos.some((r) => !r.fixable)}
         <p class="muted micro">
-          "branch-only" repositories have the infection on a non-default branch — clean those in the
-          Other branches section below.
+          Repos marked "manual review" have no automatic clean action — open them on GitHub and
+          review the flagged files by hand.
         </p>
       {/if}
     </section>
@@ -678,9 +678,10 @@ args = ["mcp"]`;
       <h3 id="ghfix-title">Force-push cleaned history?</h3>
       <p class="crit small">
         <strong>This is destructive and remote.</strong> Wormward will remediate
-        {selectedNames.length} selected repo(s) and <strong>force-push</strong> the cleaned default
-        branch to their GitHub remotes, overwriting remote history. The pre-clean tip is backed up
-        as a <code>wormward-backup/…</code> branch on each remote.
+        {selectedNames.length} selected repo(s) and <strong>force-push</strong> the cleaned
+        default branch — and any infected branch tips — to their GitHub remotes, overwriting
+        remote history. Every pre-clean tip is backed up as a <code>wormward-backup/…</code>
+        branch on its remote first.
       </p>
       <div class="row">
         <button class="btn ghost" onclick={() => (confirming = false)}>Cancel</button>
