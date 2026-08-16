@@ -9,8 +9,9 @@ use rayon::prelude::*;
 use serde::Serialize;
 use wormward_core::remediate::strip_marker_matches;
 use wormward_core::{
-    action_for, apply, commit_paths, deep_scan_repo, force_push_with_lease_to, now_secs,
-    plan_remediation, scan_repo, scan_tree, Finding, Pack, RemediationAction, RepoFiles,
+    action_for, apply, apply_branch_cleans, branch_manual_findings, commit_paths, deep_scan_repo,
+    force_push_with_lease_to, now_secs, plan_branch_cleans, plan_remediation, scan_repo, scan_tree,
+    BranchCleanStatus, Finding, Pack, RemediationAction, RepoFiles,
 };
 
 use crate::api_tree::{ApiTree, BlobCache};
@@ -506,10 +507,16 @@ fn fix_scanned(
         return outcome;
     }
 
-    // Branch-only infections have no working-tree action; nothing to do here. An infected
-    // repo with no applicable action is reported as manual review, not a silent no-op.
+    // Branch-only infections have no working-tree action. Branch tips CAN be cleaned, but
+    // only when pushing — a rewritten tip in a throwaway clone that is never pushed
+    // accomplishes nothing. Without --push, branch findings keep routing to manual review.
     let preview = plan_remediation(&sr.findings, packs);
-    if preview.actions.is_empty() {
+    let branch_preview = if opts.push {
+        plan_branch_cleans(&sr.findings, packs, 0)
+    } else {
+        Vec::new()
+    };
+    if preview.actions.is_empty() && branch_preview.is_empty() {
         outcome.manual_review = true;
         return outcome;
     }
@@ -525,29 +532,51 @@ fn fix_scanned(
         return outcome;
     };
     let dest = base.join(sanitize_full_name(&sr.repo.full_name));
-    // Blobless: the fix only edits/commits/pushes the default working tree, so downloading
-    // every blob of every branch (the old full clone) was the fix path's dominant wait.
-    if let Err(e) = clone_repo(&sr.repo, &dest, token, true, None) {
+    // Blobless unless branch tips will be cleaned: the default-branch fix only touches the
+    // default working tree, but a branch clean materializes OTHER tips' blobs, which a
+    // blobless clone would lazily re-fetch one network round-trip at a time.
+    let clean_branches = !branch_preview.is_empty();
+    if let Err(e) = clone_repo(&sr.repo, &dest, token, !clean_branches, None) {
         outcome.error = Some(e);
         return outcome;
     }
 
-    let local = scan_repo(&dest, packs);
+    fix_default_branch(&dest, sr, opts, packs, token, &mut outcome);
+    if clean_branches {
+        // Runs even when the default-branch fix bailed to manual review: each branch clean
+        // strips-and-verifies independently in its own worktree.
+        fix_branch_tips(&dest, sr, packs, token, &mut outcome);
+    }
+    outcome
+}
+
+/// The default-branch remediation exactly as it always worked: local re-scan, plan, apply,
+/// residual-verify (revert on failure), commit, optional backup + force-push. Mutates
+/// `outcome` in place; early-exits leave it exactly as the old early returns did.
+fn fix_default_branch(
+    dest: &Path,
+    sr: &ScannedRepo,
+    opts: &GithubRunOpts,
+    packs: &[Pack],
+    token: &str,
+    outcome: &mut RepoOutcome,
+) {
+    let local = scan_repo(dest, packs);
     let plan = plan_remediation(&local, packs);
     if plan.actions.is_empty() {
         // Repo changed since the scan, or its findings have no auto-action: infected but
         // not auto-strippable -> manual review, never a silent "no changes".
         outcome.manual_review = !local.is_empty();
-        return outcome;
+        return;
     }
 
     // Apply to the working tree (backups land in <repo>/.wormward-backup/<ts>/).
-    let res = apply(&dest, &plan.actions, true);
+    let res = apply(dest, &plan.actions, true);
     outcome.actions = res.applied.iter().map(describe_action).collect();
     if res.applied.is_empty() {
         // A planned action that stripped nothing (no marker) is not a fix.
         outcome.manual_review = true;
-        return outcome;
+        return;
     }
 
     // SECURITY: verify the strip actually removed the payload before committing anything.
@@ -561,14 +590,14 @@ fn fix_scanned(
     // just strippable ones. A surviving IocDomain/NpmPackage/Capability indicator (e.g. a C2
     // domain above the strip marker, or a malicious package.json) means the file is still
     // infected; revert and report manual rather than commit/push a still-flagged file.
-    let residual = scan_repo(&dest, packs).iter().any(|f| f.git_ref.is_none());
+    let residual = scan_repo(dest, packs).iter().any(|f| f.git_ref.is_none());
     if residual {
         // Restore the working tree to the committed (infected) file; do NOT commit or push.
-        let _ = git(&dest, &["checkout", "--", "."]);
+        let _ = git(dest, &["checkout", "--", "."]);
         outcome.actions.clear();
         outcome.error = None;
         outcome.manual_review = true;
-        return outcome;
+        return;
     }
 
     let paths: Vec<PathBuf> = res.applied.iter().map(|a| a.target().to_path_buf()).collect();
@@ -586,16 +615,16 @@ fn fix_scanned(
     // would fail with "nothing to commit" — treat that as a no-op success, not an error.
     for p in &paths {
         let s = p.to_string_lossy();
-        let _ = git(&dest, &["add", "-A", "--", s.as_ref()]);
+        let _ = git(dest, &["add", "-A", "--", s.as_ref()]);
     }
-    if has_staged_changes(&dest) {
-        if let Err(e) = commit_paths(&dest, &format!("wormward: remediate {campaigns}"), &paths) {
+    if has_staged_changes(dest) {
+        if let Err(e) = commit_paths(dest, &format!("wormward: remediate {campaigns}"), &paths) {
             outcome.error = Some(redact(format!("commit: {e}"), token));
-            return outcome;
+            return;
         }
     } else {
         // Nothing changed on disk; skip the commit (and the push below has nothing to do).
-        return outcome;
+        return;
     }
 
     // Force-push the cleaned default branch, backing up the pre-clean tip first.
@@ -605,20 +634,80 @@ fn fix_scanned(
             "refs/remotes/origin/{b}:refs/heads/wormward-backup/{b}-{ts}",
             b = sr.repo.default_branch
         );
-        if let Err(e) = git(&dest, &["push", "origin", "--", &backup]) {
+        if let Err(e) = git(dest, &["push", "origin", "--", &backup]) {
             outcome.error = Some(redact(format!("backup push: {e}"), token));
-            return outcome;
+            return;
         }
         // Push EXACTLY the cleaned default branch via an explicit refspec, never a bare
         // `--force-with-lease` (which under push.default=matching would push every branch).
         let refspec = format!("HEAD:refs/heads/{}", sr.repo.default_branch);
-        match force_push_with_lease_to(&dest, "origin", &refspec) {
+        match force_push_with_lease_to(dest, "origin", &refspec) {
             Ok(()) => outcome.pushed.push(sr.repo.default_branch.clone()),
             Err(e) => outcome.error = Some(redact(format!("force-push: {e}"), token)),
         }
     }
+}
 
-    outcome
+/// Clean every infected NON-default branch tip of the fix clone and force-push the rewrites.
+/// Plans are re-derived from a fresh local deep scan (same "re-scan at fix time" philosophy
+/// as the default-branch path). `origin/<default>` is excluded: after the default-branch
+/// commit, its stale remote-tracking ref would otherwise be re-planned as an "infected tip"
+/// next to the default-branch force-push. Old tips are pushed to the remote as
+/// `wormward-backup/<leaf>-<ts>` branches BEFORE each rewrite — the clone is deleted after
+/// the run, so a local backup ref could not be used for recovery.
+fn fix_branch_tips(
+    dest: &Path,
+    sr: &ScannedRepo,
+    packs: &[Pack],
+    token: &str,
+    outcome: &mut RepoOutcome,
+) {
+    let deep = deep_scan_repo(dest, packs);
+    let default_rt = format!("origin/{}", sr.repo.default_branch);
+    let ts = now_secs();
+    let plans: Vec<_> = plan_branch_cleans(&deep, packs, ts)
+        .into_iter()
+        .filter(|p| p.branch != default_rt)
+        .collect();
+    for plan in plans {
+        let leaf = plan.branch.strip_prefix("origin/").unwrap_or(&plan.branch).to_string();
+        // Remote backup first; a failed backup push skips the branch (mirrors the
+        // default-branch behavior — never rewrite what wasn't backed up).
+        let backup = format!("refs/remotes/origin/{leaf}:refs/heads/wormward-backup/{leaf}-{ts}");
+        if let Err(e) = git(dest, &["push", "origin", "--", &backup]) {
+            outcome.manual_review = true;
+            if outcome.error.is_none() {
+                outcome.error = Some(redact(format!("branch backup push: {e}"), token));
+            }
+            continue;
+        }
+        for bo in apply_branch_cleans(&[plan], false, true) {
+            match bo.status {
+                BranchCleanStatus::Cleaned { pushed: true, .. } => {
+                    outcome.actions.push(format!("cleaned branch {}", bo.plan.branch));
+                    outcome.pushed.push(leaf.clone());
+                }
+                // Cleaned-but-not-pushed persists nowhere (throwaway clone) — that is not a fix.
+                BranchCleanStatus::Cleaned { pushed: false, .. }
+                | BranchCleanStatus::Planned => outcome.manual_review = true,
+                BranchCleanStatus::Skipped(m) | BranchCleanStatus::Failed(m) => {
+                    outcome.manual_review = true;
+                    if outcome.error.is_none() {
+                        outcome.error = Some(redact(format!("clean {}: {m}", bo.plan.branch), token));
+                    }
+                }
+            }
+        }
+    }
+    // Branch findings no clean action covers stay manual work (IOC domains, capability
+    // findings, ...). The stale `origin/<default>` ref's findings don't count — the
+    // default-branch fix (or its own manual_review) already accounts for that branch.
+    if branch_manual_findings(&deep, packs)
+        .iter()
+        .any(|f| f.git_ref.as_deref() != Some(default_rt.as_str()))
+    {
+        outcome.manual_review = true;
+    }
 }
 
 /// Phase two: remediate the scanned repos, cloning ON DEMAND only the repos being
@@ -866,6 +955,59 @@ mod tests {
         bare
     }
 
+    /// Bare origin whose default branch (`main`) AND an `evil` branch both carry the payload
+    /// (`evil` = `main` + one unrelated file, so the payload blob is SHARED with main's tip).
+    fn make_wt_and_branch_infected_origin(tmp: &TempDir, name: &str) -> PathBuf {
+        let src = tmp.path().join(format!("{name}-src"));
+        std::fs::create_dir_all(&src).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            src.join("postcss.config.mjs"),
+            "export default {};\nglobal['!']='8-270-2';\n(\"rmcej%otb%\",2857687)\n",
+        )
+        .unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "infected"]);
+        git_ok(&src, &["checkout", "-q", "-b", "evil"]);
+        std::fs::write(src.join("unrelated.txt"), "clean").unwrap();
+        git_ok(&src, &["add", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "unrelated"]);
+        git_ok(&src, &["checkout", "-q", "main"]);
+        let bare = tmp.path().join(format!("{name}.git"));
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+        git_ok(&src, &["push", "-q", "origin", "evil"]);
+        bare
+    }
+
+    /// A committed file's content at `refname` in a bare repo ("" if missing).
+    fn bare_file(bare: &Path, refname: &str, file: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(bare)
+            .args(["show", &format!("{refname}:{file}")])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Short branch names in a bare repo.
+    fn bare_branches(bare: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(bare)
+            .args(["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().map(String::from).collect()
+    }
+
     fn make_infected_origin(tmp: &TempDir) -> PathBuf {
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -1101,6 +1243,126 @@ mod tests {
             vec!["me/wt".to_string()],
             "branch-only infection must not be offered as a fixable candidate"
         );
+    }
+
+    #[test]
+    fn fix_cleans_branch_only_repo_and_backs_up_on_remote() {
+        // The GitHub scan reports the infected `evil` tip; the fix must rewrite it clean,
+        // force-push it, and preserve the old tip as a wormward-backup branch ON THE REMOTE
+        // (the clone is throwaway, so a local backup ref would be a lie).
+        let tmp = TempDir::new().unwrap();
+        let bare = make_branch_only_infected_origin(&tmp, "branchonly");
+        let old_evil = String::from_utf8_lossy(
+            &Command::new("git").arg("-C").arg(&bare).args(["rev-parse", "evil"]).output().unwrap().stdout,
+        )
+        .trim()
+        .to_string();
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/branchonly".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: true,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        let outcomes = fix_pass(&scan, &opts, &builtin_packs(), "", None);
+        let o = &outcomes[0];
+        assert!(o.error.is_none(), "unexpected error: {:?}", o.error);
+        assert!(o.pushed.contains(&"evil".to_string()), "pushed: {:?}", o.pushed);
+        assert!(!o.manual_review, "a fully cleaned branch-only repo is not manual work");
+        // Remote `evil` no longer carries the payload; `main` is untouched.
+        assert!(!bare_file(&bare, "evil", "postcss.config.mjs").contains("rmcej%otb%"));
+        // Old tip preserved on the remote.
+        let backup = bare_branches(&bare)
+            .into_iter()
+            .find(|b| b.starts_with("wormward-backup/evil-"))
+            .expect("remote wormward-backup/evil-<ts> branch must exist");
+        let backup_oid = String::from_utf8_lossy(
+            &Command::new("git").arg("-C").arg(&bare).args(["rev-parse", &backup]).output().unwrap().stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(backup_oid, old_evil, "backup must point at the pre-clean tip");
+    }
+
+    #[test]
+    fn fix_without_push_leaves_branches_untouched() {
+        // Without --push a branch clean cannot persist (throwaway clone), so nothing may be
+        // rewritten and the repo stays manual review — exactly the old behavior.
+        let tmp = TempDir::new().unwrap();
+        let bare = make_branch_only_infected_origin(&tmp, "nopush");
+        let before = bare_file(&bare, "evil", "postcss.config.mjs");
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/nopush".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: true,
+            push: false,
+            yes: true,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        let outcomes = fix_pass(&scan, &opts, &builtin_packs(), "", None);
+        assert!(outcomes[0].manual_review);
+        assert!(outcomes[0].pushed.is_empty());
+        assert_eq!(bare_file(&bare, "evil", "postcss.config.mjs"), before);
+        assert!(bare_branches(&bare).iter().all(|b| !b.starts_with("wormward-backup/")));
+    }
+
+    #[test]
+    fn fix_cleans_default_branch_and_branch_tip_together() {
+        // Worm shape: same payload on main AND evil. One fix pass cleans both on the remote.
+        // Also proves origin/main is not double-cleaned via the branch path.
+        let tmp = TempDir::new().unwrap();
+        let bare = make_wt_and_branch_infected_origin(&tmp, "both");
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/both".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: true,
+            push: true,
+            yes: true,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        let outcomes = fix_pass(&scan, &opts, &builtin_packs(), "", None);
+        let o = &outcomes[0];
+        assert!(o.error.is_none(), "unexpected error: {:?}", o.error);
+        assert!(!bare_file(&bare, "main", "postcss.config.mjs").contains("rmcej%otb%"));
+        assert!(!bare_file(&bare, "evil", "postcss.config.mjs").contains("rmcej%otb%"));
+        assert!(o.pushed.contains(&"main".to_string()) && o.pushed.contains(&"evil".to_string()));
+        // The default branch is cleaned by the default-branch path ONLY — no
+        // "cleaned branch origin/main" duplicate from the branch cleaner.
+        assert!(
+            o.actions.iter().all(|a| a != "cleaned branch origin/main"),
+            "origin/<default> must be excluded from branch plans: {:?}",
+            o.actions
+        );
+        // The unrelated file on evil survives (tip rewritten, not reset to main).
+        assert_eq!(bare_file(&bare, "evil", "unrelated.txt"), "clean");
     }
 
     #[test]
