@@ -32,9 +32,25 @@ describe("humanizeError", () => {
     );
   });
 
-  it("maps 'rate limit' to a distinct wait-and-retry message", () => {
+  it("maps 'rate limit' without a duration to the wait-and-retry message", () => {
     expect(humanizeError("github rate limit: HTTP 403 from ...")).toBe(
       "GitHub rate limit reached — wormward paused and retried, but it's still limited. Wait a few minutes and try again.",
+    );
+  });
+
+  it("surfaces the backend's real wait duration when present", () => {
+    expect(humanizeError("API rate limit exceeded; limited for ~31 min (https://api.github.com/...)")).toBe(
+      "GitHub rate limit reached — wormward paused and retried, but it's still limited for about 31 more minutes. Wait and try again.",
+    );
+  });
+
+  it("names the anti-scraping flag distinctly and advises smaller scans", () => {
+    expect(
+      humanizeError(
+        "API rate limit exceeded for user ID 123. For more on scraping GitHub ...; limited for ~31 min (https://api.github.com/...)",
+      ),
+    ).toBe(
+      "GitHub has temporarily flagged this account's API traffic. Wait about 31 minutes, then scan fewer repos or orgs at once.",
     );
   });
 
