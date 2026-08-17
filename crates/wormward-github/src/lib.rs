@@ -168,6 +168,11 @@ pub struct GitHubHost {
     /// Sticky: set once any request observes a secondary rate limit (Retry-After present).
     /// `scan_pass` consults it via `throttle_hint` and serializes the rest of the run.
     secondary_hit: std::sync::atomic::AtomicBool,
+    /// Pacing engages only after GitHub signals rate pressure (any 429, or a 403 with a
+    /// rate signature). Healthy accounts keep full parallel speed; the first warning
+    /// smooths every subsequent request for the host's lifetime. The secondary-limit
+    /// breaker (serialization) layers on top unchanged.
+    pace_engaged: std::sync::atomic::AtomicBool,
 }
 
 #[derive(serde::Deserialize)]
@@ -208,7 +213,14 @@ impl GitHubHost {
             base_url: "https://api.github.com".into(),
             next_request: std::sync::Mutex::new(std::time::Instant::now()),
             secondary_hit: std::sync::atomic::AtomicBool::new(false),
+            pace_engaged: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Test-only visibility into pacing engagement.
+    #[cfg(test)]
+    pub(crate) fn pace_engaged_for_tests(&self) -> bool {
+        self.pace_engaged.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// GET `url` with auth headers. Only ever sends the bearer token to the configured
@@ -238,7 +250,7 @@ impl GitHubHost {
         let mut last_rl_msg: Option<String> = None;
         let mut last_suffix: Option<String> = None;
         for _ in 0..=MAX_RATE_RETRIES {
-            {
+            if self.pace_engaged.load(std::sync::atomic::Ordering::Relaxed) {
                 let (wait, next) = {
                     let mut slot = self.next_request.lock().unwrap();
                     let (wait, next) = pace_slot(*slot, std::time::Instant::now(), MIN_REQUEST_SPACING);
@@ -278,6 +290,9 @@ impl GitHubHost {
                         // the scan drops to serial instead of 8 workers re-tripping it.
                         self.secondary_hit.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
+                    // Any rate-shaped response engages pacing for the host's lifetime:
+                    // the retried request and everything after it goes out smoothed.
+                    self.pace_engaged.store(true, std::sync::atomic::Ordering::Relaxed);
                     let reset = resp.header("x-ratelimit-reset").map(str::to_owned);
                     let wait = retry_wait(
                         retry_after.as_deref(),
@@ -760,6 +775,7 @@ mod tests {
         // owned + org-member repos across both pages; the fork is filtered out.
         assert_eq!(names, vec!["me/a", "org/repo", "me/b"]);
         assert!(!host.throttle_hint(), "a clean run never trips the breaker");
+        assert!(!host.pace_engaged_for_tests(), "healthy traffic must stay unpaced");
     }
 
     #[test]
@@ -1116,6 +1132,7 @@ mod tests {
         // Initial attempt + MAX_RATE_RETRIES retries all hit the server (backoff engaged).
         assert_eq!(mock.hits(), super::MAX_RATE_RETRIES + 1);
         assert!(host.throttle_hint());
+        assert!(host.pace_engaged_for_tests(), "a rate-limited response must engage pacing");
     }
 
     // ---- account audit host ----
