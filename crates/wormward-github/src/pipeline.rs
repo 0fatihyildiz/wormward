@@ -226,10 +226,10 @@ enum CloneShape {
     /// No filter: every blob. The FIX path when branch tips will be cleaned (worktree
     /// materialization would otherwise lazy-fetch blob-by-blob).
     Full,
-    /// `--filter=blob:limit=MAX_CONTENT_BYTES`: the SCAN shape — the scanner never reads
-    /// files above that size, so bigger blobs are dead transfer weight. (`--no-checkout`
-    /// joins this shape when the scan switches to tree-based reading; staged separately
-    /// so each change lands green.)
+    /// `--filter=blob:limit=MAX_CONTENT_BYTES --no-checkout`: the SCAN shape — the scanner
+    /// never reads files above that size, so bigger blobs are dead transfer weight, and the
+    /// scan reads the default tip as a git TREE (`fallback_clone_scan`) rather than a working
+    /// tree, so no checkout is materialized at clone time either.
     ScanDiet,
 }
 
@@ -297,11 +297,12 @@ fn clone_repo(
 /// trees). The clone is checkout-less and blob-size-filtered (CloneShape::ScanDiet): the
 /// default tip is scanned as a git TREE — exact parity with the API path, whose
 /// `.git/hooks`/reflog passes are working-tree-only and legitimately absent — and the
-/// deep scan reads other tips via cat-file as always. The two FILESYSTEM detection
-/// passes (committed build-output payloads, installed node_modules sweep) keep their
-/// coverage via selective materialization: exactly the committed surface dirs are
-/// checked out (usually none exist, so the common case pays nothing). The temp clone is
-/// deleted on return; a later fix re-clones like any other repo.
+/// deep scan reads other tips via cat-file as always. The three FILESYSTEM detection
+/// passes (committed build-output payloads, installed node_modules sweep, typosquat
+/// dropper-behaviour corroboration) keep their coverage via selective materialization:
+/// exactly the committed surface dirs are checked out (usually none exist, so the common
+/// case pays nothing). The temp clone is deleted on return; a later fix re-clones like any
+/// other repo.
 fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRepo {
     let mut out = ScannedRepo {
         repo: repo.clone(),
@@ -347,6 +348,16 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
         let _ = git(&dest, &args);
         findings.extend(wormward_core::scan_build_output(&dest, packs));
         findings.extend(wormward_core::scan_node_modules(&dest, packs));
+        // Typosquat dropper-behaviour corroboration (scan_repo's third disk pass): its
+        // dependency-name inputs (root package.json / lockfiles) are read via `tree` — no
+        // checkout needed, cat-file already serves them — but its corroboration check
+        // (`package_dropper_behavior`) reads an INSTALLED package dir on disk
+        // (`node_modules/<name>/…`), which only exists once `node_modules` itself was
+        // materialized above. Gated on that so a repo with no vendored deps skips the call
+        // entirely (same guaranteed no-op `scan_repo` would get without a node_modules dir).
+        if committed_dirs.contains(&"node_modules") {
+            findings.extend(wormward_core::scan_dependency_typosquats(&dest, &tree, packs));
+        }
     }
     findings.extend(deep_scan_repo(&dest, packs));
     // Fixability from tree reads (no checkout exists), same content `fix_scanned`'s
@@ -1498,6 +1509,73 @@ mod tests {
         assert!(
             scan.repos()[0].auto_fixable,
             "tree-based read must confirm the strip marker without a checkout"
+        );
+    }
+
+    /// Bare origin whose default branch commits a root `package.json` naming a typosquat
+    /// dependency AND the installed package's own `package.json` carrying a dropper-behaviour
+    /// lifecycle script (`package_dropper_verdict`'s obfuscated+behavioral install-script gate —
+    /// see `package_dropper_verdict_pure_signals` in wormward-core's scanner.rs). Deliberately no
+    /// entry file (`index.js`), so ONLY `scan_dependency_typosquats`' corroboration detects this —
+    /// the general `scan_node_modules` entrypoint pass has nothing to read. `size` forces the
+    /// clone route.
+    fn make_typosquat_dropper_origin(tmp: &TempDir, name: &str) -> PathBuf {
+        let src = tmp.path().join(format!("{name}-src"));
+        std::fs::create_dir_all(src.join("node_modules/axioss")).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("package.json"), r#"{"dependencies":{"axioss":"1.0.0"}}"#).unwrap();
+        std::fs::write(
+            src.join("node_modules/axioss/package.json"),
+            r#"{"name":"axioss","version":"1.0.0","scripts":{"postinstall":"node -e \"var _$_a1b2=atob('x');require('child_process').exec('id')\""}}"#,
+        )
+        .unwrap();
+        git_ok(&src, &["add", "-f", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "typosquat dropper"]);
+        let bare = tmp.path().join(format!("{name}.git"));
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+        bare
+    }
+
+    #[test]
+    fn clone_scan_detects_typosquat_dropper_corroboration() {
+        let tmp = TempDir::new().unwrap();
+        let bare = make_typosquat_dropper_origin(&tmp, "squat");
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/squat".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+                size: CLONE_SIZE_KB + 1,
+                pushed_at: None,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        assert_eq!(
+            scan.infected_full_names(),
+            vec!["me/squat".to_string()],
+            "the typosquat dropper-corroboration pass must still run on the clone path"
+        );
+        let sr = &scan.repos()[0];
+        assert!(
+            sr.findings.iter().any(|f| f.signature_id == "typosquat:axioss"),
+            "expected the typosquat corroboration finding, got {:?}",
+            sr.findings
         );
     }
 
