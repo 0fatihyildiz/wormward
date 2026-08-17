@@ -237,9 +237,10 @@ fn clone_shape_args(shape: CloneShape) -> Vec<String> {
     match shape {
         CloneShape::Blobless => vec!["--filter=blob:none".to_string()],
         CloneShape::Full => Vec::new(),
-        CloneShape::ScanDiet => {
-            vec![format!("--filter=blob:limit={}", wormward_core::MAX_CONTENT_BYTES)]
-        }
+        CloneShape::ScanDiet => vec![
+            format!("--filter=blob:limit={}", wormward_core::MAX_CONTENT_BYTES),
+            "--no-checkout".to_string(),
+        ],
     }
 }
 
@@ -292,9 +293,15 @@ fn clone_repo(
     }
 }
 
-/// Full local clone + scan for repos whose tree the API refuses to enumerate
-/// (`truncated`, ~100k+ entries) — coverage must never silently degrade. The temp
-/// clone is deleted on return; a later fix re-clones like any other repo.
+/// Full local clone + scan for repos the API path shouldn't enumerate (big or truncated
+/// trees). The clone is checkout-less and blob-size-filtered (CloneShape::ScanDiet): the
+/// default tip is scanned as a git TREE — exact parity with the API path, whose
+/// `.git/hooks`/reflog passes are working-tree-only and legitimately absent — and the
+/// deep scan reads other tips via cat-file as always. The two FILESYSTEM detection
+/// passes (committed build-output payloads, installed node_modules sweep) keep their
+/// coverage via selective materialization: exactly the committed surface dirs are
+/// checked out (usually none exist, so the common case pays nothing). The temp clone is
+/// deleted on return; a later fix re-clones like any other repo.
 fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRepo {
     let mut out = ScannedRepo {
         repo: repo.clone(),
@@ -318,20 +325,57 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
         out.error = Some(e);
         return out;
     }
-    let mut findings = scan_repo(&dest, packs);
+    // Unborn HEAD (empty repo): nothing to scan — same as the API path's empty-branches
+    // early return.
+    let Some(head) = wormward_core::rev_parse(&dest, "HEAD") else {
+        return out;
+    };
+    let Some(tree) = wormward_core::GitTree::new(&dest, &head) else {
+        return out;
+    };
+    let mut findings = wormward_core::scan_tree(&dest, &tree, packs);
+    // Disk-only passes: materialize exactly the committed surface dirs, if any.
+    let committed_dirs: Vec<&str> = {
+        let tops = top_level_tree_names(&dest, &head);
+        wormward_core::disk_pass_dirs().into_iter().filter(|d| tops.contains(*d)).collect()
+    };
+    if !committed_dirs.is_empty() {
+        let mut args = vec!["checkout", head.as_str(), "--"];
+        args.extend(committed_dirs.iter().copied());
+        // Best-effort: a failed materialization only narrows the two disk passes back
+        // to nothing, never fails the scan.
+        let _ = git(&dest, &args);
+        findings.extend(wormward_core::scan_build_output(&dest, packs));
+        findings.extend(wormward_core::scan_node_modules(&dest, packs));
+    }
     findings.extend(deep_scan_repo(&dest, packs));
-    // Fixability from the cloned working tree, while `dest` still exists (tmp is dropped
-    // on return). Reads the flagged file's on-disk content, same as `fix_scanned` will.
-    out.auto_fixable =
-        is_auto_fixable(&findings, packs, |rel| std::fs::read_to_string(dest.join(rel)).ok());
+    // Fixability from tree reads (no checkout exists), same content `fix_scanned`'s
+    // fresh clone will see.
+    out.auto_fixable = is_auto_fixable(&findings, packs, |rel| tree.read(rel));
+    out.branch_fixable = findings.iter().any(|f| f.git_ref.is_some() && f.remediable);
     // Re-label onto the virtual repo path: the temp clone path would dangle.
     let label = PathBuf::from(&repo.full_name);
     for f in &mut findings {
         f.repo = label.clone();
     }
-    out.branch_fixable = findings.iter().any(|f| f.git_ref.is_some() && f.remediable);
     out.findings = findings;
     out
+}
+
+/// Top-level entry names of a commit's tree (`git ls-tree --name-only <commit>`, no -r).
+fn top_level_tree_names(repo: &Path, commit: &str) -> std::collections::HashSet<String> {
+    let out = wormward_core::proc::git()
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "--name-only", commit])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        _ => Default::default(),
+    }
 }
 
 /// Blob count above which a repo is scanned via a shallow clone instead of per-blob REST. The
@@ -938,7 +982,10 @@ mod tests {
         assert_eq!(clone_shape_args(CloneShape::Full), Vec::<String>::new());
         assert_eq!(
             clone_shape_args(CloneShape::ScanDiet),
-            vec![format!("--filter=blob:limit={}", wormward_core::MAX_CONTENT_BYTES)]
+            vec![
+                format!("--filter=blob:limit={}", wormward_core::MAX_CONTENT_BYTES),
+                "--no-checkout".to_string(),
+            ]
         );
     }
 
@@ -1292,6 +1339,166 @@ mod tests {
         );
         // Findings are relabeled onto the virtual repo path, not the temp clone dir.
         assert!(sr.findings.iter().all(|f| f.repo == PathBuf::from("me/big")));
+    }
+
+    /// Exact fixture `wormward_packs::polinrider::PolinriderAnalyzer::hidden_payload` (the STRICT
+    /// fingerprint `scan_build_output` calls) confirms — see
+    /// `hidden_payload_strict_is_decoder_only_and_fp_safe` in
+    /// crates/wormward-packs/src/polinrider/analyzer.rs. No marker/seed needed for this pass.
+    const BUILD_OUTPUT_PAYLOAD: &str = "var _$_1e42=(function(a){return eval(a)})('x');";
+
+    /// Exact fixture `PolinriderAnalyzer::analyze` (the full confirm, which `scan_node_modules`'s
+    /// entrypoint pass calls) confirms — see `confirms_bracket_variant` in the same file: marker +
+    /// decoder.
+    const NODE_MODULES_PAYLOAD: &str =
+        "export default {};\nglobal['!']='8-270-2';var _$_1e42=(function(a,b){return a})('x',7);";
+
+    /// Bare origin whose default branch commits an infected file inside `dist/` — only
+    /// the filesystem build-output pass detects it, so the clone path must materialize
+    /// committed disk-pass dirs. `size` forces the clone route.
+    fn make_dist_payload_origin(tmp: &TempDir, name: &str, dist_payload: &str) -> PathBuf {
+        let src = tmp.path().join(format!("{name}-src"));
+        std::fs::create_dir_all(src.join("dist")).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("readme.md"), "clean").unwrap();
+        std::fs::write(src.join("dist/bundle.mjs"), dist_payload).unwrap();
+        git_ok(&src, &["add", "-f", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "dist payload"]);
+        let bare = tmp.path().join(format!("{name}.git"));
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+        bare
+    }
+
+    /// Bare origin whose default branch commits an infected package under `node_modules/` — only
+    /// the filesystem node_modules sweep detects it, so the clone path must materialize
+    /// committed disk-pass dirs. `size` forces the clone route.
+    fn make_node_modules_payload_origin(tmp: &TempDir, name: &str, entry_payload: &str) -> PathBuf {
+        let src = tmp.path().join(format!("{name}-src"));
+        std::fs::create_dir_all(src.join("node_modules/evilpkg")).unwrap();
+        git_ok(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("readme.md"), "clean").unwrap();
+        std::fs::write(
+            src.join("node_modules/evilpkg/package.json"),
+            r#"{"name":"evilpkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("node_modules/evilpkg/index.js"), entry_payload).unwrap();
+        git_ok(&src, &["add", "-f", "."]);
+        git_ok(&src, &["commit", "-q", "--no-verify", "-m", "node_modules payload"]);
+        let bare = tmp.path().join(format!("{name}.git"));
+        Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .env("GIT_TEMPLATE_DIR", "")
+            .arg(&bare)
+            .status()
+            .unwrap();
+        git_ok(&src, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_ok(&src, &["push", "-q", "origin", "main"]);
+        bare
+    }
+
+    #[test]
+    fn clone_scan_detects_committed_build_output_payload() {
+        let tmp = TempDir::new().unwrap();
+        // PAYLOAD: copy the exact hidden-payload fixture string from wormward-core's
+        // scan_build_output test (see Step 1 instructions) — do not invent one.
+        let bare = make_dist_payload_origin(&tmp, "distpay", BUILD_OUTPUT_PAYLOAD);
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/distpay".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+                size: CLONE_SIZE_KB + 1,
+                pushed_at: None,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        assert_eq!(
+            scan.infected_full_names(),
+            vec!["me/distpay".to_string()],
+            "the build-output pass must still run on the clone path"
+        );
+    }
+
+    #[test]
+    fn clone_scan_detects_committed_node_modules_payload() {
+        let tmp = TempDir::new().unwrap();
+        // PAYLOAD: copy the exact fixture the core scan_node_modules entrypoint pass detects
+        // (see Step 1 instructions) — do not invent one.
+        let bare = make_node_modules_payload_origin(&tmp, "nmpay", NODE_MODULES_PAYLOAD);
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/nmpay".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+                size: CLONE_SIZE_KB + 1,
+                pushed_at: None,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        assert_eq!(
+            scan.infected_full_names(),
+            vec!["me/nmpay".to_string()],
+            "the node_modules pass must still run on the clone path"
+        );
+    }
+
+    #[test]
+    fn clone_scan_reports_auto_fixable_from_tree_reads() {
+        // make_infected_origin fixture (strippable payload on the default tip), size:
+        // CLONE_SIZE_KB + 1 forces the clone route. The repo must be flagged infected AND
+        // auto_fixable — the read closure must work without a checkout.
+        let tmp = TempDir::new().unwrap();
+        let bare = make_infected_origin(&tmp);
+        let host = GitFakeHost {
+            repos: vec![RepoRef {
+                full_name: "me/fixable".into(),
+                clone_url: bare.to_string_lossy().to_string(),
+                default_branch: "main".into(),
+                fork: false,
+                size: CLONE_SIZE_KB + 1,
+                pushed_at: None,
+            }],
+        };
+        let opts = GithubRunOpts {
+            clone_dir: None,
+            include_forks: false,
+            fix: false,
+            push: false,
+            yes: false,
+            orgs: vec![],
+        };
+        let scan = scan_pass(&opts, &host, &builtin_packs(), "").unwrap();
+        assert_eq!(scan.infected_full_names(), vec!["me/fixable".to_string()]);
+        assert!(
+            scan.repos()[0].auto_fixable,
+            "tree-based read must confirm the strip marker without a checkout"
+        );
     }
 
     #[test]
