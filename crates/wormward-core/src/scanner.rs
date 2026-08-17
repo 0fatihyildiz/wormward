@@ -1077,9 +1077,10 @@ const MAX_BUILD_OUTPUT_FILES: usize = 20_000;
 const NOT_BUILD_SCANNED: &[&str] = &["node_modules", "target", ".wormward-backup"];
 
 /// Dirs whose detection passes read the FILESYSTEM rather than a git tree: the
-/// build-output dirs covered by [`scan_build_output`] plus `node_modules` (the
-/// installed-package sweep). A checkout-less scan clone materializes exactly these
-/// dirs when committed, so both passes keep their coverage without a full checkout.
+/// build-output dirs covered by [`scan_build_output`], `node_modules` (the
+/// installed-package sweep), and the typosquat corroboration pass. A checkout-less scan
+/// clone materializes exactly these dirs when committed, so these passes keep their coverage
+/// without a full checkout.
 pub fn disk_pass_dirs() -> Vec<&'static str> {
     let mut dirs: Vec<&'static str> = crate::surface::EXCLUDED_DIRS
         .iter()

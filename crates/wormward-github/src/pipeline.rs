@@ -319,9 +319,9 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
         }
     };
     let dest = tmp.path().join(sanitize_full_name(&repo.full_name));
-    // Shallow all-branches (depth 1), NOT blobless: the deep scan reads every branch TIP tree
-    // (which depth-1 provides) but never history, and a blobless clone would lazily re-fetch each
-    // blob over the network — defeating the point of cloning instead of per-blob REST.
+    // Shallow all-branches (depth 1) with the ScanDiet shape: blobs above MAX_CONTENT_BYTES —
+    // which no pass reads to completion — are excluded from the pack and only lazily fetched if
+    // something touches them; everything the scanner accepts arrives in the single clone transfer.
     if let Err(e) = clone_repo(repo, &dest, token, CloneShape::ScanDiet, Some(1)) {
         out.error = Some(e);
         return out;
@@ -343,7 +343,7 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
     if !committed_dirs.is_empty() {
         let mut args = vec!["checkout", head.as_str(), "--"];
         args.extend(committed_dirs.iter().copied());
-        // Best-effort: a failed materialization only narrows the two disk passes back
+        // Best-effort: a failed materialization only narrows the three disk passes back
         // to nothing, never fails the scan.
         let _ = git(&dest, &args);
         findings.extend(wormward_core::scan_build_output(&dest, packs));
