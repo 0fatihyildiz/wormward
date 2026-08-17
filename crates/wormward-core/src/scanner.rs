@@ -155,7 +155,9 @@ fn check_npm(repo: &Path, files: &dyn RepoFiles, pack: &Pack) -> Vec<Finding> {
     findings
 }
 
-const MAX_CONTENT_BYTES: usize = 5 * 1024 * 1024;
+/// Exported so scan clones can `--filter=blob:limit=` on the same threshold — the scanner
+/// never reads bigger files, so bigger blobs are dead transfer weight.
+pub const MAX_CONTENT_BYTES: usize = 5 * 1024 * 1024;
 
 fn looks_binary(content: &str) -> bool {
     content.as_bytes().iter().take(8192).any(|&b| b == 0)
@@ -1074,13 +1076,27 @@ const MAX_BUILD_OUTPUT_FILES: usize = 20_000;
 /// spot: `.nuxt`/`.output`/`out`/`coverage`/`vendor`/`dist`/`build`/`.next` all qualify.
 const NOT_BUILD_SCANNED: &[&str] = &["node_modules", "target", ".wormward-backup"];
 
+/// Dirs whose detection passes read the FILESYSTEM rather than a git tree: the
+/// build-output dirs covered by [`scan_build_output`] plus `node_modules` (the
+/// installed-package sweep). A checkout-less scan clone materializes exactly these
+/// dirs when committed, so both passes keep their coverage without a full checkout.
+pub fn disk_pass_dirs() -> Vec<&'static str> {
+    let mut dirs: Vec<&'static str> = crate::surface::EXCLUDED_DIRS
+        .iter()
+        .filter(|d| !NOT_BUILD_SCANNED.contains(d))
+        .copied()
+        .collect();
+    dirs.push("node_modules");
+    dirs
+}
+
 /// Scan BUILD-OUTPUT / vendor / cache dirs for a hidden payload — e.g. a dropper written into
 /// `.output/server/*.mjs` (which EXECUTES on the server) or a `.nuxt`/`dist`/`vendor` bundle. These
 /// dirs are excluded from the general walk (full of legit minified/generated code that
 /// false-positives the structural detectors), so this uses the STRICT
 /// [`CampaignAnalyzer::hidden_payload`] fingerprint (the decoder identifier only), FP-clean on
 /// generated code.
-fn scan_build_output(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
+pub fn scan_build_output(repo: &Path, packs: &[Pack]) -> Vec<Finding> {
     const EXTS: &[&str] = &["js", "mjs", "cjs"];
     let mut findings = Vec::new();
     let mut count = 0usize;

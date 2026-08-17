@@ -217,21 +217,49 @@ pub struct ScanProgress {
     pub repo: String,
 }
 
+/// How much of the repo a clone transfers, per consumer.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CloneShape {
+    /// `--filter=blob:none`: refs/history without blobs; checkout materializes only the
+    /// default tip's files. The FIX path's default (it touches only the default tree).
+    Blobless,
+    /// No filter: every blob. The FIX path when branch tips will be cleaned (worktree
+    /// materialization would otherwise lazy-fetch blob-by-blob).
+    Full,
+    /// `--filter=blob:limit=MAX_CONTENT_BYTES`: the SCAN shape — the scanner never reads
+    /// files above that size, so bigger blobs are dead transfer weight. (`--no-checkout`
+    /// joins this shape when the scan switches to tree-based reading; staged separately
+    /// so each change lands green.)
+    ScanDiet,
+}
+
+fn clone_shape_args(shape: CloneShape) -> Vec<String> {
+    match shape {
+        CloneShape::Blobless => vec!["--filter=blob:none".to_string()],
+        CloneShape::Full => Vec::new(),
+        CloneShape::ScanDiet => {
+            vec![format!("--filter=blob:limit={}", wormward_core::MAX_CONTENT_BYTES)]
+        }
+    }
+}
+
 /// Clone all branches of `repo` into `dest`, authenticated via the token so private
 /// repos work (and the resulting origin can be pushed to). GIT_TERMINAL_PROMPT=0 so
 /// an auth failure fails fast instead of hanging a rayon worker. Errors are redacted.
 ///
-/// `blobless` clones with `--filter=blob:none`: refs and history come down without any blob
-/// content, and checkout materializes only the default tip's files — the right shape for the
-/// FIX path, which touches nothing but the default working tree (a full clone downloads every
-/// blob on every branch first). The fallback SCAN path must NOT use it: its deep scan cat-files
-/// arbitrary branch blobs, and each read would become its own lazy network fetch. A server
-/// without filter support just ignores the flag (git warns and does a full clone).
+/// `shape` controls how much of the repo actually transfers ([`CloneShape`]):
+/// `Blobless` (`--filter=blob:none`) is the FIX path's default — it touches only the default
+/// working tree, so refs/history come down without any blob content and checkout materializes
+/// just the default tip's files. `Full` (no filter) is the FIX path when branch tips will also
+/// be cleaned — worktree materialization of OTHER tips would otherwise lazy-fetch blob-by-blob
+/// over the network. `ScanDiet` (`--filter=blob:limit=`) is the SCAN path's shape: the scanner
+/// never reads a blob bigger than that threshold, so bigger blobs are dead transfer weight. A
+/// server without filter support just ignores the flag (git warns and does a full clone).
 fn clone_repo(
     repo: &RepoRef,
     dest: &Path,
     token: &str,
-    blobless: bool,
+    shape: CloneShape,
     depth: Option<u32>,
 ) -> Result<(), String> {
     let mut cmd = wormward_core::proc::git();
@@ -245,8 +273,8 @@ fn clone_repo(
         // hooks into OUR temp clone, and the local re-scan would flag those hooks as
         // findings about the repo. Hooks are local artifacts, never repo content.
         .args(["clone", "--no-single-branch", "--template=", "-q"]);
-    if blobless {
-        cmd.arg("--filter=blob:none");
+    for a in clone_shape_args(shape) {
+        cmd.arg(a);
     }
     if let Some(d) = depth {
         // Shallow: fetch only each branch tip's tree (deep scan reads tips, never history), so a
@@ -286,7 +314,7 @@ fn fallback_clone_scan(repo: &RepoRef, packs: &[Pack], token: &str) -> ScannedRe
     // Shallow all-branches (depth 1), NOT blobless: the deep scan reads every branch TIP tree
     // (which depth-1 provides) but never history, and a blobless clone would lazily re-fetch each
     // blob over the network — defeating the point of cloning instead of per-blob REST.
-    if let Err(e) = clone_repo(repo, &dest, token, false, Some(1)) {
+    if let Err(e) = clone_repo(repo, &dest, token, CloneShape::ScanDiet, Some(1)) {
         out.error = Some(e);
         return out;
     }
@@ -666,7 +694,13 @@ fn fix_scanned(
     // default working tree, but a branch clean materializes OTHER tips' blobs, which a
     // blobless clone would lazily re-fetch one network round-trip at a time.
     let clean_branches = !branch_preview.is_empty();
-    if let Err(e) = clone_repo(&sr.repo, &dest, token, !clean_branches, None) {
+    if let Err(e) = clone_repo(
+        &sr.repo,
+        &dest,
+        token,
+        if clean_branches { CloneShape::Full } else { CloneShape::Blobless },
+        None,
+    ) {
         outcome.error = Some(e);
         return outcome;
     }
@@ -897,6 +931,16 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
     use wormward_packs::builtin_packs;
+
+    #[test]
+    fn clone_shape_args_match_their_consumers() {
+        assert_eq!(clone_shape_args(CloneShape::Blobless), vec!["--filter=blob:none".to_string()]);
+        assert_eq!(clone_shape_args(CloneShape::Full), Vec::<String>::new());
+        assert_eq!(
+            clone_shape_args(CloneShape::ScanDiet),
+            vec![format!("--filter=blob:limit={}", wormward_core::MAX_CONTENT_BYTES)]
+        );
+    }
 
     fn git_ok(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
