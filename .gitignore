@@ -5,9 +5,6 @@
 # Node / frontend
 node_modules/
 
-# Local scratch
-.superpowers/
-
 # Tauri generated
 apps/desktop/src-tauri/gen/
 apps/desktop/dist/

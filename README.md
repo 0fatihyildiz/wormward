@@ -11,7 +11,7 @@ always explicit, backed up, and dry-run first.
 
 Precision is a first-class goal: every signature is designed not to false-positive on legitimate
 code (lockfiles, WASM/Emscripten glue, minified bundles, popular dependencies). See
-[docs/superpowers/specs/2026-07-20-wormward-fp-hardening.md](docs/superpowers/specs/2026-07-20-wormward-fp-hardening.md).
+[docs/false-positives.md](docs/false-positives.md).
 
 ## Install
 
@@ -237,7 +237,7 @@ on structure (padding-injection + the generic `_$_[0-9a-f]{4,}` decoder), never 
 non-config source (`server.js`, `routes/*.js`, `Gruntfile.js`, `.prettierrc.mjs`, controllers)
 — which the surface-scoped passes missed. This drove the repo-wide structural pass
 (`scan_injection_structure`). See
-[the FP-hardening spec](docs/superpowers/specs/2026-07-20-wormward-fp-hardening.md).
+[the false-positive notes](docs/false-positives.md).
 
 <details>
 <summary><b>Full confirmed-infected repo list (2,471)</b> — click to expand</summary>
